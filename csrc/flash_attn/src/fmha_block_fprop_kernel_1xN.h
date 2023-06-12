@@ -94,7 +94,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
     // if( binfo.stop_early() ) return;
     if( binfo.stop_early(loop_step_idx * Cta_tile_p::N) ) return;
 
-    Blockmask blockmask(params, loop_step_idx);
+    Blockmask<> blockmask(params, loop_step_idx, Cta_tile_p::M);
     int block_row_idx = 0;
     int mask_val = blockmask.mask_val(0);
     if (mask_val == -1) return;

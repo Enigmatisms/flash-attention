@@ -38,15 +38,31 @@ namespace fmha {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <int BlockmaskGrainRow = 256, int BlockmaskGrainCol = 16>
 struct Blockmask {
 
     template<typename Params>
-    __device__ Blockmask(const Params &params, int loop_step_idx) :
-        blockmask_ptr(params.blockmask + loop_step_idx * params.seqlen_q / 16) {
+    __device__ Blockmask(const Params &params, int loop_step_idx, int const compute_blocksize_row) :
+        // assert BlockmaskGrainRow is divisible by compute_blocksize_row
+	// assert BlockmaskGrainCol * ELEMENT_BYTES is divisible by BYTES_PER_LDG
+        blockmask_ptr(params.blockmask + loop_step_idx * (BlockmaskGrainRow / compute_blocksize_row)  * params.seqlen_q / BlockmaskGrainCol) {
     }
 
     __device__ int mask_val(int block_row_idx) const {
         return blockmask_ptr[block_row_idx];
+    }
+
+    // get the mask_val for the element in (row, col) of a block
+    __device__ int mask_val(int row, int col) const {
+        return mask_val(col/BlockmaskGrainCol + row/BlockmaskGrainRow*params.seqlen_q/BlockmaskGrainCol);
+    }
+    
+    __device__ bool predicate(int row, int col) const {
+        return mask_val(row, col) != -1;
+    }
+
+    __device__ int block_row_idx() const {
+        return mask_val(0)
     }
 
     const int *blockmask_ptr;

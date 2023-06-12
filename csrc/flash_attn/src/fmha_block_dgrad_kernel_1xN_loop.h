@@ -138,7 +138,7 @@ inline __device__ void compute_block_dq_dk_dv_1xN_one_iter(const Params &params,
     // if( binfo.stop_early() ) return;
     if( binfo.stop_early(loop_step_idx * Cta_tile_p::N) ) return;
 
-    Blockmask blockmask(params, loop_step_idx);
+    Blockmask<> blockmask(params, loop_step_idx, Cta_tile_p::M);
     int block_row_idx = 0;
     int mask_val = blockmask.mask_val(0);
     if (mask_val == -1) return;

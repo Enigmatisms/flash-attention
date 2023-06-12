@@ -52,6 +52,7 @@ void run_fmha_block_dgrad_sm80_loop_(const FMHA_dgrad_params &params, cudaStream
 
 void run_fmha_block_dgrad_sm80(const FMHA_dgrad_params &params, cudaStream_t stream) {
     FP16_SWITCH(params.is_bf16, ([&] {
+#if 0
         if (params.d == 16) {
             using Kernel_traits = FMHA_kernel_traits<256, 16, 16, 1, 8, 0x08u, elem_type>;
             run_fmha_block_dgrad_sm80_loop_<Kernel_traits>(params, stream);
@@ -65,5 +66,8 @@ void run_fmha_block_dgrad_sm80(const FMHA_dgrad_params &params, cudaStream_t str
             using Kernel_traits = FMHA_kernel_traits<256, 128, 16, 1, 8, 0x08u, elem_type>;
             run_fmha_block_dgrad_sm80_loop_<Kernel_traits>(params, stream);
         }
+#endif
+        using Kernel_traits = FMHA_kernel_traits<256, 128, 16, 1, 8, 0x08u, elem_type>;
+        run_fmha_block_dgrad_sm80_loop_<Kernel_traits>(params, stream);
     }));
 }

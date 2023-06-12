@@ -43,7 +43,14 @@ template<
     int ROWS_,
     // The number of columns.
     int COLS,
-    int BYTES_PER_LDGS_ = 16
+    int BYTES_PER_LDGS_ = 16,
+    // TODO assert WARP_ROWS <= BlockmaskGrainRow, WARP_COLS <= BlockmaskGrainCol
+    // TODO If WARP_COLS * BYTES_PER_ELEMENT is divisible by L1 cache line size (128-byte), we don't waste the bandwidth of a global memory access.
+    // TODO For fp16, that is at least 64 elements in a warp tile's row.
+    // The number of rows of Q, K or V loaded by a warp.
+    int WARP_ROWS = 4,
+    // The number of cols of Q, K or V loaded by a warp.
+    int WARP_COLS = 64
 >
 struct Gmem_tile_qkv {
 
@@ -55,12 +62,15 @@ struct Gmem_tile_qkv {
     // The size of a row in bytes.
     static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
-    // The number of threads to load a "row" of the matrix.
-    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
-
     static constexpr int ROWS = ROWS_;
+
+    // TODO assert that warp num is enough to load a row of cta tile.
+    static constexpr int BYTES_PER_WARP_ROW = WARP_COLS * BITS_PER_ELEMENT / 8;
+    static constexpr int WARPS_PER_ROW = BYTES_PER_ROW / BYTES_PER_WARP_ROW;
+    static constexpr int THREADS_PER_WARP_ROW = BYTES_PER_WARP_ROW / BYTES_PER_LDG;
+
     // The number of "rows" loaded per LDG.
-    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
+    static constexpr int ROWS_PER_LDG = WARP_ROWS * Cta_tile::WARPS_PER_CTA / WARPS_PER_ROW;
     // The number of LDGs needed to load a chunk of the Q matrix.
     static constexpr int LDGS = DivUpConstexpr(ROWS, ROWS_PER_LDG);
 
@@ -72,13 +82,16 @@ struct Gmem_tile_qkv {
         : row_stride_in_bytes(row_stride_in_elts * BYTES_PER_ELEMENT)
         , actual_seqlen(use_seqlen_q ? binfo.actual_seqlen_q : binfo.actual_seqlen_k)
         , ptr(reinterpret_cast<char *>(ptr_))
-        , tidx_(tidx)
-        , col_predicate((tidx % THREADS_PER_ROW) * (BYTES_PER_LDG / BYTES_PER_ELEMENT) < headdim) {
+        , tidx_(tidx) {
 
+	int warpId = tidx / Cta_tile::THREADS_PER_WARP;
+	int laneId = tidx % Cta_tile::THREADS_PER_WARP;
         // Compute the position in the sequence (within the CTA for the moment).
-        int row = tidx / THREADS_PER_ROW;
+	int row = (warpId / WARPS_PER_ROW) * WARP_ROWS + laneId/THREADS_PER_WARP_ROW;
         // Compute the position of the thread in the row.
-        int col = tidx % THREADS_PER_ROW;
+	int col = (warpId % WARPS_PER_ROW)*THREADS_PER_WARP_ROW+laneId%THREADS_PER_WARP_ROW;
+
+	col_predicate = col * (BYTES_PER_LDG / BYTES_PER_ELEMENT) < headdim;
 
         // Store the row as we need it to disable the loads.
         // TD [2022-04-16]: To minimize registers, we'll recompute row_ instead of storing it
@@ -106,10 +119,12 @@ struct Gmem_tile_qkv {
         , tidx_(tidx)
         , col_predicate(true) {
 
+	int warpId = tidx / Cta_tile::THREADS_PER_WARP;
+	int laneId = tidx % Cta_tile::THREADS_PER_WARP;
         // Compute the position in the sequence (within the CTA for the moment).
-        int row = tidx / THREADS_PER_ROW;
+	int row = (warpId / WARPS_PER_ROW) * WARP_ROWS + laneId / THREADS_PER_WARP_ROW;
         // Compute the position of the thread in the row.
-        int col = tidx % THREADS_PER_ROW;
+	int col = (warpId % WARPS_PER_ROW) * THREADS_PER_WARP_ROW + laneId % THREADS_PER_WARP_ROW;
 
         // Store the row as we need it to disable the loads.
         // TD [2022-04-16]: To minimize registers, we'll recompute row_ instead of storing it
@@ -134,14 +149,19 @@ struct Gmem_tile_qkv {
     }
 
     inline __device__ void load() {
-        int row_ = tidx_ / THREADS_PER_ROW;
+        int warpId = tidx / Cta_tile::THREADS_PER_WARP;
+	int laneId = tidx % Cta_tile::THREADS_PER_WARP;
+	int row_ = (warpId / WARPS_PER_ROW) * WARP_ROWS + laneId/THREADS_PER_WARP_ROW;
+	int col_ = (warpId % WARPS_PER_ROW)*THREADS_PER_WARP_ROW+laneId%THREADS_PER_WARP_ROW;
         const void *ptrs[LDGS];
-        uint32_t preds[LDGS];
+	// TODO assert each lane only load once in a warp tile.
         #pragma unroll
         for( int ii = 0; ii < LDGS; ++ii ) {
             // ptrs[ii] = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             ptrs[ii] = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
-            preds[ii] = col_predicate && ((row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen));
+	    // TODO assert that elements in a LDG share the same blockmask val. So we just check the blockmask val for the first element.
+	    // TODO assert that (row_, col_ * (BYTES_PER_LDG / BYTES_PER_ELEMENT)) is in the range of blockmask. Though following code uses a trick to avoid invalid memory access.
+            preds[ii] = col_predicate && ((row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen)) && blockmask.predicate(row_, col_ * (BYTES_PER_LDG / BYTES_PER_ELEMENT));
             fetch_[ii] = make_uint4(0, 0, 0, 0);
         }
 
@@ -155,12 +175,11 @@ struct Gmem_tile_qkv {
 
     // Store data to memory.
     inline __device__ void store(const uint4 (&data)[LDGS]) {
-        int row_ = tidx_ / THREADS_PER_ROW;
         #pragma unroll
         for( int ii = 0; ii < LDGS; ++ii ) {
             // char *ptr_ = ptr + (int64_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
             char *ptr_ = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
-            if (col_predicate && (row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen)) {
+            if (preds[LDGS]) {
                 fmha::stg(ptr_, data[ii]);
             }
         }
@@ -185,6 +204,8 @@ struct Gmem_tile_qkv {
     // The length of the sequence loaded by that memory tile.
     int actual_seqlen;
     const bool col_predicate;
+    // TODO umiswing reduce reg use
+    uint32_t preds[LDGS];
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
