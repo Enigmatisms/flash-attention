@@ -94,10 +94,13 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
     // if( binfo.stop_early() ) return;
     if( binfo.stop_early(loop_step_idx * Cta_tile_p::N) ) return;
 
-    Blockmask blockmask(params, loop_step_idx);
+    Blockmask<> blockmask(params, loop_step_idx, Cta_tile_p::M);
     int block_row_idx = 0;
+#if 0
     int mask_val = blockmask.mask_val(0);
-    if (mask_val == -1) return;
+#endif
+    // TODO should we keep this?
+    if (blockmask.threadblock_tile_predicate() == -1) return;
     // if ((threadIdx.x == 0) && (blockIdx.x == 0) && (blockIdx.y == 0)) {
     //     printf("mask_val = %d.\n", mask_val);
     // }
@@ -117,7 +120,7 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
 
     // Wind gmem tiles to the correct position.
     static_assert(Cta_tile_p::N % Cta_tile_p::M == 0);
-    int block_row_idx_next = mask_val / 4;
+    int block_row_idx_next = blockmask.threadblock_tile_row_idx();
     int block_row_idx_to_move = block_row_idx_next - block_row_idx;
     gmem_q.move(block_row_idx_to_move);
     gmem_o.move(block_row_idx_to_move);
@@ -153,11 +156,11 @@ inline __device__ void device_block_1xN_(const Params &params, const int bidb, c
     }
 
     // Trigger the loads for K.
-    gmem_k.load();
+    gmem_k.load(blockmask);
     // Trigger the loads for Q.
-    gmem_q.load();
+    gmem_q.load(blockmask);
     // Trigger the loads for V.
-    gmem_v.load();
+    gmem_v.load(blockmask);
 
     if (!Is_first) { __syncthreads(); }
 

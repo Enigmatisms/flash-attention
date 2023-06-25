@@ -190,6 +190,154 @@ struct Gmem_tile_qkv {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<
+    // The dimensions of the tile computed by the CTA.
+    typename Cta_tile_,
+    // The number of bits per element.
+    int BITS_PER_ELEMENT,
+    // The number of rows of Q, K or V loaded by this tile.
+    int ROWS_,
+    // The number of columns.
+    int COLS,
+    int BYTES_PER_LDGS_ = 16,
+    typename Base = Gmem_tile_qkv<Cta_tile, BITS_PER_ELEMENT, ROWS_, COLS, BYTES_PER_LDGS>
+>
+struct Gmem_tile_q
+    : public Gmem_tile_qkv<Cta_tile, BITS_PER_ELEMENT, ROWS_, COLS, BYTES_PER_LDGS> {
+    // The base class.
+    using Base = Gmem_tile_qkv<Cta_tile, BITS_PER_ELEMENT, ROWS_, COLS, BYTES_PER_LDGS>;
+
+    // Ctor.
+    template<typename BInfo>
+    inline __device__ Gmem_tile_q(void *ptr_, const uint32_t row_stride_in_elts,
+                                  const uint32_t head_stride_in_elts, const int headdim,
+                                  const BInfo &binfo, const int tidx, bool use_seqlen_q)
+                      : Base(void *ptr_, const uint32_t row_stride_in_elts,
+                             const uint32_t head_stride_in_elts, const int headdim,
+                             const BInfo &binfo, const int tidx, bool use_seqlen_q) {
+    }
+
+    // Ctor.
+    template<typename BInfo>
+    inline __device__ Gmem_tile_q(void *ptr_, const uint32_t row_stride_in_elts,
+                                    const uint32_t head_stride_in_elts, 
+                                    const BInfo &binfo, const int tidx, bool use_seqlen_q)
+                      : Base(void *ptr_, const uint32_t row_stride_in_elts,
+                             const uint32_t head_stride_in_elts, 
+                             const BInfo &binfo, const int tidx, bool use_seqlen_q) {
+    }
+
+};
+
+template<
+    // The dimensions of the tile computed by the CTA.
+    typename Cta_tile_,
+    // The number of bits per element.
+    int BITS_PER_ELEMENT,
+    // The number of rows of Q, K or V loaded by this tile.
+    int ROWS_,
+    // The number of columns.
+    int COLS,
+    int BYTES_PER_LDGS_ = 16,
+    // TODO to use L1 cache line and avoid bank conflict, assert WARP_TILE_COLS >= 64 (128 bytes)
+    int WARP_TILE_COLS = 256
+    typename Base = Gmem_tile_qkv<Cta_tile, BITS_PER_ELEMENT, ROWS_, COLS, BYTES_PER_LDGS>
+>
+struct Gmem_tile_k
+    : public Gmem_tile_qkv<Cta_tile, BITS_PER_ELEMENT, ROWS_, COLS, BYTES_PER_LDGS> {
+    // The base class.
+    using Base = Gmem_tile_qkv<Cta_tile, BITS_PER_ELEMENT, ROWS_, COLS, BYTES_PER_LDGS>;
+    static constexpr int BYTES_PER_WARP_TILE_ROW = WARP_TILE_COLS * Base::BYTES_PER_ELEMENT;
+    static constexpr int WARPS_PER_ROW = Base::BYTES_PER_ROW / BYTES_PER_WARP_TILE_ROW;
+    static constexpr int WARPS_PER_COL = Base::Cta_tile::WARPS_PER_CTA / WARPS_PER_ROW;
+    static constexpr int THREADS_PER_WARP_TILE_ROW = BYTES_PER_WARP_TILE_ROW / BYTES_PER_LDG;
+    static constexpr int WARP_TILE_ROWS = Cta_tile::THREADS_PER_WARP / THREADS_PER_WARP_TILE_ROW;
+    static constexpr int ROWS_PER_LDG = Cta_tile::WARPS_PER_CTA * WARP_TILE_ROWS;
+    static constexpr int ELEMENT_PER_LDG = Base::BYTES_PER_LDG / Base::BYTES_PER_ELEMENT;
+    static constexpr int LDGS = DivUpConstexpr(ROWS, ROWS_PER_LDG);
+
+    // Ctor.
+    template<typename BInfo>
+    inline __device__ Gmem_tile_k(void *ptr_, const uint32_t row_stride_in_elts,
+                                  const uint32_t head_stride_in_elts, const int headdim,
+                                  const BInfo &binfo, const int tidx, bool use_seqlen_q)
+                      : Base(void *ptr_, const uint32_t row_stride_in_elts,
+                             const uint32_t head_stride_in_elts, const int headdim,
+                             const BInfo &binfo, const int tidx, bool use_seqlen_q) {
+	int warpId = tidx / Base::Cta_tile::THREADS_PER_WARP;
+        int laneId = tidx % Base::Cta_tile::THREADS_PER_WARP;
+        int row = warpId / WARPS_PER_ROW + laneId / THREADS_PER_WARP_TILE_ROW;
+	int col = warpId % WARPS_PER_ROW + laneId % THREADS_PER_WARP_TILE_ROW;
+        uint32_t row_offset = (uint32_t)(((use_seqlen_q ? binfo.sum_s_q : binfo.sum_s_k) + row) * row_stride_in_bytes);
+        row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
+        ptr += row_offset + col * BYTES_PER_LDG;
+    }
+
+    // Ctor.
+    template<typename BInfo>
+    inline __device__ Gmem_tile_k(void *ptr_, const uint32_t row_stride_in_elts,
+                                    const uint32_t head_stride_in_elts, 
+                                    const BInfo &binfo, const int tidx, bool use_seqlen_q)
+                      : Base(void *ptr_, const uint32_t row_stride_in_elts,
+                             const uint32_t head_stride_in_elts, 
+                             const BInfo &binfo, const int tidx, bool use_seqlen_q) {
+	int warpId = tidx / Base::Cta_tile::THREADS_PER_WARP;
+        int laneId = tidx % Base::Cta_tile::THREADS_PER_WARP;
+        int row = warpId / WARPS_PER_ROW + laneId / THREADS_PER_WARP_TILE_ROW;
+	int col = warpId % WARPS_PER_ROW + laneId % THREADS_PER_WARP_TILE_ROW;
+        uint32_t row_offset = (uint32_t)(((use_seqlen_q ? binfo.sum_s_q : binfo.sum_s_k) + row) * row_stride_in_bytes);
+        row_offset += (uint32_t)(binfo.bidh * head_stride_in_elts * BYTES_PER_ELEMENT);
+        ptr += row_offset + col * BYTES_PER_LDG;
+    }
+
+    inline __device__ void load() {
+        const void *ptrs[LDGS];
+	int warpId = tidx / Base::Cta_tile::THREADS_PER_WARP;
+        int laneId = tidx % Base::Cta_tile::THREADS_PER_WARP;
+        int row = warpId / WARPS_PER_ROW + laneId / THREADS_PER_WARP_TILE_ROW;
+	int col = warpId % WARPS_PER_ROW + laneId % THREADS_PER_WARP_TILE_ROW;
+        #pragma unroll
+        for( int ii = 0; ii < LDGS; ++ii ) {
+            ptrs[ii] = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
+	    // TODO only lane0 access the blockmask val
+            preds[ii] = col_predicate && ((row_ + ii * ROWS_PER_LDG) < min(ROWS, actual_seqlen)) && blockmask.predicate(row + ii * ROWS_PER_LDG, col * ELEMENT_PER_LDG);
+            fetch_[ii] = make_uint4(0, 0, 0, 0);
+        }
+
+        // not packing predicates removes restrictions (e.g. FP16 384, 4 warps)
+        Ldg_functor<uint4, LDGS> fct(fetch_, ptrs);
+        #pragma unroll
+        for( int ii = 0; ii < LDGS; ++ii ) {
+            fct.load(ii, preds[ii]);
+        }
+    }
+
+    inline __device__ void store(const uint4 (&data)[LDGS]) {
+	int warpId = tidx / Base::Cta_tile::THREADS_PER_WARP;
+        int laneId = tidx % Base::Cta_tile::THREADS_PER_WARP;
+        int row = warpId / WARPS_PER_ROW + laneId / THREADS_PER_WARP_TILE_ROW;
+	int col = warpId % WARPS_PER_ROW + laneId % THREADS_PER_WARP_TILE_ROW;
+        #pragma unroll
+        for( int ii = 0; ii < LDGS; ++ii ) {
+            char *ptr_ = ptr + (uint32_t)ii * ROWS_PER_LDG * row_stride_in_bytes;
+            if (preds[i]) {
+                fmha::stg(ptr_, data[ii]);
+            }
+        }
+    }
+
+    // It's very lucky that we can avoid bank conflict when WARP_TILE_COLS >= 64,
+    // since lane0-lane7 access to different banks, so as following phases.
+    inline __device__ void commit() {
+    }
+
+    // TODO reduce reg use.
+    uint32_t preds[LDGS];
+
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<
     typename Cta_tile,
     int BYTES_PER_ELEMENT = 2
 >
