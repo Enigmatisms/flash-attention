@@ -310,11 +310,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     unsigned long long seed = std::get<0>(seeds);
     unsigned long long offset = std::get<1>(seeds) + (bidb * params.h + bidh) * 32 + tidx % 32;
 
-    // Save seed and offset for backward.
-    if (block_id == 0 && tidx == 0) {
-        params.rng_state[0] = seed;
-        params.rng_state[1] = std::get<1>(seeds);
-    }
+    // (umiswing): paddle will save seed and offset before calling fa2.
+    // // Save seed and offset for backward.
+    // if (block_id == 0 && tidx == 0) {
+    //     params.rng_state[0] = seed;
+    //     params.rng_state[1] = std::get<1>(seeds);
+    // }
 
     clear(acc_o);
 

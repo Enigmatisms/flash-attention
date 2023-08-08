@@ -96,8 +96,9 @@ struct Flash_fwd_params : public Qkv_params {
     // Random state.
     at::PhiloxCudaState philox_args;
 
-    // Pointer to the RNG seed (idx 0) and offset (idx 1).
-    uint64_t * rng_state;
+    // (umiswing): we only read rng_state in bwd now.
+    // // Pointer to the RNG seed (idx 0) and offset (idx 1).
+    // uint64_t rng_state[2];
 
     bool is_bf16;
     bool is_causal;
@@ -106,6 +107,8 @@ struct Flash_fwd_params : public Qkv_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Flash_bwd_params : public Flash_fwd_params {
+    // Pointer to the RNG seed (idx 0) and offset (idx 1).
+    uint64_t rng_state[2];
 
     // The dO and dQKV matrices.
     void *__restrict__ do_ptr;
