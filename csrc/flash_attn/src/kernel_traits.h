@@ -155,7 +155,7 @@ struct Flash_fwd_kernel_traits : public Base {
 
     using GmemCopyAtomMask = Copy_Atom<DefaultCopy, elem_type>;
     using GmemTiledCopyP = decltype(
-        make_tiled_copy(Copy_Atom<DefaultCopy, elem_type>{},
+        make_tiled_copy(Copy_Atom<DefaultCopy, float>{},
                         GmemLayoutAtomP{},
                         Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
 

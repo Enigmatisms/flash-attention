@@ -838,6 +838,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                                                n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
                                                                params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockM * params.seqlen_k);
+        } else {
+            flash::apply_mask_local(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                                    binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                    binfo.actual_seqlen_q, AtomLayoutMS * 16);
         }
         if (!Is_causal) {
             if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {

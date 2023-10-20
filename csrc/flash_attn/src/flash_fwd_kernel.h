@@ -71,6 +71,7 @@ make_tiled_copy_C_warpcontiguousM(Copy_Atom<Args...> const& copy_atom,
 template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1, typename Tensor2>
 inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
                                          Tensor2 &acc_o, float softmax_scale_log2) {
+
     if (Is_first) {
         flash::template reduce_max</*zero_init=*/true>(scores, scores_max);
         flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
@@ -83,9 +84,10 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         #pragma unroll
         for (int mi = 0; mi < size(scores_max); ++mi) {
-            float scores_max_cur = !Check_inf
-                ? scores_max(mi)
-                : (scores_max(mi) == -INFINITY ? 0.0f : scores_max(mi));
+            /* float scores_max_cur = !Check_inf */
+            /*     ? scores_max(mi) */
+            /*     : (scores_max(mi) == -INFINITY ? 0.0f : scores_max(mi)); */
+            float scores_max_cur = scores_max(mi) == -INFINITY ? 0.0f : scores_max(mi);
             float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
             scores_sum(mi) *= scores_scale;
             #pragma unroll
@@ -97,6 +99,7 @@ inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, T
         #pragma unroll
         for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); }
     }
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -185,7 +188,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
-    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
+    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<float *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
 
@@ -386,6 +389,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                                                             n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
+        } else {
+            flash::apply_mask_local(
+            scores, n_block * kBlockN, binfo.actual_seqlen_k,
+            m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+            binfo.actual_seqlen_q, kNWarps * 16);
         }
 
         // if (cute::thread0()) { print(scores); }
@@ -499,6 +507,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                                                             n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
                                                             params.unscale_softmax);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
+        } else {
+            flash::apply_mask_local(
+            scores, n_block * kBlockN, binfo.actual_seqlen_k,
+            m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+            binfo.actual_seqlen_q, kNWarps * 16);
         }
 
         softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);

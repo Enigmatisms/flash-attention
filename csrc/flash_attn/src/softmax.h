@@ -140,6 +140,46 @@ inline __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const uint32_t
     }
 }
 
+template <bool HasWSLeft=true, typename Engine, typename Layout>
+inline __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
+                                        const int max_seqlen_k, const int row_idx_offset_,
+                                        const int max_seqlen_q, const int warp_row_stride) {
+    // tensor has shape (ncol=(2, MMA_M), nrow=(2, MMA_N))
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+    const int lane_id = threadIdx.x % 32;
+    // const int row_idx_offset = row_idx_offset_ + lane_id / 4;
+    const int row_idx_offset = row_idx_offset_;
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+    #pragma unroll
+    for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+        const int row_idx_base = row_idx_offset + mi * warp_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size<0, 0>(tensor); ++i) {
+            const int row_idx = row_idx_base + i * 8;
+            #pragma unroll
+            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                const int col_idx_base = col_idx_offset + nj * 8;
+                const uint32_t col_idx_limit = std::min(max_seqlen_k, row_idx + 1);
+                #pragma unroll
+                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                    const int col_idx = col_idx_base + j;
+                    /* if (col_idx >= col_idx_limit || (row_idx >= max_seqlen_q/2 && col_idx < max_seqlen_k/2)) { */
+                    /*     /\* tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY; *\/ */
+                    /*     tensor(make_coord(i, mi), make_coord(j, nj)) += row_idx + col_idx; */
+                    /* } */
+                    /* tensor(make_coord(i, mi), make_coord(j, nj)) = tensor(make_coord(i, mi), make_coord(j, nj)) + static_cast<cutlass::bfloat16_t>(static_cast<float>(col_idx*(row_idx+1)/1234567.f)); */
+                    tensor(make_coord(i, mi), make_coord(j, nj)) = tensor(make_coord(i, mi), make_coord(j, nj)) + static_cast<cutlass::bfloat16_t>(static_cast<float>((col_idx+row_idx*max_seqlen_k)/1234567.f));
+                }
+            }
+            // if (cute::thread0()) {
+            //     printf("mi = %d, i = %d, row_idx = %d, max_seqlen_k = %d\n", mi, i, row_idx, max_seqlen_k);
+            //     print(tensor(make_coord(i, mi), _));
+            //     // print(tensor(_, j + nj * size<1, 0>(tensor)));
+            // }
+        }
+    }
+}
+
 template <typename Engine, typename Layout>
 inline __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor, const uint32_t col_idx_offset_,
                                          const uint32_t max_seqlen_k, const uint32_t row_idx_offset_,
@@ -251,7 +291,8 @@ inline __device__ void apply_attn_mask(
     #pragma unroll
     for (int i = 0; i < size(tPrScores); ++i) {
         if (elem_less(tPcMask(i), make_coord(seqlen_q, seqlen_k))) {
-            tPrScores(i) = tPrScores(i) + tPgMask(i) * unscale_softmax;
+            /* tPrScores(i) = tPrScores(i) + tPgMask(i) * unscale_softmax; */
+            tPrScores(i) = tPrScores(i) + tPgMask(i);
         }
     }
 }
@@ -261,6 +302,7 @@ inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor, uint8_t p_d
                                      unsigned long long seed, unsigned long long offset,
                                      uint32_t block_row_start, uint32_t block_col_start,
                                      uint32_t block_row_stride) {
+#if 0
     // tensor has shape (8, MMA_M, MMA_N / 2)
     using T = typename Engine::value_type;
     auto encode_dropout = [](bool keep, T val) {
@@ -322,6 +364,7 @@ inline __device__ void apply_dropout(Tensor<Engine, Layout> &tensor, uint8_t p_d
             // // }
         }
     }
+#endif
 }
 
 }  // namespace flash
