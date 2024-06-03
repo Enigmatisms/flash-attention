@@ -95,125 +95,6 @@ const char *flash_attn_error() {
       const int64_t * mask_dims = nullptr;              \
       CHECK_BWD_EXECTUABLE(__seqlen_q, __seqlen_k)
 
-void set_params_fprop_strided(Flash_fwd_params &params,
-                      // sizes
-                      const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t seqlen_q_rounded,
-                      const size_t seqlen_k_rounded,
-                      const size_t h,
-                      const size_t h_k,
-                      const size_t d,
-                      const size_t d_rounded,
-                      // device pointers
-                      void * const q,
-                      void * const k,
-                      void * const v,
-                      void * const out,
-                      void * const cu_seqlens_q_d,
-                      void * const cu_seqlens_k_d,
-                      void * const p_d,
-                      void * const softmax_lse_d,
-                      float p_dropout,
-                      float softmax_scale,
-                      float softmax_unscale,
-                      bool is_causal,
-                      bool is_bf16,
-                      const int q_row_stride,
-                      const int k_row_stride,
-                      const int v_row_stride,
-                      const int q_head_stride,
-                      const int k_head_stride,
-                      const int v_head_stride,
-                      const int o_row_stride,
-                      const int o_head_stride,
-                      const int q_batch_stride,
-                      const int k_batch_stride,
-                      const int v_batch_stride,
-                      const int o_batch_stride,
-                      bool varlen_padded_input = false,
-                      void * attn_mask = nullptr,
-                      void * attn_mask_start_row_indices = nullptr,
-                      const int attn_mask_start_row = 0,
-                      int mask_head_mod_size = 0,
-                      int mask_seq_q_mod_size = 0) {
-    // Reset the parameters
-    memset(&params, 0, sizeof(params));
-
-    params.is_bf16 = is_bf16;
-    // Set the pointers and strides.
-    params.q_ptr = q;
-    params.k_ptr = k;
-    params.v_ptr = v;
-    // All stride are in elements, not bytes.
-    params.q_row_stride = q_row_stride;
-    params.k_row_stride = k_row_stride;
-    params.v_row_stride = v_row_stride;
-    params.q_head_stride = q_head_stride;
-    params.k_head_stride = k_head_stride;
-    params.v_head_stride = v_head_stride;
-    params.o_ptr = out;
-    params.o_row_stride = o_row_stride;
-    params.o_head_stride = o_head_stride;
-    params.varlen_padded_input = varlen_padded_input;
-
-    if (cu_seqlens_q_d == nullptr ||  params.varlen_padded_input) {
-        params.q_batch_stride = q_batch_stride;
-        params.k_batch_stride = k_batch_stride;
-        params.v_batch_stride = v_batch_stride;
-        params.o_batch_stride = o_batch_stride;
-    }
-
-    params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
-    params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
-
-    // P = softmax(QK^T)
-    params.p_ptr = p_d;
-
-    // Softmax sum
-    params.softmax_lse_ptr = softmax_lse_d;
-
-    // Set the dimensions.
-    params.b = b;
-    params.h = h;
-    params.h_k = h_k;
-    params.h_h_k_ratio = h / h_k;
-    params.seqlen_q = seqlen_q;
-    params.seqlen_k = seqlen_k;
-    params.seqlen_q_rounded = seqlen_q_rounded;
-    params.seqlen_k_rounded = seqlen_k_rounded;
-    params.d = d;
-    params.d_rounded = d_rounded;
-
-    // attn mask
-    params.attn_mask_ptr = attn_mask;
-    params.mask_head_mod_size = mask_head_mod_size;
-    params.mask_seq_q_mod_size = mask_seq_q_mod_size;
-
-    // sparse mask row index
-    params.attn_mask_start_row_indices_ptr = attn_mask_start_row_indices;
-    params.attn_mask_start_row = attn_mask_start_row;
-
-    // Set the different scale values.
-    params.scale_softmax = softmax_scale;
-    params.scale_softmax_log2 = softmax_scale * M_LOG2E;
-    params.unscale_softmax = softmax_unscale;
-
-    // Set this to probability of keeping an element to simplify things.
-    params.p_dropout = 1.f - p_dropout;
-    // Convert p from float to int so we don't have to convert the random uint to float to compare.
-    // [Minor] We want to round down since when we do the comparison we use <= instead of <
-    // params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
-    // params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
-    params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
-    params.rp_dropout = 1.f / params.p_dropout;
-    params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
-    ASSERT_CHECK(p_dropout < 1.f);
-
-    params.is_causal = is_causal;
-}
-
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -847,56 +728,32 @@ bool reduce_attn_scores(const void * const q,
 
     Reduce_attn_scores_params params;
 
-    set_params_dgrad_strided(params,
-                             batch_size,
-                             seqlen_q, seqlen_k,
-                             /*seqlen_q_rounded=*/0, /*seqlen_k_rounded=*/0,
-                             num_heads, num_heads_k,
-                             head_size, /*head_size_rounded=*/0,
-                             const_cast<void *>(q),
-                             const_cast<void *>(k),
-                             /*v=*/nullptr,
-                             const_cast<void *>(reduced_scores),
-                             /*dout=*/nullptr,
-                             /*dq=*/nullptr,
-                             /*dk=*/nullptr,
-                             /*dv=*/nullptr,
-                             /*cu_seqlens_q_d=*/nullptr,
-                             /*cu_seqlens_k_d=*/nullptr,
-                             /*dq_accum_d=*/nullptr,
-                             /*dk_accum_d=*/nullptr,
-                             /*dv_accum_d=*/nullptr,
-                             const_cast<void *>(softmax_lse),
-                             /*dsoftmax_sum_d=*/nullptr,
-                             /*p_dropout=*/0.0f,
-                             softmax_scale,
-                             /*softmax_unscale=*/0,
-                             /*is_causal=*/false,
-                             is_bf16,
-                             q_row_stride,
-                             k_row_stride,
-                             /*v_row_stride=*/0,
-                             q_head_stride,
-                             k_head_stride,
-                             /*v_head_stride=*/0,
-                             o_row_stride,
-                             o_head_stride,
-                             q_batch_stride,
-                             k_batch_stride,
-                             /*v_batch_stride=*/0,
-                             o_batch_stride,
-                             /*dq_row_stride=*/0,
-                             /*dk_row_stride=*/0,
-                             /*dv_row_stride=*/0,
-                             /*dq_head_stride=*/0,
-                             /*dk_head_stride=*/0,
-                             /*dv_head_stride=*/0,
-                             /*do_row_stride=*/0,
-                             /*do_head_stride=*/0,
-                             /*dq_batch_stride=*/0,
-                             /*dk_batch_stride=*/0,
-                             /*dv_batch_stride=*/0,
-                             /*do_batch_stride=*/0);
+    set_params_dgrad(params,
+                     batch_size,
+                     seqlen_q, seqlen_k,
+                     /*seqlen_q_rounded=*/0, /*seqlen_k_rounded=*/0,
+                     num_heads, num_heads_k,
+                     head_size, /*head_size_rounded=*/0,
+                     const_cast<void *>(q),
+                     const_cast<void *>(k),
+                     /*v=*/nullptr,
+                     const_cast<void *>(reduced_scores),
+                     /*dout=*/nullptr,
+                     /*dq=*/nullptr,
+                     /*dk=*/nullptr,
+                     /*dv=*/nullptr,
+                     /*cu_seqlens_q_d=*/nullptr,
+                     /*cu_seqlens_k_d=*/nullptr,
+                     /*dq_accum_d=*/nullptr,
+                     /*dk_accum_d=*/nullptr,
+                     /*dv_accum_d=*/nullptr,
+                     const_cast<void *>(softmax_lse),
+                     /*dsoftmax_sum_d=*/nullptr,
+                     /*p_dropout=*/0.0f,
+                     softmax_scale,
+                     /*softmax_unscale=*/0,
+                     /*is_causal=*/false,
+                     is_bf16);
 
     params.reduced_scores = reduced_scores;
     params.p_ptr = softmax_ptr;
