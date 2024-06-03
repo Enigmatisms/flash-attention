@@ -213,6 +213,7 @@ void set_params_fprop_strided(Flash_fwd_params &params,
 
     params.is_causal = is_causal;
 }
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -406,122 +407,6 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.num_splits = num_splits;
 }
 
-void set_params_dgrad_strided(Flash_bwd_params &params,
-                      // sizes
-                      const size_t b,
-                      const size_t seqlen_q,
-                      const size_t seqlen_k,
-                      const size_t seqlen_q_rounded,
-                      const size_t seqlen_k_rounded,
-                      const size_t h,
-                      const size_t h_k,
-                      const size_t d,
-                      const size_t d_rounded,
-                      // device pointers
-                      void * const q,
-                      void * const k,
-                      void * const v,
-                      void * const out,
-                      void * const dout,
-                      void * const dq,
-                      void * const dk,
-                      void * const dv,
-                      void * const cu_seqlens_q_d,
-                      void * const cu_seqlens_k_d,
-                      void * const dq_accum_d,
-                      void * const dk_accum_d,
-                      void * const dv_accum_d,
-                      void * const softmax_lse_d,
-                      void * const dsoftmax_sum_d,
-                      float p_dropout,
-                      float softmax_scale,
-                      float softmax_unscale,
-                      bool is_causal,
-                      bool is_bf16,
-                      const int q_row_stride,
-                      const int k_row_stride,
-                      const int v_row_stride,
-                      const int q_head_stride,
-                      const int k_head_stride,
-                      const int v_head_stride,
-                      const int o_row_stride,
-                      const int o_head_stride,
-                      const int q_batch_stride,
-                      const int k_batch_stride,
-                      const int v_batch_stride,
-                      const int o_batch_stride,
-                      const int dq_row_stride,
-                      const int dk_row_stride,
-                      const int dv_row_stride,
-                      const int dq_head_stride,
-                      const int dk_head_stride,
-                      const int dv_head_stride,
-                      const int do_row_stride,
-                      const int do_head_stride,
-                      const int dq_batch_stride,
-                      const int dk_batch_stride,
-                      const int dv_batch_stride,
-                      const int do_batch_stride,
-                      const bool varlen_padded_input = false,
-                      const int num_splits = 0,
-                      void * attn_mask = nullptr,
-                      void * attn_mask_start_row_indices = nullptr,
-                      const int attn_mask_start_row = 0,
-                      int mask_head_mod_size = 0,
-                      int mask_seq_q_mod_size = 0) {
-
-    set_params_fprop_strided(params,
-                     b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
-                     q, k, v, out,
-                     cu_seqlens_q_d,
-                     cu_seqlens_k_d,
-                     nullptr,
-                     softmax_lse_d,
-                     p_dropout,
-                     softmax_scale,
-                     softmax_unscale,
-                     is_causal,
-                     is_bf16,
-                     q_row_stride,k_row_stride,v_row_stride,
-                     q_head_stride,k_head_stride,v_head_stride,
-                     o_row_stride,o_head_stride,
-                     q_batch_stride,k_batch_stride,v_batch_stride,o_batch_stride,
-                     varlen_padded_input,
-                     attn_mask,
-                     attn_mask_start_row_indices,
-                     attn_mask_start_row,
-                     mask_head_mod_size,
-                     mask_seq_q_mod_size);
-
-    // Set the pointers and strides.
-    params.do_ptr = dout;
-    params.do_row_stride = do_row_stride;
-    params.do_head_stride = do_head_stride;
-    params.dq_ptr = dq;
-    params.dk_ptr = dk;
-    params.dv_ptr = dv;
-    params.dq_row_stride = dq_row_stride;
-    params.dk_row_stride = dk_row_stride;
-    params.dv_row_stride = dv_row_stride;
-    params.dq_head_stride = dq_head_stride;
-    params.dk_head_stride = dk_head_stride;
-    params.dv_head_stride = dv_head_stride;
-
-    if (cu_seqlens_q_d == nullptr || varlen_padded_input) {
-        params.do_batch_stride = do_batch_stride;
-        params.dq_batch_stride = dq_batch_stride;
-        params.dk_batch_stride = dk_batch_stride;
-        params.dv_batch_stride = dv_batch_stride;
-    }
-    params.dq_accum_ptr = dq_accum_d;
-    params.dk_accum_ptr = dk_accum_d;
-    params.dv_accum_ptr = dv_accum_d;
-
-    // Softmax sum
-    params.dsoftmax_sum = dsoftmax_sum_d;
-    params.num_splits = num_splits;
-}
-
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     FP16_SWITCH(!params.is_bf16, [&] {
         FWD_HEADDIM_SWITCH(params.d, [&] {
@@ -585,19 +470,7 @@ bool flash_attn_fwd(const void * const q,
                     const int64_t * const mask_dims,
                     const void * const attn_mask_start_row_indices,
                     const int64_t * const attn_mask_start_row_indices_dims,
-                    const int attn_mask_start_row,
-                    const int q_row_stride,
-                    const int k_row_stride,
-                    const int v_row_stride,
-                    const int q_head_stride,
-                    const int k_head_stride,
-                    const int v_head_stride,
-                    const int o_row_stride,
-                    const int o_head_stride,
-                    const int q_batch_stride,
-                    const int k_batch_stride,
-                    const int v_batch_stride,
-                    const int o_batch_stride) {
+                    const int attn_mask_start_row) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
     const int mask_head_mod_size = attn_mask ? mask_dims[1] : attn_mask_start_row_indices ? attn_mask_start_row_indices_dims[1] : 0;
@@ -606,7 +479,7 @@ bool flash_attn_fwd(const void * const q,
     CHECK_FWD_EXECTUABLE(seqlen_q, seqlen_k)
 
     Flash_fwd_params params;
-    set_params_fprop_strided(params,
+    set_params_fprop(params,
                      batch_size,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
@@ -625,19 +498,6 @@ bool flash_attn_fwd(const void * const q,
                      softmax_unscale,
                      is_causal,
                      is_bf16,
-                     q_row_stride,
-                     k_row_stride,
-                     v_row_stride,
-                     q_head_stride,
-                     k_head_stride,
-                     v_head_stride,
-                     o_row_stride,
-                     o_head_stride,
-                     q_batch_stride,
-                     k_batch_stride,
-                     v_batch_stride,
-                     o_batch_stride,
-                     false/*varlen_padded_input=*/,
                      const_cast<void *>(attn_mask),
                      const_cast<void *>(attn_mask_start_row_indices),
                      attn_mask_start_row,
@@ -688,28 +548,16 @@ bool flash_attn_varlen_fwd(const void * const q,
                            uint64_t seed,
                            uint64_t offset,
                            const void * const attn_mask,
-                           const int64_t * const mask_dims,
-                           const int q_row_stride,
-                           const int k_row_stride,
-                           const int v_row_stride,
-                           const int q_head_stride,
-                           const int k_head_stride,
-                           const int v_head_stride,
-                           const int o_row_stride,
-                           const int o_head_stride,
-                           const int q_batch_stride,
-                           const int k_batch_stride,
-                           const int v_batch_stride,
-                           const int o_batch_stride,
-                           bool varlen_padded_input) {
+                           const int64_t * const mask_dims) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
     const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
     const int mask_seq_q_mod_size = attn_mask ? mask_dims[2] : 0;
 
     CHECK_FWD_EXECTUABLE(max_seqlen_q, max_seqlen_k)
+    
     Flash_fwd_params params;
-    set_params_fprop_strided(params,
+    set_params_fprop(params,
                      batch_size,
                      max_seqlen_q, max_seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
@@ -728,25 +576,11 @@ bool flash_attn_varlen_fwd(const void * const q,
                      softmax_unscale,
                      is_causal,
                      is_bf16,
-                     q_row_stride,
-                     k_row_stride,
-                     v_row_stride,
-                     q_head_stride,
-                     k_head_stride,
-                     v_head_stride,
-                     o_row_stride,
-                     o_head_stride,
-                     q_batch_stride,
-                     k_batch_stride,
-                     v_batch_stride,
-                     o_batch_stride,
-                     varlen_padded_input,
                      const_cast<void *>(attn_mask),
                      nullptr,
                      -1,
                      mask_head_mod_size,
-                     mask_seq_q_mod_size
-                    );
+                     mask_seq_q_mod_size);
     
     params.rng_state = static_cast<uint64_t*>(rng_state);
 
@@ -817,31 +651,7 @@ bool flash_attn_bwd(const void * const dout,
                     const int64_t * const mask_dims,
                     const void * const attn_mask_start_row_indices,
                     const int64_t * const attn_mask_start_row_indices_dims,
-                    const int attn_mask_start_row,
-                    const int q_row_stride,
-                    const int k_row_stride,
-                    const int v_row_stride,
-                    const int q_head_stride,
-                    const int k_head_stride,
-                    const int v_head_stride,
-                    const int o_row_stride,
-                    const int o_head_stride,
-                    const int q_batch_stride,
-                    const int k_batch_stride,
-                    const int v_batch_stride,
-                    const int o_batch_stride,
-                    const int dq_row_stride,
-                    const int dk_row_stride,
-                    const int dv_row_stride,
-                    const int dq_head_stride,
-                    const int dk_head_stride,
-                    const int dv_head_stride,
-                    const int do_row_stride,
-                    const int do_head_stride,
-                    const int dq_batch_stride,
-                    const int dk_batch_stride,
-                    const int dv_batch_stride,
-                    const int do_batch_stride) {
+                    const int attn_mask_start_row) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
     const int mask_head_mod_size = attn_mask ? mask_dims[1] : attn_mask_start_row_indices ? attn_mask_start_row_indices_dims[1] : 0;
@@ -855,7 +665,7 @@ bool flash_attn_bwd(const void * const dout,
 
     Flash_bwd_params params;
 
-    set_params_dgrad_strided(params,
+    set_params_dgrad(params,
                      batch_size,
                      seqlen_q, seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
@@ -881,31 +691,6 @@ bool flash_attn_bwd(const void * const dout,
                      softmax_unscale,
                      is_causal,
                      is_bf16,
-                     q_row_stride,
-                     k_row_stride,
-                     v_row_stride,
-                     q_head_stride,
-                     k_head_stride,
-                     v_head_stride,
-                     o_row_stride,
-                     o_head_stride,
-                     q_batch_stride,
-                     k_batch_stride,
-                     v_batch_stride,
-                     o_batch_stride,
-                     dq_row_stride,
-                     dk_row_stride,
-                     dv_row_stride,
-                     dq_head_stride,
-                     dk_head_stride,
-                     dv_head_stride,
-                     do_row_stride,
-                     do_head_stride,
-                     dq_batch_stride,
-                     dk_batch_stride,
-                     dv_batch_stride,
-                     do_batch_stride,
-                     false/*varlen_padded_input=*/,
                      num_splits,
                      const_cast<void *>(attn_mask),
                      const_cast<void *>(attn_mask_start_row_indices),
@@ -964,32 +749,7 @@ bool flash_attn_varlen_bwd(const void * const dout,
                            uint64_t seed,
                            uint64_t offset,
                            const void * const attn_mask,
-                           const int64_t * const mask_dims,
-                           const int q_row_stride,
-                           const int k_row_stride,
-                           const int v_row_stride,
-                           const int q_head_stride,
-                           const int k_head_stride,
-                           const int v_head_stride,
-                           const int o_row_stride,
-                           const int o_head_stride,
-                           const int q_batch_stride,
-                           const int k_batch_stride,
-                           const int v_batch_stride,
-                           const int o_batch_stride,
-                           const int dq_row_stride,
-                           const int dk_row_stride,
-                           const int dv_row_stride,
-                           const int dq_head_stride,
-                           const int dk_head_stride,
-                           const int dv_head_stride,
-                           const int do_row_stride,
-                           const int do_head_stride,
-                           const int dq_batch_stride,
-                           const int dk_batch_stride,
-                           const int dv_batch_stride,
-                           const int do_batch_stride,
-                           const bool varlen_padded_input) {
+                           const int64_t * const mask_dims) {
     FLASHATTNLIB_BEGIN_FUNC
     const bool is_dropout = p_dropout > 0.0;
     const int mask_head_mod_size = attn_mask ? mask_dims[1] : 0;
@@ -1001,7 +761,7 @@ bool flash_attn_varlen_bwd(const void * const dout,
 
     Flash_bwd_params params;
 
-    set_params_dgrad_strided(params,
+    set_params_dgrad(params,
                      batch_size,
                      max_seqlen_q, max_seqlen_k,
                      seqlen_q_rounded, seqlen_k_rounded,
@@ -1027,31 +787,6 @@ bool flash_attn_varlen_bwd(const void * const dout,
                      softmax_unscale,
                      is_causal,
                      is_bf16,
-                     q_row_stride,
-                     k_row_stride,
-                     v_row_stride,
-                     q_head_stride,
-                     k_head_stride,
-                     v_head_stride,
-                     o_row_stride,
-                     o_head_stride,
-                     q_batch_stride,
-                     k_batch_stride,
-                     v_batch_stride,
-                     o_batch_stride,
-                     dq_row_stride,
-                     dk_row_stride,
-                     dv_row_stride,
-                     dq_head_stride,
-                     dk_head_stride,
-                     dv_head_stride,
-                     do_row_stride,
-                     do_head_stride,
-                     dq_batch_stride,
-                     dk_batch_stride,
-                     dv_batch_stride,
-                     do_batch_stride,
-                     varlen_padded_input,
                      num_splits,
                      const_cast<void *>(attn_mask),
                      nullptr,
