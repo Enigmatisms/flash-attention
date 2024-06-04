@@ -267,6 +267,8 @@ inline __device__ void reduce_attn_scores_1colblock(const Params &params, const 
                                      AtomLayoutMS * 16);
         }
 
+        // umiswing: idk why but adding __syncthreads() after gemm produces a better accuracy.
+        __syncthreads();
         CUTE_STATIC_ASSERT_V(size(local_reduced_scores) == size<1>(scores));
         static_assert(decltype(size<0>(local_reduced_scores))::value == decltype(size<1,0>(scores))::value);
         static_assert(decltype(size<1>(local_reduced_scores))::value == decltype(size<1,1>(scores))::value);
