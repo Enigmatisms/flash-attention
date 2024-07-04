@@ -68,7 +68,11 @@ inline __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor
 
 
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
+
+
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
+
+
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
     #pragma unroll
     for (int mi = 0; mi < size<0>(tensor); ++mi) {
