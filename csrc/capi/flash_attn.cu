@@ -516,11 +516,14 @@ void set_params_dgrad_strided(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+#if 0
     FP16_SWITCH(!params.is_bf16, [&] {
         FWD_HEADDIM_SWITCH(params.d, [&] {
             run_mha_fwd_<elem_type, kHeadDim>(params, stream);
         });
     });
+#endif
+            run_mha_fwd_<cutlass::half_t, 128>(params, stream);
 }
 
 #ifdef __cplusplus
@@ -631,6 +634,7 @@ bool flash_attn_fwd(const void * const q,
     FLASHATTNLIB_END_FUNC
 }
 
+#if 0
 bool flash_attn_varlen_fwd(const void * const q,
                            const void * const k,
                            const void * const v,
@@ -1175,6 +1179,7 @@ bool flash_attn_bwd_with_bias_and_mask(const void *q,              // total_q x 
                                               mask_dims,
                                               bias_dims);
 }
+#endif
 #ifdef __cplusplus
 }
 #endif
