@@ -131,26 +131,9 @@ inline __device__ void write_softmax_to_gmem(
 
 // template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, bool Return_softmax, bool Is_attn_mask, bool Is_equal_seq_qk, typename Params>
 template<typename Kernel_traits, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block, const unsigned char conditions_fuck) {
-#if 0
-constexpr bool Is_dropout = false;
-constexpr bool Is_causal = false;
-constexpr bool Is_even_N = true;
-constexpr bool Is_even_K = true;
-constexpr bool Return_softmax = false;
-constexpr bool Is_attn_mask = false;
-constexpr bool Is_equal_seq_qk = false;
-#endif
+inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block, const unsigned char tm_conditions) {
+    const unsigned char conditions = 0x0c;
 
-
-constexpr unsigned char conditions = 0x0c;
-
-assert(conditions == conditions_fuck);
-
-#if 0
-    printf("\nthreadIdx.x:%d, conditions:%x\n",threadIdx.x, conditions);
-    __syncthreads();
-#endif
     const bool Is_sparse_attn_mask = params.attn_mask_start_row_indices_ptr != nullptr;
     const int attn_mask_start_row = params.attn_mask_start_row;
 
@@ -174,10 +157,6 @@ assert(conditions == conditions_fuck);
     constexpr int MMA_M = kBlockM / decltype(size<0>(typename Kernel_traits::TiledMma::TiledShape_MNK{}))::value;
 
     const BlockInfoFwd binfo(params, bidb, !(conditions & Is_even_N_flag));
-    
-    if (cute::thread0()) {
-        printf("!(conditions & Is_even_N_flag):%d\n",!(conditions & Is_even_N_flag));
-    }
 
     if (m_block * kBlockM >= binfo.actual_seqlen_q || binfo.actual_seqlen_k == 0) return;
 
@@ -190,7 +169,6 @@ assert(conditions == conditions_fuck);
 
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     if (conditions & Is_causal_flag) {
-//    if (Is_causal) {
         n_block_max = std::min(n_block_max, cute::ceil_div((m_block + 1) * kBlockM, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
@@ -332,7 +310,6 @@ assert(conditions == conditions_fuck);
 
     // Set predicates for k bounds
     if (!(conditions & Is_even_K_flag)) {
-//    if (!Is_even_K) {
         #pragma unroll
         for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d; }
         #pragma unroll
@@ -342,11 +319,11 @@ assert(conditions == conditions_fuck);
     // Prologue
 
     Tensor tQrQ = make_fragment_like(tQgQ);
-    FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] { 
-    // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
-    flash::copy</*Is_even_MN=*/false, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
-                                                 binfo.actual_seqlen_q - m_block * kBlockM);
-  });
+    BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] { 
+        // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
+        flash::copy</*Is_even_MN=*/false, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                                     binfo.actual_seqlen_q - m_block * kBlockM);
+    });
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
 
     // // Copy rmem to smem
@@ -367,11 +344,11 @@ assert(conditions == conditions_fuck);
     }
 
     int n_block = n_block_max - 1;
-    FWD_SWITCH(conditions & Is_even_N_flag, Is_even_N, [&] {
-        FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
-    // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    flash::copy<Is_even_N, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                      binfo.actual_seqlen_k - n_block * kBlockN);
+    BOOL_SWITCH(conditions & Is_even_N_flag, Is_even_N, [&] {
+        BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
+            // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+            flash::copy<Is_even_N, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                              binfo.actual_seqlen_k - n_block * kBlockN);
         });
     });
     cute::cp_async_fence();
@@ -405,7 +382,6 @@ assert(conditions == conditions_fuck);
     // We will have at least 1 "masking" iteration.
 
     const int n_masking_steps = conditions & Is_causal_flag ? cute::ceil_div(kBlockM, kBlockN) : 1;
-//    constexpr int n_masking_steps = Is_causal ? cute::ceil_div(kBlockM, kBlockN) : 1;
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -416,17 +392,17 @@ assert(conditions == conditions_fuck);
         // Advance gV
         if (masking_step > 0) {
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
-            FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+            BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
             });
         } else {
             // Clear the smem tiles to account for predicated off loads
-            FWD_SWITCH(conditions & Is_even_N_flag, Is_even_N, [&] {
-                FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
-            flash::copy<Is_even_N, Is_even_K, /*Clear_OOB_MN=*/true>(
-                gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
-            );
-                    });
+            BOOL_SWITCH(conditions & Is_even_N_flag, Is_even_N, [&] {
+                BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
+                    flash::copy<Is_even_N, Is_even_K, /*Clear_OOB_MN=*/true>(
+                        gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+                    );
+                });
             });
         }
         cute::cp_async_fence();
@@ -441,7 +417,6 @@ assert(conditions == conditions_fuck);
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (conditions & Is_attn_mask_flag) {
-//        if (Is_attn_mask) {
             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
                                                             m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
                                                             n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
@@ -455,8 +430,6 @@ assert(conditions == conditions_fuck);
         // can produce Inf / NaN.
         if (!(conditions & Is_causal_flag)) {
             if (!(conditions & Is_even_N_flag)) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
-//        if (!Is_causal) {
-//            if (!Is_even_N) { flash::apply_mask(scores, binfo.actual_seqlen_k - n_block * kBlockN); }
         } else {
             // Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
             // Tensor taccScS = thr_mma.partition_C(caccS);                           // (MMA,MMA_M,MMA_N)
@@ -496,19 +469,18 @@ assert(conditions == conditions_fuck);
         if (n_block > 0) {
             // Advance gK
             tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             });
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
         }
-        FWD_SWITCH(masking_step == 0, Is_first, [&] {
-            FWD_SWITCH(conditions & Is_causal_flag, Is_causal, [&] {
-                FWD_SWITCH(conditions & Is_attn_mask_flag, Is_attn_mask, [&] {
-
-                  // TODO: when we have key_padding_mask we'll need to Check_inf
-                  softmax_rescale_o</*Is_first=*/Is_first,  /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+        BOOL_SWITCH(masking_step == 0, Is_first, [&] {
+            BOOL_SWITCH(conditions & Is_causal_flag, Is_causal, [&] {
+                BOOL_SWITCH(conditions & Is_attn_mask_flag, Is_attn_mask, [&] {
+                    // TODO: when we have key_padding_mask we'll need to Check_inf
+                    softmax_rescale_o</*Is_first=*/Is_first,  /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
                 });
             });
         });
@@ -521,7 +493,6 @@ assert(conditions == conditions_fuck);
         uint32_t block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         uint32_t block_col_idx = n_block * (kBlockN / 32);
         if (conditions & Return_softmax_flag) {
-//        if (Return_softmax) {
             Tensor tOrP_copy = make_fragment_like(tOrP);
             cute::copy(tOrP, tOrP_copy);
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
@@ -532,7 +503,6 @@ assert(conditions == conditions_fuck);
             tPgP.data() = tPgP.data() + (-kBlockN);
         }
         if (conditions & Is_dropout_flag) {
-//        if (Is_dropout) {
             flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
                                  block_row_idx, block_col_idx, kNWarps);
         }
@@ -556,8 +526,8 @@ assert(conditions == conditions_fuck);
         __syncthreads();
         // Advance gV
         tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
-        FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
-        flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+        BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
+            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
         });
         cute::cp_async_fence();
 
@@ -571,8 +541,8 @@ assert(conditions == conditions_fuck);
         if (n_block > 0) {
             // Advance gK
             tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
-            flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+            BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
+                flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
             });
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
@@ -583,7 +553,6 @@ assert(conditions == conditions_fuck);
         Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
 
         if (conditions & Is_attn_mask_flag) {
-//        if (Is_attn_mask) {
             flash::apply_attn_mask<Kernel_traits::TiledMma>(scores, tPgMask, tPcMask,
                                                             m_block == m_block_max - 1 ? m_residue : params.seqlen_q,
                                                             n_block == n_block_max - 1 ? n_residue : params.seqlen_k,
@@ -591,7 +560,6 @@ assert(conditions == conditions_fuck);
             tPgMask.data() = tPgMask.data() + (-kBlockN);
         }
         if (conditions & Is_causal_flag && Is_sparse_attn_mask && m_block * kBlockM >= params.attn_mask_start_row) {
-//        if (Is_causal && Is_sparse_attn_mask && m_block * kBlockM >= params.attn_mask_start_row) {
 	        if (tidx < kBlockN) {
                 sSparseMask(tidx) = gSparseMask(tidx);
             }
@@ -606,12 +574,11 @@ assert(conditions == conditions_fuck);
         }
 
         if (conditions & Is_equal_seq_qk_flag) {
-//        if (Is_equal_seq_qk) {
           softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
         } else {
-            FWD_SWITCH(conditions & Is_causal_flag, Is_causal, [&] {
-                FWD_SWITCH(conditions & Is_attn_mask_flag, Is_attn_mask, [&] {
-          softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
+            BOOL_SWITCH(conditions & Is_causal_flag, Is_causal, [&] {
+                BOOL_SWITCH(conditions & Is_attn_mask_flag, Is_attn_mask, [&] {
+                    softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
                 });            
             });
         }
@@ -623,7 +590,6 @@ assert(conditions == conditions_fuck);
         uint32_t block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         uint32_t block_col_idx = n_block * (kBlockN / 32);
         if (conditions & Return_softmax_flag) {
-//        if (Return_softmax) {
             Tensor tOrP_copy = make_fragment_like(tOrP);
             cute::copy(tOrP, tOrP_copy);
             flash::apply_dropout</*encode_dropout_in_sign_bit=*/true>(
@@ -634,7 +600,6 @@ assert(conditions == conditions_fuck);
             tPgP.data() = tPgP.data() + (-kBlockN);
         }
         if (conditions & Is_dropout_flag) {
-//        if (Is_dropout) {
             flash::apply_dropout(tOrP, params.p_dropout_in_uint8_t, seed, offset,
                                  block_row_idx, block_col_idx, kNWarps);
         }
@@ -653,7 +618,6 @@ assert(conditions == conditions_fuck);
         float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
         lse(mi) = (sum == 0.f || sum != sum) ? INFINITY : scores_max(mi) * params.scale_softmax + __logf(sum);
         float scale = !(conditions & Is_dropout_flag) ? inv_sum : inv_sum * params.rp_dropout;
-//        float scale = !Is_dropout ? inv_sum : inv_sum * params.rp_dropout;
         #pragma unroll
         for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scale; }
     }
@@ -714,17 +678,15 @@ assert(conditions == conditions_fuck);
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);                           // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
     if (!(conditions & Is_even_K_flag)) {
-//    if (!Is_even_K) {
         #pragma unroll
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
-    FWD_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
-    // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
-    );
+    BOOL_SWITCH(conditions & Is_even_K_flag, Is_even_K, [&] {
+        // Clear_OOB_K must be false since we don't want to write zeros to gmem
+        flash::copy</*Is_even_MN=*/false, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+        );
     });
-assert(conditions == conditions_fuck);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
