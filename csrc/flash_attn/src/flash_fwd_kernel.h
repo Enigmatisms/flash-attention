@@ -131,8 +131,7 @@ inline __device__ void write_softmax_to_gmem(
 
 // template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_even_N, bool Is_even_K, bool Return_softmax, bool Is_attn_mask, bool Is_equal_seq_qk, typename Params>
 template<typename Kernel_traits, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block, const unsigned char tm_conditions) {
-    const unsigned char conditions = 0x0c;
+inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block, const unsigned char conditions) {
 
     const bool Is_sparse_attn_mask = params.attn_mask_start_row_indices_ptr != nullptr;
     const int attn_mask_start_row = params.attn_mask_start_row;
@@ -477,12 +476,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             cute::cp_async_fence();
         }
         BOOL_SWITCH(masking_step == 0, Is_first, [&] {
-            BOOL_SWITCH(conditions & Is_causal_flag, Is_causal, [&] {
-                BOOL_SWITCH(conditions & Is_attn_mask_flag, Is_attn_mask, [&] {
-                    // TODO: when we have key_padding_mask we'll need to Check_inf
-                    softmax_rescale_o</*Is_first=*/Is_first,  /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
-                });
-            });
+            // TODO: when we have key_padding_mask we'll need to Check_inf
+            softmax_rescale_o</*Is_first=*/Is_first,  /*Check_inf=*/true>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
         });
 
         // Convert scores from fp32 to fp16/bf16
@@ -573,15 +568,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             gSparseMask.data() = gSparseMask.data() + (-kBlockN);
         }
 
-        if (conditions & Is_equal_seq_qk_flag) {
-          softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
-        } else {
-            BOOL_SWITCH(conditions & Is_causal_flag, Is_causal, [&] {
-                BOOL_SWITCH(conditions & Is_attn_mask_flag, Is_attn_mask, [&] {
-                    softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_attn_mask>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
-                });            
-            });
-        }
+        softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/true>(scores, scores_max, scores_sum, acc_o, params.scale_softmax_log2);
 
         Tensor rP = flash::convert_type<Element>(scores);
         // Reshape rP from (nrow=(2, MMA_M), ncol=(2, MMA_N)) to ((2, 2, 2), MMA_M, MMA_N / 2)
