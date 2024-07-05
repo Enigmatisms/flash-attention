@@ -49,15 +49,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if (is_attn_mask && !Is_causal) conditions |= Is_attn_mask_flag;
     if (is_equal_qk) conditions |= Is_equal_seq_qk_flag;
 
-std::cout << "\nconditions:" << std::bitset<8>(conditions) << std::endl;
-std::cout << "\nIs_dropout:" << bool{conditions&Is_dropout_flag} << std::endl;
-std::cout << "\nIs_causal:" << bool{conditions&Is_causal_flag} << std::endl;
-std::cout << "\nIs_even_N:" << bool{conditions&Is_even_N_flag} << std::endl;
-std::cout << "\nIs_even_K:" << bool{conditions&Is_even_K_flag} << std::endl;
-std::cout << "\nReturn_softmax:" << bool{conditions&Return_softmax_flag} << std::endl;
-std::cout << "\nIs_attn_mask:" << bool{conditions&Is_attn_mask_flag} << std::endl;
-std::cout << "\nIs_equal_seq_qk:" << bool{conditions&Is_equal_seq_qk_flag} << std::endl;
-
     // Will only return softmax if dropout, to reduce compilation time.
     auto kernel = &flash_fwd_kernel<Kernel_traits>;
     // auto kernel = &flash_fwd_kernel<Kernel_traits, Is_dropout, Is_causal, IsEvenNConst, true, ReturnSoftmaxConst && Is_dropout>;
