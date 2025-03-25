@@ -154,6 +154,10 @@ public:
     void
     operator()(Params const& params, char* smem_buf) {
 
+        if (cute::thread0()) {
+            printf("\nwsm debug FlashAttnBwdPostprocessConvertdQ start\n");
+        }
+
         static constexpr int kBlockM = get<0>(TileShape_MK{});
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
@@ -249,6 +253,11 @@ public:
         flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
             gmem_tiled_copy_dQ, tdQrdQ, tdQgdQ, tdQcdQ, tdQpdQ, std::min(seqlen_info.seqlen - m_block * kBlockM, kBlockM)
         );
+
+        if (cute::thread0()) {
+            printf("\nwsm debug FlashAttnBwdPostprocessConvertdQ end\n");
+        }
+
     }
 
 };

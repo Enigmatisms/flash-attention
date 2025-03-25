@@ -35,8 +35,10 @@ public:
     // Mainloop derived types
     using CollectiveMainloop = CollectiveMainloop_;
     using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
+    using TileShape_MNK_HeadDimV = typename CollectiveMainloop::TileShape_MNK_HeadDimV;
     using TiledMmaSdP = typename CollectiveMainloop::TiledMmaSdP;
-    using TiledMmadKV = typename CollectiveMainloop::TiledMmadKV;
+    using TiledMmadK = typename CollectiveMainloop::TiledMmadK;
+    using TiledMmadV = typename CollectiveMainloop::TiledMmadV;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using ClusterShape = typename CollectiveMainloop::ClusterShape;
     using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -147,6 +149,9 @@ public:
     CUTLASS_DEVICE
     void
     operator()(Params const& params, char* smem_buf) {
+        if (cute::thread0()) {
+            printf("\nwsm debug FlashAttnBwdSm90 start\n");
+        }
 
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int NumCopyThreads = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
@@ -241,7 +246,8 @@ public:
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
             // Initialize matmul objects.
-            TiledMmadKV tiled_mma_dKV;
+            TiledMmadK tiled_mma_dK;
+            TiledMmadV tiled_mma_dV;
 
             PipelineState smem_pipe_read;
             PipelineState_dO smem_pipe_read_do;
@@ -259,13 +265,15 @@ public:
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
 
                 // dK and dV output accumulator.
-                Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
-                Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+                Tensor tdKrdK = partition_fragment_C(tiled_mma_dK, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+                Tensor tdVrdV = partition_fragment_C(tiled_mma_dV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK_HeadDimV{}));
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
                     tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
                 if (tile_valid) {
-                    epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
+                    // TODO(umiswing): fix gqa and mla conflict
+                    epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage,
+                                   tiled_mma_dK, tiled_mma_dV,
                                    threadIdx.x - NumCopyThreads, block_coord);
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
@@ -275,6 +283,9 @@ public:
             epilogue.store_tail();
         }
 
+        if (cute::thread0()) {
+            printf("\nwsm debug FlashAttnBwdSm90 end\n");
+        }
     }
 
 };

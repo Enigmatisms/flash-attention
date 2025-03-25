@@ -367,6 +367,7 @@ if(NOT SKIP_BUILD_FA)
     endif()
     
     list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_prepare_scheduler.cu")
+    list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/mla.cu")
 
     # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/*_sm90.cu")
     # file(GLOB FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim*_sm90.cu")

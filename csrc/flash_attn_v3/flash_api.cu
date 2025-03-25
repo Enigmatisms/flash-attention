@@ -245,7 +245,12 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
                 if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM192
-                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
+                if (params.d <= 192) {
+                    if (params.d == params.dv || Arch != 90)
+                        return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream);
+                    else
+                        return run_mla_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream);
+                }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM256
                 if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
@@ -264,7 +269,15 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
                 if (params.d <= 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM192
-                if (params.d <= 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
+                if (params.d <= 192) {
+                  printf("\nwsm debug params.d:%d, params.dv:%d\n", params.d, params.dv);
+                  if (params.d == params.dv)
+                    return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream);
+                  else {
+                    printf("\nwsm debug run_mha_bwd()\n");
+                    return run_mla_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream);
+                  }
+                }
                 #endif
                 #ifndef FLASHATTENTION_DISABLE_HDIM256
                 if (params.d <= 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }

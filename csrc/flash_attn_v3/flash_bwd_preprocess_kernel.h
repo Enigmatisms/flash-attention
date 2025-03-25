@@ -142,6 +142,9 @@ public:
     CUTLASS_DEVICE
     void
     operator()(Params const& params, [[maybe_unused]] char* smem_buf) {
+        if (cute::thread0()) {
+            printf("\nwsm debug FlashAttnBwdPreprocess begin\n");
+        }
 
         static constexpr int kBlockM = get<0>(TileShape_MK{});
 
@@ -245,6 +248,9 @@ public:
             params.dq_semaphore[bidh + bidb * num_head + m_block * num_head * num_batch] = 0;
         }
 
+        if (cute::thread0()) {
+            printf("\nwsm debug FlashAttnBwdPreprocess end\n");
+        }
     }
 
 };
