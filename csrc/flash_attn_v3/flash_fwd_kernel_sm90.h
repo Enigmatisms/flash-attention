@@ -111,6 +111,7 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineVt::SharedStorage pipeline_vt;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
+            alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMask::SharedStorage pipeline_flashmask;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
@@ -181,18 +182,23 @@ public:
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK_PV{});
 
         using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
         using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
         using MainloopPipelineKVNew = typename CollectiveMainloop::MainloopPipelineKVNew;
+        using MainloopPipelineFlashMask = typename CollectiveMainloop::MainloopPipelineFlashMask;
         using PipelineState = typename CollectiveMainloop::PipelineState;
         using PipelineParamsK = typename MainloopPipelineK::Params;
         using PipelineParamsV = typename MainloopPipelineV::Params;
         using PipelineParamsVt = typename MainloopPipelineVt::Params;
         using PipelineParamsKVNew = typename MainloopPipelineKVNew::Params;
+        using PipelineParamsFlashMask = typename MainloopPipelineFlashMask::Params;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
+
+        __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -292,6 +298,15 @@ public:
         }
         auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
 
+        PipelineParamsFlashMask pipeline_params_flashmask;
+        pipeline_params_flashmask.role = warp_group_idx == 0
+            ? MainloopPipelineFlashMask::ThreadCategory::Producer
+            : MainloopPipelineFlashMask::ThreadCategory::Consumer;
+        pipeline_params_flashmask.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+        pipeline_params_flashmask.producer_arv_count = NumProducerThreads;
+
+        MainloopPipelineFlashMask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
+
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
@@ -352,10 +367,11 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
-                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write,
+                                         shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
+                                         flashmask_smem_);
             }
-            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
+            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
@@ -417,17 +433,20 @@ public:
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
-                        params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                        params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
+                        tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
+                        flashmask_smem_);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
-                            params.mainloop, pipeline_k, pipeline_v, smem_pipe_read,
-                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage);
+                            params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
+                            flashmask_smem_);
                     } else {
                         tile_valid = mainloop.mma_pv(
-                            params.mainloop, pipeline_v, smem_pipe_read,
-                            tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage);
+                            params.mainloop, pipeline_v, pipeline_flashmask, smem_pipe_read,
+                            tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage,
+                            flashmask_smem_);
                     }
                 }
                 // Do this here before the epilogue so that the next tile is ready to go.

@@ -21,12 +21,13 @@
 #include "mainloop_fwd_sm90_tma_gmma_ws.hpp"
 #include "mainloop_fwd_sm80.hpp"
 #include "epilogue_fwd.hpp"
+#include "flash_mask.hpp"
 
 using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor>
+          bool PackGQA, bool Split, bool V_colmajor, bool Is_flashmask>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
@@ -51,7 +52,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
     using CollectiveMainloop = std::conditional_t<
         Arch >= 90,
-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
+        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, Is_flashmask>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
@@ -87,7 +88,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         cute::conditional_return<!V_colmajor>(
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
-    typename CollectiveMainloop::Arguments mainloop_args {
+    typename CollectiveMainloop::Arguments mainloop_args = [&] () {
+        if constexpr(Arch >= 90)
+            return typename CollectiveMainloop::Arguments {
         static_cast<Element const*>(params.q_ptr),
         {seqlen_q, params.d, params.h, batch_q},  // shape_Q
         {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
@@ -127,7 +130,57 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
         params.leftpad_k,
+        params.h_flashmask, params.h_h_flashmask_ratio,
+        reinterpret_cast<int*>(params.lt_start_ptr), reinterpret_cast<int*>(params.lt_end_ptr),
+        reinterpret_cast<int*>(params.ut_start_ptr), reinterpret_cast<int*>(params.ut_end_ptr),
+        params.flashmask_maxmin_ptr,
+        params.lt_start_nblockmax, params.lt_start_nblockmin,
+        params.lt_end_nblockmax, params.lt_end_nblockmin,
+        params.ut_start_nblockmax, params.ut_start_nblockmin,
+        params.ut_end_nblockmax, params.ut_end_nblockmin,
     };
+    else
+        return typename CollectiveMainloop::Arguments {
+        static_cast<Element const*>(params.q_ptr),
+        {seqlen_q, params.d, params.h, batch_q},  // shape_Q
+        {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen_q ? params.q_batch_stride : 0},  // stride_Q
+        static_cast<Element*>(params.k_ptr),
+        {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
+         params.d, params.h_k, !params.page_table ? batch_k : params.num_pages},  // shape_K
+        {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen_k ? params.k_batch_stride : 0},  // stride_K
+        static_cast<Element*>(params.v_ptr),
+        params.dv,  // headdim_v
+        v_strides,  // stride_V
+        static_cast<Element const*>(params.knew_ptr),
+        {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1},  // shape_K_new
+        {params.knew_row_stride, _1{}, params.knew_head_stride, !is_varlen_k_new ? params.knew_batch_stride : 0},  // stride_K_new
+        static_cast<Element const*>(params.vnew_ptr),
+        {params.vnew_row_stride, _1{}, params.vnew_head_stride, !is_varlen_k_new ? params.vnew_batch_stride : 0}, // stride_V_new
+        static_cast<Element const*>(params.qv_ptr),
+        {params.qv_row_stride, _1{}, params.qv_head_stride, !is_varlen_q ? params.qv_batch_stride : 0},  // stride_Qv
+        static_cast<Element const*>(params.rotary_cos_ptr),
+        {params.seqlen_k, params.rotary_dim / 2},  // shape_rotary, the seqlen shape doesn't matter
+        {params.rotary_dim / 2, _1{}},  // stride_rotary_cos
+        static_cast<Element const*>(params.rotary_sin_ptr),
+        {params.rotary_dim / 2, _1{}},  // stride_rotary_sin
+        params.is_rotary_interleaved,
+        params.page_table,
+        // if page_size is not set, avoid dividing by zero
+        {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
+        {params.page_table_batch_stride, _1{}},  // stride_page_table
+        params.scale_softmax,
+        params.q_descale_ptr, params.k_descale_ptr, params.v_descale_ptr,
+        {params.q_descale_batch_stride, params.q_descale_head_stride},
+        {params.k_descale_batch_stride, params.k_descale_head_stride},
+        {params.v_descale_batch_stride, params.v_descale_head_stride},
+        params.window_size_left, params.window_size_right,
+        params.softcap,
+        params.num_splits,
+        params.kv_batch_idx,
+        params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
+        params.seqused_q, params.seqused_k,
+        params.leftpad_k};
+}();
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
         {seqlen_q, params.dv, params.h, batch_q, params.num_splits},  // shape_O
@@ -165,6 +218,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
+
+    if constexpr (Is_flashmask)
+        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
@@ -213,7 +269,9 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                         CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                             static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor>(params, stream);
+                            BOOL_SWITCH(params.lt_start_ptr != nullptr, Is_flashmask_, [&] {
+                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Is_flashmask_ && !Is_FP8>(params, stream);
+                            });
                         });
                     });
                 });

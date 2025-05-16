@@ -59,6 +59,7 @@ enum class FwdNamedBarriers {
     QueryRotated = 8,
     PFull = 9,
     PEmpty = 6,  // HACK: PEmpty is only used when we don't have 3 WGs
+    FlashMask = 10,
 };
 
 enum class BwdNamedBarriers {

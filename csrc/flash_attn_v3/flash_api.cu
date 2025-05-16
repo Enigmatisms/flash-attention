@@ -504,6 +504,29 @@ DEFINE_GETTER_SETTER(bool, skip_scheduler_metadata_computation)
 DEFINE_GETTER_SETTER(int, arch)
 DEFINE_GETTER_SETTER(int, num_sm)
 
+DEFINE_GETTER_SETTER(int, h_flashmask)
+DEFINE_GETTER_SETTER(int, h_h_flashmask_ratio)
+
+DEFINE_GETTER_SETTER(void *, lt_start_ptr)
+DEFINE_GETTER_SETTER(void *, lt_end_ptr)
+
+DEFINE_GETTER_SETTER(void *, ut_start_ptr)
+DEFINE_GETTER_SETTER(void *, ut_end_ptr)
+
+DEFINE_GETTER_SETTER(int *, flashmask_maxmin_ptr)
+
+DEFINE_GETTER_SETTER(int *, lt_start_nblockmax)
+DEFINE_GETTER_SETTER(int *, lt_start_nblockmin)
+
+DEFINE_GETTER_SETTER(int *, lt_end_nblockmax)
+DEFINE_GETTER_SETTER(int *, lt_end_nblockmin)
+
+DEFINE_GETTER_SETTER(int *, ut_start_nblockmax)
+DEFINE_GETTER_SETTER(int *, ut_start_nblockmin)
+
+DEFINE_GETTER_SETTER(int *, ut_end_nblockmax)
+DEFINE_GETTER_SETTER(int *, ut_end_nblockmin)
+
 #define DEFINE_BWD_GETTER_SETTER(type, member) \
 type fa3_bwd_params_get_##member(const Flash_bwd_params* params_handle) { return params_handle->member; } \
 void fa3_bwd_params_set_##member(Flash_bwd_params* params_handle, type value) { params_handle->member = value; }

@@ -157,6 +157,30 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+    // FlashMask
+    int h_flashmask;
+    int h_h_flashmask_ratio;
+    
+    void * __restrict__ lt_start_ptr = nullptr;
+    void * __restrict__ lt_end_ptr = nullptr;
+    
+    void * __restrict__ ut_start_ptr = nullptr;
+    void * __restrict__ ut_end_ptr = nullptr;
+    
+    int * __restrict__ flashmask_maxmin_ptr = nullptr;
+    
+    int * __restrict__ lt_start_nblockmax = nullptr;
+    int * __restrict__ lt_start_nblockmin = nullptr;
+    
+    int * __restrict__ lt_end_nblockmax = nullptr;
+    int * __restrict__ lt_end_nblockmin = nullptr;
+    
+    int * __restrict__ ut_start_nblockmax = nullptr;
+    int * __restrict__ ut_start_nblockmin = nullptr;
+    
+    int * __restrict__ ut_end_nblockmax = nullptr;
+    int * __restrict__ ut_end_nblockmin = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
