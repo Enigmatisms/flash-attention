@@ -402,25 +402,25 @@ struct CollectiveMainloopFwdSm90 {
         int const h_flashmask;
         int const h_h_flashmask_ratio;
 
-        int * __restrict__ const lt_start_ptr = nullptr;
-        int * __restrict__ const lt_end_ptr = nullptr;
+        int32_t * __restrict__ const lt_start_ptr = nullptr;
+        int32_t * __restrict__ const lt_end_ptr = nullptr;
 
-        int * __restrict__ const ut_start_ptr = nullptr;
-        int * __restrict__ const ut_end_ptr = nullptr;
+        int32_t * __restrict__ const ut_start_ptr = nullptr;
+        int32_t * __restrict__ const ut_end_ptr = nullptr;
 
-        int * __restrict__ const flashmask_maxmin_ptr = nullptr;
+        int32_t * __restrict__ const flashmask_maxmin_ptr = nullptr;
 
-        int * __restrict__ const lt_start_nblockmax = nullptr;
-        int * __restrict__ const lt_start_nblockmin = nullptr;
+        int32_t * __restrict__ const lt_start_nblockmax = nullptr;
+        int32_t * __restrict__ const lt_start_nblockmin = nullptr;
 
-        int * __restrict__ const lt_end_nblockmax = nullptr;
-        int * __restrict__ const lt_end_nblockmin = nullptr;
+        int32_t * __restrict__ const lt_end_nblockmax = nullptr;
+        int32_t * __restrict__ const lt_end_nblockmin = nullptr;
 
-        int * __restrict__ const ut_start_nblockmax = nullptr;
-        int * __restrict__ const ut_start_nblockmin = nullptr;
+        int32_t * __restrict__ const ut_start_nblockmax = nullptr;
+        int32_t * __restrict__ const ut_start_nblockmin = nullptr;
 
-        int * __restrict__ const ut_end_nblockmax = nullptr;
-        int * __restrict__ const ut_end_nblockmin = nullptr;
+        int32_t * __restrict__ const ut_end_nblockmax = nullptr;
+        int32_t * __restrict__ const ut_end_nblockmin = nullptr;
     };
 
     // Device side kernel params
@@ -939,7 +939,7 @@ struct CollectiveMainloopFwdSm90 {
         int n_block_prev = n_block;
 
         auto get_next_block = [&] (int n_block_min) -> int {
-            if (Is_flashmask) {
+            if constexpr (Is_flashmask) {
                 return flash_mask.get_n_block(n_block_min);
             } else {
                 return n_block - 1;
@@ -1271,9 +1271,11 @@ struct CollectiveMainloopFwdSm90 {
             scoremod_premask_fn(tSrS);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
 
-            consumer_wait(pipeline_flashmask, smem_pipe_read);
-            flash_mask.template apply<TiledMmaQK>(tSrS, m_block);
-            pipeline_flashmask.consumer_release(smem_pipe_read);
+            if constexpr(Is_flashmask) {
+              consumer_wait(pipeline_flashmask, smem_pipe_read);
+              flash_mask.template apply<TiledMmaQK>(tSrS, thread_idx, smem_pipe_read.index());
+              pipeline_flashmask.consumer_release(smem_pipe_read);
+            }
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
@@ -1318,9 +1320,11 @@ struct CollectiveMainloopFwdSm90 {
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
 
-                consumer_wait(pipeline_flashmask, smem_pipe_read);
-                flash_mask.template apply<TiledMmaQK>(tSrS, m_block);
-                pipeline_flashmask.consumer_release(smem_pipe_read);
+                if constexpr (Is_flashmask) {
+                  consumer_wait(pipeline_flashmask, smem_pipe_read);
+                  flash_mask.template apply<TiledMmaQK>(tSrS, thread_idx, smem_pipe_read.index());
+                  pipeline_flashmask.consumer_release(smem_pipe_read);
+                }
 
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
@@ -1412,9 +1416,11 @@ struct CollectiveMainloopFwdSm90 {
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
 
-                consumer_wait(pipeline_flashmask, smem_pipe_read);
-                flash_mask.template apply<TiledMmaQK>(tSrS, m_block);
-                pipeline_flashmask.consumer_release(smem_pipe_read);
+                if constexpr (Is_flashmask) {
+                  consumer_wait(pipeline_flashmask, smem_pipe_read);
+                  flash_mask.template apply<TiledMmaQK>(tSrS, thread_idx, smem_pipe_read.index());
+                  pipeline_flashmask.consumer_release(smem_pipe_read);
+                }
 
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }

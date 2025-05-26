@@ -88,6 +88,13 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         cute::conditional_return<!V_colmajor>(
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
+
+    if constexpr (Is_flashmask) {
+        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
+        // cudaDeviceSynchronize();
+        // printf("\n>>>>>> wsm debug after prepare_block_maxmin");
+    }
+
     typename CollectiveMainloop::Arguments mainloop_args = [&] () {
         if constexpr(Arch >= 90)
             return typename CollectiveMainloop::Arguments {
@@ -131,8 +138,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.seqused_q, params.seqused_k,
         params.leftpad_k,
         params.h_flashmask, params.h_h_flashmask_ratio,
-        reinterpret_cast<int*>(params.lt_start_ptr), reinterpret_cast<int*>(params.lt_end_ptr),
-        reinterpret_cast<int*>(params.ut_start_ptr), reinterpret_cast<int*>(params.ut_end_ptr),
+        params.lt_start_ptr, params.lt_end_ptr,
+        params.ut_start_ptr, params.ut_end_ptr,
         params.flashmask_maxmin_ptr,
         params.lt_start_nblockmax, params.lt_start_nblockmin,
         params.lt_end_nblockmax, params.lt_end_nblockmin,
@@ -218,9 +225,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     typename AttnKernel::Params kernel_params = AttnKernel::to_underlying_arguments({
         mainloop_args, epilogue_args, {device, params.num_sm}, scheduler_args
     });
-
-    if constexpr (Is_flashmask)
-        flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();

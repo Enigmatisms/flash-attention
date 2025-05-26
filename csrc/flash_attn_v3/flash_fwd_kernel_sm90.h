@@ -81,6 +81,9 @@ public:
     // If we use cp.async to load K and V, we need more registers for the producer WG.
     static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
     static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
+    // static constexpr uint32_t LoadRegisterRequirement = (NumMmaWarpGroups == 1 ? 72 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32));
+    // static constexpr uint32_t MmaRegisterRequirement = (NumMmaWarpGroups == 1 ? 272 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160));
+
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
@@ -321,7 +324,9 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
+            // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
@@ -373,6 +378,7 @@ public:
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
+            // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.

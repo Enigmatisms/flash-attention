@@ -191,25 +191,13 @@ DECLARE_GETTER_SETTER(int, num_sm)
 DECLARE_GETTER_SETTER(int, h_flashmask)
 DECLARE_GETTER_SETTER(int, h_h_flashmask_ratio)
 
-DECLARE_GETTER_SETTER(void *, lt_start_ptr)
-DECLARE_GETTER_SETTER(void *, lt_end_ptr)
+DECLARE_GETTER_SETTER(int32_t *, lt_start_ptr)
+DECLARE_GETTER_SETTER(int32_t *, lt_end_ptr)
 
-DECLARE_GETTER_SETTER(void *, ut_start_ptr)
-DECLARE_GETTER_SETTER(void *, ut_end_ptr)
+DECLARE_GETTER_SETTER(int32_t *, ut_start_ptr)
+DECLARE_GETTER_SETTER(int32_t *, ut_end_ptr)
 
-DECLARE_GETTER_SETTER(int *, flashmask_maxmin_ptr)
-
-DECLARE_GETTER_SETTER(int *, lt_start_nblockmax)
-DECLARE_GETTER_SETTER(int *, lt_start_nblockmin)
-
-DECLARE_GETTER_SETTER(int *, lt_end_nblockmax)
-DECLARE_GETTER_SETTER(int *, lt_end_nblockmin)
-
-DECLARE_GETTER_SETTER(int *, ut_start_nblockmax)
-DECLARE_GETTER_SETTER(int *, ut_start_nblockmin)
-
-DECLARE_GETTER_SETTER(int *, ut_end_nblockmax)
-DECLARE_GETTER_SETTER(int *, ut_end_nblockmin)
+DECLARE_GETTER_SETTER(int32_t *, flashmask_maxmin_ptr)
 
 #define DECLARE_BWD_GETTER_SETTER(type, member) \
 type fa3_bwd_params_get_##member(const Flash_bwd_params* params_handle); \
