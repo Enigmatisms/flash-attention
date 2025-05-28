@@ -128,8 +128,6 @@ public:
             partially_masked = false;
         partially_masked = false;
 
-        // if(threadIdx.x == 0) printf("\n>>>>>> wsm debug partially_masked:%d, m_block:%d, n_block:%d kBlockM:%d, kBlockN:%d, lt_start_max:%d, lt_end_max:%d, ut_start_max:%d, ut_end_max:%d, lt_start_min:%d, lt_end_min:%d, ut_start_min:%d, ut_end_min:%d\n",
-        //                                                partially_masked,    m_block,    n_block,   kBlockM,    kBlockN,    lt_start_max,    lt_end_max,    ut_start_max,    ut_end_max,    lt_start_min,    lt_end_min,    ut_start_min,    ut_end_min);
         return n_block;
     }
     return n_block_min - 1;
@@ -170,9 +168,6 @@ public:
       #pragma unroll
       for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
         int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
-        // __syncwarp();
-        // printf("\n>>>>>> wsm debug row_idx:%d, thread_idx:%d\n", row_idx, thread_idx);
-        // __syncwarp();
         #pragma unroll
         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
           int const col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block

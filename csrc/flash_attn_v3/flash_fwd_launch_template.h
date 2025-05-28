@@ -91,8 +91,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     if constexpr (Is_flashmask) {
         flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
-        // cudaDeviceSynchronize();
-        // printf("\n>>>>>> wsm debug after prepare_block_maxmin");
     }
 
     typename CollectiveMainloop::Arguments mainloop_args = [&] () {
