@@ -7,7 +7,7 @@ namespace flash {
 
 template <int kBlockM, int kBlockN, int kStages>
 class FlashMask {
-
+#if 0
   bool partially_masked;
   using index_t = uint32_t;
   int32_t const n_block_min;
@@ -184,6 +184,7 @@ public:
       }
     }
 
+#endif
 };
 
 namespace flashmask {
