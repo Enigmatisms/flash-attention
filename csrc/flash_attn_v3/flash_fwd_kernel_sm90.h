@@ -204,6 +204,8 @@ public:
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
         __shared__ int32_t flashmask_maxmin_smem_producer_[8 * NumProducerThreads];
         __shared__ int32_t flashmask_maxmin_smem_consumer_[8 * NumMmaThreads];
+        __shared__ int32_t n_block_smem_[CollectiveMainloop::kStages];
+        __shared__ int32_t mask_state_smem_[CollectiveMainloop::kStages];
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -307,7 +309,7 @@ public:
         pipeline_params_flashmask.role = warp_group_idx == 0
             ? MainloopPipelineFlashMask::ThreadCategory::Producer
             : MainloopPipelineFlashMask::ThreadCategory::Consumer;
-        pipeline_params_flashmask.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+        pipeline_params_flashmask.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
         pipeline_params_flashmask.producer_arv_count = NumProducerThreads;
 
         MainloopPipelineFlashMask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
@@ -326,7 +328,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
-            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
@@ -375,11 +377,11 @@ public:
                 // pipeline_vt won't be used if we don't need to transpose V.
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
-                                         flashmask_smem_, flashmask_maxmin_smem_producer_);
+                                         flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
-            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+            // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;
@@ -441,13 +443,13 @@ public:
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, flashmask_maxmin_smem_consumer_);
+                        flashmask_smem_, flashmask_maxmin_smem_consumer_, n_block_smem_, mask_state_smem_);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, flashmask_maxmin_smem_consumer_);
+                            flashmask_smem_, flashmask_maxmin_smem_consumer_, n_block_smem_, mask_state_smem_);
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_flashmask, smem_pipe_read,
