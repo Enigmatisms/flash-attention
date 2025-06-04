@@ -202,7 +202,7 @@ public:
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ int32_t flashmask_maxmin_smem_producer_[8 * NumProducerThreads];
+        __shared__ int32_t flashmask_maxmin_smem_producer_[8 * NumProducerThreads * 4];
         __shared__ int32_t flashmask_maxmin_smem_consumer_[8 * NumMmaThreads];
         __shared__ int32_t n_block_smem_[CollectiveMainloop::kStages];
         __shared__ int32_t mask_state_smem_[CollectiveMainloop::kStages];
@@ -328,7 +328,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
-            // cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
@@ -381,7 +381,7 @@ public:
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
-            // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;
