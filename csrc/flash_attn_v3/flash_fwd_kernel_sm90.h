@@ -202,15 +202,17 @@ public:
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        // __shared__ int32_t flashmask_maxmin_smem_producer_[8 * NumProducerThreads * 4];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * 8192 / 128];
+//        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * 8192 / 128];
+        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * CollectiveMainloop::hackSeqlen / 128];
         __shared__ int32_t flashmask_maxmin_smem_consumer_[8 * NumMmaThreads];
-//        __shared__ int32_t n_block_smem_[CollectiveMainloop::kStages];
-        __shared__ int32_t consumer_n_block_smem_[CollectiveMainloop::kStages];
-        __shared__ int32_t n_block_smem_[8192 / 128 * 128];
+//        __shared__ int32_t consumer_n_block_smem_[CollectiveMainloop::kStages];
+//        __shared__ int32_t n_block_smem_[8192 / 128 * 128];
+        __shared__ int32_t n_block_smem_[CollectiveMainloop::hackSeqlen / 128];
+        __shared__ int32_t consumer_n_block_smem_[CollectiveMainloop::hackSeqlen / 128];
+
         __shared__ int32_t mask_state_smem_[CollectiveMainloop::kStages];
 
-        if(threadIdx.x * 4 < 8192) {
+        if(threadIdx.x * 4 < CollectiveMainloop::hackSeqlen) {
           asm volatile(
             "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
               ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + threadIdx.x)),
@@ -219,7 +221,7 @@ public:
 
           asm volatile(
             "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-              ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + 8192 / 128 + threadIdx.x)),
+              ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::hackSeqlen / 128 + threadIdx.x)),
                 "l"(reinterpret_cast<int4*>(params.mainloop.lt_start_nblockmin) + threadIdx.x),
                 "n"(16));
 
@@ -228,6 +230,8 @@ public:
         }
 
         __syncthreads();
+
+//        printf("\n>>>>>> wsm debug finish cp.async, threadIdx.x:%d\n", threadIdx.x);
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -465,7 +469,7 @@ public:
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, flashmask_maxmin_smem_consumer_, consumer_n_block_smem_, mask_state_smem_);
+                        flashmask_smem_, flashmask_maxmin_smem_producer_, consumer_n_block_smem_, mask_state_smem_);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(

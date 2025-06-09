@@ -35,6 +35,8 @@ template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, 
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Is_flashmask>
 struct CollectiveMainloopFwdSm90 {
 
+    static constexpr int hackSeqlen = 128 * 1024;
+
     static constexpr int kStages = Stages;
 //    static constexpr int kStages = 1;
     using ClusterShape = ClusterShape_;
@@ -641,214 +643,46 @@ struct CollectiveMainloopFwdSm90 {
     }
 
     CUTLASS_DEVICE
-    int32_t load_flashmask_maxmin(int const& thread_idx, int const& threads_num, int const& n_block, int const& n_block_min, Params const& params, int32_t* flashmask_maxmin_smem) {
-        if constexpr (Is_flashmask) {
-            int32_t idx = (n_block - (threads_num * 4 - 1) + thread_idx * 4) / 4; // need to load value in n_block
-            int4* s_lt_start_max = reinterpret_cast<int4*>(flashmask_maxmin_smem);
-            int4* s_lt_start_min = reinterpret_cast<int4*>(flashmask_maxmin_smem) + threads_num;
-
-            int4* s_lt_end_max = reinterpret_cast<int4*>(flashmask_maxmin_smem) + 2 * threads_num;
-            int4* s_lt_end_min = reinterpret_cast<int4*>(flashmask_maxmin_smem) + 3 * threads_num;
-            
-            int4* s_ut_start_max = reinterpret_cast<int4*>(flashmask_maxmin_smem) + 4 * threads_num;
-            int4* s_ut_start_min = reinterpret_cast<int4*>(flashmask_maxmin_smem) + 5 * threads_num;
-            
-            int4* s_ut_end_max = reinterpret_cast<int4*>(flashmask_maxmin_smem) + 6 * threads_num;
-            int4* s_ut_end_min = reinterpret_cast<int4*>(flashmask_maxmin_smem) + 7 * threads_num;
-
-            if(idx * 4 >= n_block_min) {
-                // TODO(umiswing): add row_offset
-                asm volatile(
-                  "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(cutlass::arch::cutlass_get_smem_pointer(s_lt_start_max + thread_idx)), "l"(reinterpret_cast<int4*>(params.lt_start_nblockmax) + idx), "n"(16));
-                asm volatile(
-                  "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(cutlass::arch::cutlass_get_smem_pointer(s_lt_start_min + thread_idx)), "l"(reinterpret_cast<int4*>(params.lt_start_nblockmin) + idx), "n"(16));
-#if 0
-                s_lt_start_max[thread_idx] = params.lt_start_nblockmax == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.lt_start_nblockmax) + idx);
-                s_lt_start_min[thread_idx] = params.lt_start_nblockmin == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.lt_start_nblockmin) + idx);
-
-                s_lt_end_max[thread_idx] = params.lt_end_nblockmax == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.lt_end_nblockmax) + idx);
-                s_lt_end_min[thread_idx] = params.lt_end_nblockmin == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.lt_end_nblockmin) + idx);
-
-                s_ut_start_max[thread_idx] = params.ut_start_nblockmax == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.ut_start_nblockmax) + idx);
-                s_ut_start_min[thread_idx] = params.ut_start_nblockmin == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.ut_start_nblockmin) + idx);
-
-                s_ut_end_max[thread_idx] = params.ut_end_nblockmax == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.ut_end_nblockmax) + idx);
-                s_ut_end_min[thread_idx] = params.ut_end_nblockmin == nullptr ? int4{INT_MAX, INT_MAX, INT_MAX, INT_MAX} : __ldg(reinterpret_cast<int4*>(params.ut_end_nblockmin) + idx);
-#endif
-            }
-            // return max(n_block - threads_num - 1, n_block_min);
-            return n_block - (threads_num * 4 - 1);
-        }
-    }
-
-#if 0
-    CUTLASS_DEVICE
-    void produce_next_n_block(int const& thread_idx, int const& threads_num, int32_t const& m_block, int32_t& n_block, int32_t& min_n_block_in_smem, bool& partially_masked, int32_t const& n_block_min, Params const& params, int32_t* flashmask_maxmin_smem, int32_t* n_block_smem, int32_t* mask_state_smem, MainloopPipelineFlashMask pipeline_flashmask, PipelineState& smem_pipe_write) {
-            if constexpr (Is_flashmask) {
-                if (/*threads_num == 32 &&*/threadIdx.x >= threads_num) return;
-
-                pipeline_flashmask.producer_acquire(smem_pipe_write);
-
-#if 0
-                if(n_block < min_n_block_in_smem) {
-                    // cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-                    __syncwarp();
-                    // umiswing: async cp beyond flashmask load?
-                    // min_n_block_in_smem = load_flashmask_maxmin(thread_idx, threads_num, n_block / 4 * 4 + 3, 0 /*n_block_min / 4 * 4*/, params, flashmask_maxmin_smem);
-                    min_n_block_in_smem = load_flashmask_maxmin(thread_idx, threads_num, 63 / 4 * 4 + 3, 0 /*n_block_min / 4 * 4*/, params, flashmask_maxmin_smem);
-                    asm volatile("cp.async.commit_group;\n" ::);
-                    asm volatile("cp.async.wait_group 0;\n" ::);
-                    // cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-                    __syncwarp();
-                }
-#endif
-                int32_t lt_start_max, lt_start_min;
-                int32_t* s_lt_start_max = flashmask_maxmin_smem;
-                int32_t* s_lt_start_min = flashmask_maxmin_smem + 8192 / 128;
-
-                int32_t* s_lt_end_max = flashmask_maxmin_smem + 2 * 8192 / 128;
-                int32_t* s_lt_end_min = flashmask_maxmin_smem + 3 * 8192 / 128;
-
-                int32_t* s_ut_start_max = flashmask_maxmin_smem + 4 * 8192 / 128;
-                int32_t* s_ut_start_min = flashmask_maxmin_smem + 5 * 8192 / 128;
-
-                int32_t* s_ut_end_max = flashmask_maxmin_smem + 6 * 8192 / 128;
-                int32_t* s_ut_end_min = flashmask_maxmin_smem + 7 * 8192 / 128;
-
-                int32_t lt_end_max = INT_MAX;
-                int32_t lt_end_min = INT_MAX;
-
-                int32_t ut_start_max = INT_MAX;
-                int32_t ut_start_min = INT_MAX;
-
-                int32_t ut_end_max = INT_MAX;
-                int32_t ut_end_min = INT_MAX;
-
-
-                #pragma unroll
-                for(n_block--; n_block >= 0 /*n_block_min*/; n_block--) {
-#if 0
-                    if(n_block < min_n_block_in_smem) {
-                        // cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-                        __syncwarp();
-                        // umiswing: async cp beyond flashmask load?
-                        // min_n_block_in_smem = load_flashmask_maxmin(thread_idx, threads_num, n_block / 4 * 4 + 3, 0 /*n_block_min / 4 * 4*/, params, flashmask_maxmin_smem);
-                        min_n_block_in_smem = load_flashmask_maxmin(thread_idx, threads_num, n_block / 4 * 4 + 3, n_block_min / 4 * 4, params, flashmask_maxmin_smem);
-                        asm volatile("cp.async.commit_group;\n" ::);
-                        asm volatile("cp.async.wait_group 0;\n" ::);
-                        // cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-                        __syncwarp();
-                    }
-#endif
-
-#if 0
-                    int32_t* s_lt_start_max = flashmask_maxmin_smem;
-                    int32_t* s_lt_start_min = flashmask_maxmin_smem + threads_num * 4;
-
-                    int32_t* s_lt_end_max = flashmask_maxmin_smem + 2 * threads_num * 4;
-                    int32_t* s_lt_end_min = flashmask_maxmin_smem + 3 * threads_num * 4;
-
-                    int32_t* s_ut_start_max = flashmask_maxmin_smem + 4 * threads_num * 4;
-                    int32_t* s_ut_start_min = flashmask_maxmin_smem + 5 * threads_num * 4;
-
-                    int32_t* s_ut_end_max = flashmask_maxmin_smem + 6 * threads_num * 4;
-                    int32_t* s_ut_end_min = flashmask_maxmin_smem + 7 * threads_num * 4;
-#endif
-
-#if 0
-                    int32_t lt_start_max = n_block >= n_block_min ? s_lt_start_max[n_block - min_n_block_in_smem] : INT_MAX;
-                    int32_t lt_start_min = n_block >= n_block_min ? s_lt_start_min[n_block - min_n_block_in_smem] : INT_MAX;
-#endif
-
-                    lt_start_max = n_block >= n_block_min ? s_lt_start_max[n_block] : INT_MAX;
-                    lt_start_min = n_block >= n_block_min ? s_lt_start_min[n_block] : INT_MAX;
-
-#if 0
-                    int32_t lt_start_max = s_lt_start_max[n_block - (-64)];
-                    int32_t lt_start_min = s_lt_start_min[n_block - (-64)];
-#endif
-
-#if 0
-                    int32_t lt_end_max = INT_MAX;
-                    int32_t lt_end_min = INT_MAX;
-
-                    int32_t ut_start_max = INT_MAX;
-                    int32_t ut_start_min = INT_MAX;
-
-                    int32_t ut_end_max = INT_MAX;
-                    int32_t ut_end_min = INT_MAX;
-#endif
-
-#if 0
-                    int32_t lt_start_max = s_lt_start_max[n_block - min_n_block_in_smem];
-                    int32_t lt_start_min = s_lt_start_min[n_block - min_n_block_in_smem];
-
-                    int32_t lt_end_max = s_lt_end_max[n_block - min_n_block_in_smem];
-                    int32_t lt_end_min = s_lt_end_min[n_block - min_n_block_in_smem];
-
-                    int32_t ut_start_max = s_ut_start_max[n_block - min_n_block_in_smem];
-                    int32_t ut_start_min = s_ut_start_min[n_block - min_n_block_in_smem];
-
-                    int32_t ut_end_max = s_ut_end_max[n_block - min_n_block_in_smem];
-                    int32_t ut_end_min = s_ut_end_min[n_block - min_n_block_in_smem];
-#endif
-
-                    if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
-                        continue;
-                    if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
-                        continue;
-                    if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
-                        partially_masked = true;
-                    else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
-                        partially_masked = true;
-                    else
-                        partially_masked = false;
-
-                    // umiswing: is it necessary to sync here?
-                    // cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-                    break;
-                }
-
-                if(thread_idx == 0) {
-                  n_block_smem[smem_pipe_write.index()] = n_block;
-                  mask_state_smem[smem_pipe_write.index()] = partially_masked;
-                }
-
-                // pipeline_flashmask.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
-                pipeline_flashmask.producer_commit(smem_pipe_write);
-
-            } else {
-                n_block--;
-            }
-    }
-#endif
-
-    CUTLASS_DEVICE
     void produce_next_n_block(int const& thread_idx, int32_t const& m_block, int32_t const& n_block, int32_t* consumer_n_block_smem, MainloopPipelineFlashMask pipeline_flashmask, PipelineState& smem_pipe_write) {
-        if (/*threads_num == 32 &&*/threadIdx.x >= 32) return;
-//        if(thread_idx == 0) printf("\n>>>>>> wsm debug produce m_block:%d, n_block:%d, smem_pipe_write.index():%d blockIdx.x:%d\n", m_block, n_block, smem_pipe_write.index(), blockIdx.x);
+#if 0
+long long int clk_val = clock64();
+if(thread_idx == 2 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
+if(thread_idx == 0 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
         pipeline_flashmask.producer_acquire(smem_pipe_write);
-//        if(thread_idx == 0) printf("\n>>>>>> wsm debug after produce m_block:%d, n_block:%d, smem_pipe_write.index():%d, blockIdx.x:%d\n", m_block, n_block, smem_pipe_write.index(), blockIdx.x);
+clk_val = clock64();
+if(thread_idx == 2 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
+if(thread_idx == 0 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
+        __syncwarp();
         if(thread_idx == 0) {
           consumer_n_block_smem[smem_pipe_write.index()] = n_block;
         }
+        __syncwarp();
         pipeline_flashmask.producer_commit(smem_pipe_write);
+#endif
     }
 
     CUTLASS_DEVICE
     void consume_next_n_block(int32_t const& thread_idx, int32_t const& m_block, int32_t& n_block, bool& partially_masked, int32_t const * const n_block_smem, int32_t const * const mask_state_smem, MainloopPipelineFlashMask pipeline_flashmask, PipelineState& smem_pipe_read) {
+#if 0
         if constexpr (Is_flashmask) {
-          // consumer_wait(pipeline_flashmask, smem_pipe_read);
-//          if(thread_idx == 0) printf("\n>>>>>> wsm debug consume m_block:%d, n_block:%d, smem_pipe_read.index():%d, blockIdx.x:%d\n", m_block, n_block, smem_pipe_read.index(), blockIdx.x);
+long long int clk_val = clock64();
+if(thread_idx == 2 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
+if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
           auto barrier_token = pipeline_flashmask.consumer_try_wait(smem_pipe_read);
           pipeline_flashmask.consumer_wait(smem_pipe_read, barrier_token);
-//          if(thread_idx == 0) printf("\n>>>>>> wsm debug after consume m_block:%d, n_block:%d, smem_pipe_read.index():%d, blockIdx.x:%d\n", m_block, n_block, smem_pipe_read.index(), blockIdx.x);
+clk_val = clock64();
+if(thread_idx == 2 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
+if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
           n_block = n_block_smem[smem_pipe_read.index()];
+clk_val = clock64();
+if(thread_idx == 2 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait and update m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
+if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait and update m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
           partially_masked = mask_state_smem[smem_pipe_read.index()];
           pipeline_flashmask.consumer_release(smem_pipe_read);
         } else {
           n_block--;
         }
+#endif
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -889,8 +723,6 @@ struct CollectiveMainloopFwdSm90 {
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
-
-        // n_block_min = m_block * kBlockM / 1024 * 1024 / kBlockN;
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -1080,16 +912,16 @@ struct CollectiveMainloopFwdSm90 {
         if(thread_idx == 0) {
           int32_t lt_start_max, lt_start_min;
           int32_t* s_lt_start_max = flashmask_maxmin_smem_;
-          int32_t* s_lt_start_min = flashmask_maxmin_smem_ + 8192 / 128;
+          int32_t* s_lt_start_min = flashmask_maxmin_smem_ + hackSeqlen / 128;
 
-          int32_t* s_lt_end_max = flashmask_maxmin_smem_ + 2 * 8192 / 128;
-          int32_t* s_lt_end_min = flashmask_maxmin_smem_ + 3 * 8192 / 128;
+          int32_t* s_lt_end_max = flashmask_maxmin_smem_ + 2 * hackSeqlen / 128;
+          int32_t* s_lt_end_min = flashmask_maxmin_smem_ + 3 * hackSeqlen / 128;
 
-          int32_t* s_ut_start_max = flashmask_maxmin_smem_ + 4 * 8192 / 128;
-          int32_t* s_ut_start_min = flashmask_maxmin_smem_ + 5 * 8192 / 128;
+          int32_t* s_ut_start_max = flashmask_maxmin_smem_ + 4 * hackSeqlen / 128;
+          int32_t* s_ut_start_min = flashmask_maxmin_smem_ + 5 * hackSeqlen / 128;
 
-          int32_t* s_ut_end_max = flashmask_maxmin_smem_ + 6 * 8192 / 128;
-          int32_t* s_ut_end_min = flashmask_maxmin_smem_ + 7 * 8192 / 128;
+          int32_t* s_ut_end_max = flashmask_maxmin_smem_ + 6 * hackSeqlen / 128;
+          int32_t* s_ut_end_min = flashmask_maxmin_smem_ + 7 * hackSeqlen / 128;
 
           int32_t lt_end_max = INT_MAX;
           int32_t lt_end_min = INT_MAX;
@@ -1100,8 +932,9 @@ struct CollectiveMainloopFwdSm90 {
           int32_t ut_end_max = INT_MAX;
           int32_t ut_end_min = INT_MAX;
           for(n_block--; n_block >= n_block_min; n_block--) {
-            lt_start_max = n_block >= n_block_min ? s_lt_start_max[n_block] : INT_MAX;
-            lt_start_min = n_block >= n_block_min ? s_lt_start_min[n_block] : INT_MAX;
+//            printf("\n>>>>>> wsm debug m_block:%%d, n_block:%d\n", m_block, n_block);
+            lt_start_max = s_lt_start_max[n_block];
+            lt_start_min = s_lt_start_min[n_block];
 
             if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
                 continue;
@@ -1120,27 +953,17 @@ struct CollectiveMainloopFwdSm90 {
           }
           n_block_smem_[valid_n_block_num] = -1;
 
-//            printf("\n>>>>>> wsm debug m_block:%d, valid_n_block_num:%d, blockIdx.x:%d\n", m_block, valid_n_block_num, blockIdx.x);
-//            for(int i=0;i<=valid_n_block_num;i++) {
-//              printf("m_block:%d, i:%d, n_block_smem_[%d]:%d, blockIdx.x:%d\n", m_block, i, i, n_block_smem_[i], blockIdx.x);
-//            }
         }
 
-//        __syncwarp();
+        __syncwarp();
+
         valid_n_block_num = __shfl_sync(0xffffffff, valid_n_block_num, 0);
 
+//        printf("\n>>>>>> wsm debug after gather n_block to smem, threadIdx.x:%d\n", threadIdx.x);
+
         int valid_n_block_idx = 0;
-#if 0
-        bool partially_masked;
-        static constexpr int NumThreads = NumProducerThreads;
-        int32_t min_n_block_in_smem = INT_MAX;
-        // get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskLoad);
-        produce_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_write);
-#endif
         n_block = n_block_smem_[valid_n_block_idx++];
         produce_next_n_block(thread_idx, m_block, n_block, consumer_n_block_smem_, pipeline_flashmask, smem_pipe_write);
-//        if(thread_idx == 0)
-//          printf("\n>>>>>> wsm debug producer threadIdx.x:%d, m_block:%d, n_block:%d, blockIdx.x:%d\n", threadIdx.x, m_block, n_block, blockIdx.x);
 
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // If this is true, we're guaranteed that only the first warp will execute this function
@@ -1434,6 +1257,7 @@ struct CollectiveMainloopFwdSm90 {
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
 
+#if 0
         int n_block = n_block_max;
         bool partially_masked;
         static constexpr int NumThreads = !LargeHeadDimV ? NumMmaThreads : NumMmaThreadsQK;
@@ -1448,6 +1272,67 @@ struct CollectiveMainloopFwdSm90 {
         n_block = n_block_smem_[valid_n_block_idx++];
 #endif
 
+#endif
+
+
+        int n_block = n_block_max;
+        int valid_n_block_num = 0;
+        if(threadIdx.x % 32 == 0) {
+// if(m_block == 7) printf("\n>>>>>> wsm debug n_block:%d, n_block_max:%d, n_block_min:%d, threadIdx.x:%d\n",
+//                                             n_block,    n_block_max,    n_block_min,    threadIdx.x);
+          int32_t lt_start_max, lt_start_min;
+          int32_t* s_lt_start_max = flashmask_maxmin_smem_;
+          int32_t* s_lt_start_min = flashmask_maxmin_smem_ + hackSeqlen / 128;
+
+          int32_t* s_lt_end_max = flashmask_maxmin_smem_ + 2 * hackSeqlen / 128;
+          int32_t* s_lt_end_min = flashmask_maxmin_smem_ + 3 * hackSeqlen / 128;
+
+          int32_t* s_ut_start_max = flashmask_maxmin_smem_ + 4 * hackSeqlen / 128;
+          int32_t* s_ut_start_min = flashmask_maxmin_smem_ + 5 * hackSeqlen / 128;
+
+          int32_t* s_ut_end_max = flashmask_maxmin_smem_ + 6 * hackSeqlen / 128;
+          int32_t* s_ut_end_min = flashmask_maxmin_smem_ + 7 * hackSeqlen / 128;
+
+          int32_t lt_end_max = INT_MAX;
+          int32_t lt_end_min = INT_MAX;
+
+          int32_t ut_start_max = INT_MAX;
+          int32_t ut_start_min = INT_MAX;
+
+          int32_t ut_end_max = INT_MAX;
+          int32_t ut_end_min = INT_MAX;
+          for(n_block--; n_block >= n_block_min; n_block--) {
+//            printf("\n>>>>>> wsm debug m_block:%%d, n_block:%d\n", m_block, n_block);
+            lt_start_max = s_lt_start_max[n_block];
+            lt_start_min = s_lt_start_min[n_block];
+
+            if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
+                continue;
+            if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
+                continue;
+#if 0
+            if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
+                partially_masked = true;
+            else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
+                partially_masked = true;
+            else
+                partially_masked = false;
+#endif
+              n_block_smem_[valid_n_block_num] = n_block; // umiswing: each warp should write the same value, this will save one barrier
+            valid_n_block_num++;
+          }
+          n_block_smem_[valid_n_block_num] = -1;
+// if(m_block == 7) printf("\n>>>>>> wsm debug valid_n_block_num:%d, threadIdx.x:%d\n", valid_n_block_num, threadIdx.x);
+        }
+
+        __syncwarp(); // umiswing: rely on each warp write the same value to n_block_smem_, this save one barrier
+        valid_n_block_num = __shfl_sync(0xffffffff, valid_n_block_num, 0);
+// if(thread_idx == 2 && m_block == 7)        printf("\n>>>>>> wsm debug valid_n_block_num:%d\n", valid_n_block_num);
+        int valid_n_block_idx = 0;
+        n_block = n_block_smem_[valid_n_block_idx++];
+
+// if(thread_idx == 2 && m_block == 7) printf("\n>>>>>> wsm debug n_block:%d\n", n_block);
+        
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.qhead_per_khead_divmod
@@ -1560,7 +1445,8 @@ struct CollectiveMainloopFwdSm90 {
             // get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK);
             PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
             ++smem_pipe_read;
-            consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read);
+//            consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read);
+            n_block = n_block_smem_[valid_n_block_idx++];
 
 //            n_block = n_block_smem_[valid_n_block_idx++];
 
@@ -1570,6 +1456,7 @@ struct CollectiveMainloopFwdSm90 {
 
             // Each step does gemm0 for iter n_block, gemm1 for iter n_block + 1, and softmax for iter n_block.
             auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {
+// if(thread_idx == 2 && m_block == 7) printf("\n>>>>>> wsm debug before fwd_step n_block:%d\n", n_block);
                 static constexpr bool Check_inf = decltype(check_inf_type)::value;
                 // PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 // ++smem_pipe_read;
@@ -1618,6 +1505,7 @@ struct CollectiveMainloopFwdSm90 {
 
                 smem_pipe_read_v = smem_pipe_read;
                 ++smem_pipe_read;
+// if(thread_idx == 2 && m_block == 7) printf("\n>>>>>> wsm debug after fwd_step n_block:%d\n", n_block);
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
@@ -1626,7 +1514,7 @@ struct CollectiveMainloopFwdSm90 {
                 int const n_block_min_causal_local_mask =
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
                 #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)/*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_causal_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
+                for (; n_block >= n_block_min_causal_local_mask; n_block = n_block_smem_[valid_n_block_idx++]/*consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)*//*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_causal_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
 //        if(thread_idx == 0)
 //          printf("\n>>>>>> wsm debug consumer threadIdx.x:%d, m_block:%d, n_block:%d, blockIdx.x:%d\n", threadIdx.x, m_block, n_block, blockIdx.x);
 
@@ -1641,7 +1529,7 @@ struct CollectiveMainloopFwdSm90 {
                            cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)/*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_before_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
+            for (; n_block >= n_block_min_before_local_mask; n_block = n_block_smem_[valid_n_block_idx++]/*consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)*//*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_before_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
 //        if(thread_idx == 0)
 //          printf("\n>>>>>> wsm debug consumer threadIdx.x:%d, m_block:%d, n_block:%d, blockIdx.x:%d\n", threadIdx.x, m_block, n_block, blockIdx.x);
 
@@ -1652,7 +1540,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_local) {
                 auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
                 #pragma unroll 1
-                for (; n_block >= n_block_min; consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)/*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
+                for (; n_block >= n_block_min; n_block = n_block_smem_[valid_n_block_idx++]/*consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)*//*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
 //        if(thread_idx == 0)
 //          printf("\n>>>>>> wsm debug consumer threadIdx.x:%d, m_block:%d, n_block:%d, blockIdx.x:%d\n", threadIdx.x, m_block, n_block, blockIdx.x);
 
@@ -1738,7 +1626,7 @@ struct CollectiveMainloopFwdSm90 {
 
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
             fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
-            consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read);
+//            consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read);
             /*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK);*/
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
@@ -1746,7 +1634,7 @@ struct CollectiveMainloopFwdSm90 {
                 int const n_block_min_causal_local_mask =
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
                 #pragma unroll 1
-                for (; n_block >= n_block_min_causal_local_mask; consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)/*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_causal_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
+                for (; n_block >= n_block_min_causal_local_mask; n_block--/*consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)*//*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_causal_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
                     fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
                 }
             }
@@ -1757,14 +1645,14 @@ struct CollectiveMainloopFwdSm90 {
                            cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
-            for (; n_block >= n_block_min_before_local_mask; consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)/*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_before_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
+            for (; n_block >= n_block_min_before_local_mask; n_block--/*consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)*//*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min_before_local_mask, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*is_first_iter*/, cute::false_type{} /*check_inf*/);
             }
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
                 auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
                 #pragma unroll 1
-                for (; n_block >= n_block_min; consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)/*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
+                for (; n_block >= n_block_min; n_block--/*consume_next_n_block(thread_idx, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read)*//*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK)*/) {
                     fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
                 }
             }
