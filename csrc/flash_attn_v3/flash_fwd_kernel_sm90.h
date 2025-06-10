@@ -202,13 +202,10 @@ public:
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-//        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * 8192 / 128];
         __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * CollectiveMainloop::hackSeqlen / 128];
         __shared__ int32_t flashmask_maxmin_smem_consumer_[8 * NumMmaThreads];
-//        __shared__ int32_t consumer_n_block_smem_[CollectiveMainloop::kStages];
-//        __shared__ int32_t n_block_smem_[8192 / 128 * 128];
-        __shared__ int32_t n_block_smem_[CollectiveMainloop::hackSeqlen / 128];
-        __shared__ int32_t consumer_n_block_smem_[CollectiveMainloop::hackSeqlen / 128];
+        __shared__ int32_t n_block_smem_[CollectiveMainloop::hackSeqlen / 128 * CollectiveMainloop::kFlashMaskStages];
+//        __shared__ int32_t consumer_n_block_smem_[CollectiveMainloop::hackSeqlen / 128];
 
         __shared__ int32_t mask_state_smem_[CollectiveMainloop::kStages];
 
@@ -363,6 +360,8 @@ public:
             // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
             PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
+            cutlass::PipelineState<CollectiveMainloop::kFlashMaskStages> flashmask_pipe_write = cutlass::make_producer_start_state<MainloopPipelineFlashMask>();
+
             int work_idx = 0;
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
@@ -402,10 +401,11 @@ public:
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write,
+                                         flashmask_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
-                                         flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_, consumer_n_block_smem_);
+                                         flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_, n_block_smem_);
             }
-            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, shared_storage, work_idx);
+            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
@@ -414,6 +414,7 @@ public:
 
             PipelineState smem_pipe_read;
             PipelineState smem_pipe_read_new;
+            cutlass::PipelineState<CollectiveMainloop::kFlashMaskStages> flashmask_pipe_read;
             // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
             // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
 
@@ -468,8 +469,9 @@ public:
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
+                        flashmask_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, flashmask_maxmin_smem_producer_, consumer_n_block_smem_, mask_state_smem_);
+                        flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(

@@ -38,6 +38,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int hackSeqlen = 128 * 1024;
 
     static constexpr int kStages = Stages;
+    static constexpr int kFlashMaskStages = 2;
 //    static constexpr int kStages = 1;
     using ClusterShape = ClusterShape_;
     using TileShape_MNK = TileShape_MNK_;
@@ -291,7 +292,7 @@ struct CollectiveMainloopFwdSm90 {
     using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
-    using MainloopPipelineFlashMask = typename cutlass::PipelineAsync<kStages>;
+    using MainloopPipelineFlashMask = typename cutlass::PipelineAsync<kFlashMaskStages>;
     using PipelineState = cutlass::PipelineState<kStages>;
 
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
@@ -642,49 +643,6 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    CUTLASS_DEVICE
-    void produce_next_n_block(int const& thread_idx, int32_t const& m_block, int32_t const& n_block, int32_t* consumer_n_block_smem, MainloopPipelineFlashMask pipeline_flashmask, PipelineState& smem_pipe_write) {
-#if 0
-long long int clk_val = clock64();
-if(thread_idx == 2 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
-if(thread_idx == 0 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
-        pipeline_flashmask.producer_acquire(smem_pipe_write);
-clk_val = clock64();
-if(thread_idx == 2 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
-if(thread_idx == 0 && m_block == 255)        printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after acquire m_block:%d, n_block:%d, smem_pipe_write.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_write.index());
-        __syncwarp();
-        if(thread_idx == 0) {
-          consumer_n_block_smem[smem_pipe_write.index()] = n_block;
-        }
-        __syncwarp();
-        pipeline_flashmask.producer_commit(smem_pipe_write);
-#endif
-    }
-
-    CUTLASS_DEVICE
-    void consume_next_n_block(int32_t const& thread_idx, int32_t const& m_block, int32_t& n_block, bool& partially_masked, int32_t const * const n_block_smem, int32_t const * const mask_state_smem, MainloopPipelineFlashMask pipeline_flashmask, PipelineState& smem_pipe_read) {
-#if 0
-        if constexpr (Is_flashmask) {
-long long int clk_val = clock64();
-if(thread_idx == 2 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
-if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, before wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
-          auto barrier_token = pipeline_flashmask.consumer_try_wait(smem_pipe_read);
-          pipeline_flashmask.consumer_wait(smem_pipe_read, barrier_token);
-clk_val = clock64();
-if(thread_idx == 2 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
-if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
-          n_block = n_block_smem[smem_pipe_read.index()];
-clk_val = clock64();
-if(thread_idx == 2 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait and update m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
-if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug threadIdx.x:%d, after wait and update m_block:%d, n_block:%d, smem_pipe_read.index():%d\n", clk_val, threadIdx.x, m_block, n_block, smem_pipe_read.index());
-          partially_masked = mask_state_smem[smem_pipe_read.index()];
-          pipeline_flashmask.consumer_release(smem_pipe_read);
-        } else {
-          n_block--;
-        }
-#endif
-    }
-
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
@@ -693,6 +651,7 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
          MainloopPipelineVt pipeline_vt,
          MainloopPipelineFlashMask pipeline_flashmask,
          PipelineState& smem_pipe_write,
+         cutlass::PipelineState<kFlashMaskStages>& flashmask_pipe_write,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
          SeqlenInfo_t const& seqlen_info,
@@ -700,10 +659,11 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
          int &work_idx,
          int32_t* const flashmask_smem_,
          int32_t* const flashmask_maxmin_smem_,
-         int32_t* const n_block_smem_,
+         int32_t* const n_block_smem,
          int32_t* const mask_state_smem_,
          int32_t* const consumer_n_block_smem_
          ) {
+        int32_t* const n_block_smem_ = n_block_smem + hackSeqlen / 128 * flashmask_pipe_write.index();
 
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
@@ -909,6 +869,8 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
         int n_block = n_block_max;
         int valid_n_block_num = 0;
 
+        pipeline_flashmask.producer_acquire(flashmask_pipe_write);
+
         if(thread_idx == 0) {
           int32_t lt_start_max, lt_start_min;
           int32_t* s_lt_start_max = flashmask_maxmin_smem_;
@@ -955,6 +917,9 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
 
         }
 
+        pipeline_flashmask.producer_commit(flashmask_pipe_write);
+        ++flashmask_pipe_write;
+
         __syncwarp();
 
         valid_n_block_num = __shfl_sync(0xffffffff, valid_n_block_num, 0);
@@ -963,7 +928,6 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
 
         int valid_n_block_idx = 0;
         n_block = n_block_smem_[valid_n_block_idx++];
-        produce_next_n_block(thread_idx, m_block, n_block, consumer_n_block_smem_, pipeline_flashmask, smem_pipe_write);
 
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         // If this is true, we're guaranteed that only the first warp will execute this function
@@ -1034,16 +998,10 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
 
         PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
         ++smem_pipe_write;
-        // produce_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_write);
         n_block = n_block_smem_[valid_n_block_idx++];
-        produce_next_n_block(thread_idx, m_block, n_block, consumer_n_block_smem_, pipeline_flashmask, smem_pipe_write);
-//        if(thread_idx == 0)
-//          printf("\n>>>>>> wsm debug producer threadIdx.x:%d, m_block:%d, n_block:%d, blockIdx.x:%d\n", threadIdx.x, m_block, n_block, blockIdx.x);
-
 
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
-//        for (; n_block >= n_block_min; produce_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_write)/*get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskLoad)*/)
-        for (; valid_n_block_idx <= valid_n_block_num; n_block = n_block_smem_[valid_n_block_idx++], produce_next_n_block(thread_idx, m_block, n_block, consumer_n_block_smem_, pipeline_flashmask, smem_pipe_write)) {
+        for (; n_block >= n_block_min; n_block = n_block_smem_[valid_n_block_idx++]) {
 //            if(thread_idx == 0)
 //              printf("\n>>>>>> wsm debug producer threadIdx.x:%d, m_block:%d, n_block:%d, blockIdx.x:%d\n", threadIdx.x, m_block, n_block, blockIdx.x);
             // PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
@@ -1085,7 +1043,7 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
     CUTLASS_DEVICE void
     load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v, MainloopPipelineVt pipeline_vt,
               MainloopPipelineFlashMask pipeline_flashmask,
-              PipelineState& smem_pipe_write, SharedStorage &shared_storage, int const work_idx) {
+              PipelineState& smem_pipe_write, cutlass::PipelineState<kFlashMaskStages>& flashmask_pipe_write, SharedStorage &shared_storage, int const work_idx) {
         // If we don't wait for barrier_O here, when using Cluster, CTA0 might exit early and CTA1 will
         // try to arrive on barrier_O of CTA0, causing "unspecified launch failure".
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
@@ -1100,7 +1058,7 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
             pipeline_k.producer_tail(smem_pipe_write);
             pipeline_v.producer_tail(smem_pipe_write);
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
-            // if constexpr (Is_flashmask) pipeline_flashmask.producer_tail(smem_pipe_write);
+            if constexpr (Is_flashmask) pipeline_flashmask.producer_tail(flashmask_pipe_write);
         }
     }
 
@@ -1150,6 +1108,7 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
         MainloopPipelineV pipeline_v,
         MainloopPipelineFlashMask pipeline_flashmask,
         PipelineState& smem_pipe_read,
+        cutlass::PipelineState<kFlashMaskStages>& flashmask_pipe_read,
         FrgTensorO& tOrO,
         Softmax& softmax,
         int const thread_idx,
@@ -1159,9 +1118,10 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
         SharedStorage& shared_storage,
         int32_t* const flashmask_smem_,
         int32_t* const flashmask_maxmin_smem_,
-        int32_t* const n_block_smem_,
+        int32_t* const n_block_smem,
         int32_t* const mask_state_smem_
         ) {
+        int32_t* const n_block_smem_ = n_block_smem + hackSeqlen / 128 * flashmask_pipe_read.index();
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -1257,77 +1217,11 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
 
-#if 0
-        int n_block = n_block_max;
-        bool partially_masked;
-        static constexpr int NumThreads = !LargeHeadDimV ? NumMmaThreads : NumMmaThreadsQK;
-        int32_t min_n_block_in_smem = INT_MAX;
-        // get_next_n_block(thread_idx, NumThreads, m_block, n_block, min_n_block_in_smem, partially_masked, n_block_min, params, flashmask_maxmin_smem_, FwdNamedBarriers::FlashMaskQK);
-        consume_next_n_block(thread_idx, m_block, n_block, partially_masked, n_block_smem_, mask_state_smem_, pipeline_flashmask, smem_pipe_read);
-//        if(thread_idx == 0)
-//          printf("\n>>>>>> wsm debug consumer threadIdx.x:%d, m_block:%d, n_block:%d, blockIdx.x:%d\n", threadIdx.x, m_block, n_block, blockIdx.x);
-#if 0
-        int valid_n_block_num = *s_valid_n_block_num;
-        int valid_n_block_idx = 0;
-        n_block = n_block_smem_[valid_n_block_idx++];
-#endif
-
-#endif
-
-
         int n_block = n_block_max;
         int valid_n_block_num = 0;
-        if(threadIdx.x % 32 == 0) {
-// if(m_block == 7) printf("\n>>>>>> wsm debug n_block:%d, n_block_max:%d, n_block_min:%d, threadIdx.x:%d\n",
-//                                             n_block,    n_block_max,    n_block_min,    threadIdx.x);
-          int32_t lt_start_max, lt_start_min;
-          int32_t* s_lt_start_max = flashmask_maxmin_smem_;
-          int32_t* s_lt_start_min = flashmask_maxmin_smem_ + hackSeqlen / 128;
 
-          int32_t* s_lt_end_max = flashmask_maxmin_smem_ + 2 * hackSeqlen / 128;
-          int32_t* s_lt_end_min = flashmask_maxmin_smem_ + 3 * hackSeqlen / 128;
+        consumer_wait(pipeline_flashmask, flashmask_pipe_read);
 
-          int32_t* s_ut_start_max = flashmask_maxmin_smem_ + 4 * hackSeqlen / 128;
-          int32_t* s_ut_start_min = flashmask_maxmin_smem_ + 5 * hackSeqlen / 128;
-
-          int32_t* s_ut_end_max = flashmask_maxmin_smem_ + 6 * hackSeqlen / 128;
-          int32_t* s_ut_end_min = flashmask_maxmin_smem_ + 7 * hackSeqlen / 128;
-
-          int32_t lt_end_max = INT_MAX;
-          int32_t lt_end_min = INT_MAX;
-
-          int32_t ut_start_max = INT_MAX;
-          int32_t ut_start_min = INT_MAX;
-
-          int32_t ut_end_max = INT_MAX;
-          int32_t ut_end_min = INT_MAX;
-          for(n_block--; n_block >= n_block_min; n_block--) {
-//            printf("\n>>>>>> wsm debug m_block:%%d, n_block:%d\n", m_block, n_block);
-            lt_start_max = s_lt_start_max[n_block];
-            lt_start_min = s_lt_start_min[n_block];
-
-            if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
-                continue;
-            if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
-                continue;
-#if 0
-            if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
-                partially_masked = true;
-            else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
-                partially_masked = true;
-            else
-                partially_masked = false;
-#endif
-              n_block_smem_[valid_n_block_num] = n_block; // umiswing: each warp should write the same value, this will save one barrier
-            valid_n_block_num++;
-          }
-          n_block_smem_[valid_n_block_num] = -1;
-// if(m_block == 7) printf("\n>>>>>> wsm debug valid_n_block_num:%d, threadIdx.x:%d\n", valid_n_block_num, threadIdx.x);
-        }
-
-        __syncwarp(); // umiswing: rely on each warp write the same value to n_block_smem_, this save one barrier
-        valid_n_block_num = __shfl_sync(0xffffffff, valid_n_block_num, 0);
-// if(thread_idx == 2 && m_block == 7)        printf("\n>>>>>> wsm debug valid_n_block_num:%d\n", valid_n_block_num);
         int valid_n_block_idx = 0;
         n_block = n_block_smem_[valid_n_block_idx++];
 
@@ -1670,6 +1564,8 @@ if(thread_idx == 0 && m_block == 255)          printf("\n>>>>>> %lld, wsm debug 
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
         }
+        pipeline_flashmask.consumer_release(flashmask_pipe_read);
+        ++flashmask_pipe_read;
         ++work_idx;
         return true;
     }
