@@ -244,13 +244,14 @@ namespace flashmask {
 
   template <int kBlockN>
   void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream) {
+    printf("\nprepare_block_maxmin kBlockN:%d\n", kBlockN);
     if (params.lt_start_ptr == nullptr &&
         params.ut_end_ptr == nullptr) {
       return;
     }
     int *nblock_smask = params.flashmask_maxmin_ptr;
     const int nblock_seqlen = (params.seqlen_k + kBlockN - 1) / kBlockN;
-    const int nblock_masklen = params.b * params.h_flashmask * nblock_seqlen;
+    const int nblock_masklen = (params.b * params.h_flashmask * nblock_seqlen + 3) / 4 * 4; // umiswing: padding for int4 load
     params.lt_start_nblockmax = nblock_smask;
     params.lt_start_nblockmin = nblock_smask + nblock_masklen;
     params.ut_end_nblockmax = nblock_smask + 2 * nblock_masklen;

@@ -54,6 +54,7 @@ public:
 
     // Mainloop derived types
     using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
+    using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
     using TiledMmaPV = typename CollectiveMainloop::TiledMmaPV;
     using ArchTag = typename CollectiveMainloop::ArchTag;
     using ClusterShape = typename CollectiveMainloop::ClusterShape;
@@ -185,7 +186,7 @@ public:
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
-        static constexpr int kBlockN = get<1>(TileShape_MNK_PV{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
         using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
@@ -202,33 +203,200 @@ public:
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * CollectiveMainloop::hackSeqlen / 128];
-        __shared__ int32_t flashmask_maxmin_smem_consumer_[8 * NumMmaThreads];
-        __shared__ int32_t n_block_smem_[CollectiveMainloop::hackSeqlen / 128 * CollectiveMainloop::kFlashMaskStages];
-//        __shared__ int32_t consumer_n_block_smem_[CollectiveMainloop::hackSeqlen / 128];
+        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * CollectiveMainloop::Flashmask_n_block_buffer_length];
+        __shared__ int32_t n_block_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kFlashMaskStages];
 
-        __shared__ int32_t mask_state_smem_[CollectiveMainloop::kStages];
+        __shared__ bool mask_state_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kStages];
 
-        if(threadIdx.x * 4 < CollectiveMainloop::hackSeqlen) {
-          asm volatile(
-            "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-              ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + threadIdx.x)),
-                "l"(reinterpret_cast<int4*>(params.mainloop.lt_start_nblockmax) + threadIdx.x),
-                "n"(16));
+#if 0
+        if(threadIdx.x == 0 && blockIdx.x == 0) {
+          // lt
+          if(params.mainloop.lt_start_nblockmax != nullptr)
+            printf("\nlt_start_nblockmax:%p\n", params.mainloop.lt_start_nblockmax);
 
-          asm volatile(
-            "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-              ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::hackSeqlen / 128 + threadIdx.x)),
-                "l"(reinterpret_cast<int4*>(params.mainloop.lt_start_nblockmin) + threadIdx.x),
-                "n"(16));
+          if(params.mainloop.lt_start_nblockmin != nullptr)
+            printf("\nlt_start_nblockmin:%p\n", params.mainloop.lt_start_nblockmin);
 
-          asm volatile("cp.async.commit_group;\n" ::);
-          asm volatile("cp.async.wait_group 0;\n" ::);
+          if(params.mainloop.lt_end_nblockmax != nullptr)
+            printf("\nlt_end_nblockmax:%p\n", params.mainloop.lt_end_nblockmax);
+
+          if(params.mainloop.lt_end_nblockmin != nullptr)
+            printf("\nlt_end_nblockmin:%p\n", params.mainloop.lt_end_nblockmin);
+
+          // ut
+          if(params.mainloop.ut_start_nblockmax != nullptr)
+            printf("\nut_start_nblockmax:%p\n", params.mainloop.ut_start_nblockmax);
+
+          if(params.mainloop.ut_start_nblockmin != nullptr)
+            printf("\nut_start_nblockmin:%p\n", params.mainloop.ut_start_nblockmin);
+
+          if(params.mainloop.ut_end_nblockmax != nullptr)
+            printf("\nut_end_nblockmax:%p\n", params.mainloop.ut_end_nblockmax);
+
+          if(params.mainloop.ut_end_nblockmin != nullptr)
+            printf("\nut_end_nblockmin:%p\n", params.mainloop.ut_end_nblockmin);
         }
+#endif
+
+        for(int64_t idx = threadIdx.x; idx < ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += blockDim.x) {
+          // lt
+          if(params.mainloop.lt_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_start_nblockmax) + idx),
+                  "n"(16));
+
+          if(params.mainloop.lt_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_start_nblockmin) + idx),
+                  "n"(16));
+
+          if(params.mainloop.lt_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 2 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_end_nblockmax) + idx),
+                  "n"(16));
+
+          if(params.mainloop.lt_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 3 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.lt_end_nblockmin) + idx),
+                  "n"(16));
+
+          // ut
+          if(params.mainloop.ut_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 4 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_start_nblockmax) + idx),
+                  "n"(16));
+
+          if(params.mainloop.ut_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 5 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_start_nblockmin) + idx),
+                  "n"(16));
+
+          if(params.mainloop.ut_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 6 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmax) + idx),
+                  "n"(16));
+
+          if(params.mainloop.ut_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 7 + idx)),
+                  "l"(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmin) + idx),
+                  "n"(16));
+
+        }
+
+//        for(int64_t idx = threadIdx.x + (get<0>(params.mainloop.shape_K) / kBlockN + 3) / 4 * 4; idx < get<0>(params.mainloop.shape_Q) / kBlockM; idx += blockDim.x)
+        for(int64_t idx = threadIdx.x + ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4 * 4; idx < (get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN; idx += blockDim.x) {
+          // lt
+          if(params.mainloop.lt_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + idx)),
+                  "l"(params.mainloop.lt_start_nblockmax + idx),
+                  "n"(4));
+
+          if(params.mainloop.lt_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length + idx)),
+                  "l"(params.mainloop.lt_start_nblockmin + idx),
+                  "n"(4));
+
+          if(params.mainloop.lt_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 2 + idx)),
+                  "l"(params.mainloop.lt_end_nblockmax + idx),
+                  "n"(4));
+
+          if(params.mainloop.lt_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 3 + idx)),
+                  "l"(params.mainloop.lt_end_nblockmin + idx),
+                  "n"(4));
+          // ut
+          if(params.mainloop.ut_start_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 4 + idx)),
+                  "l"(params.mainloop.ut_start_nblockmax + idx),
+                  "n"(4));
+
+          if(params.mainloop.ut_start_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 5 + idx)),
+                  "l"(params.mainloop.ut_start_nblockmin + idx),
+                  "n"(4));
+
+          if(params.mainloop.ut_end_nblockmax != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 6 + idx)),
+                  "l"(params.mainloop.ut_end_nblockmax + idx),
+                  "n"(4));
+
+          if(params.mainloop.ut_end_nblockmin != nullptr)
+            asm volatile(
+              "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 7 + idx)),
+                  "l"(params.mainloop.ut_end_nblockmin + idx),
+                  "n"(4));
+        }
+
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 0;\n" ::);
 
         __syncthreads();
 
-//        printf("\n>>>>>> wsm debug finish cp.async, threadIdx.x:%d\n", threadIdx.x);
+if(threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("\nget<0>(params.mainloop.shape_K):%d, kBlockN:%d\n",get<0>(params.mainloop.shape_K), kBlockN);
+        for(int i=0;i<(get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN;i++) {
+        printf("\nparams.mainloop.lt_start_nblockmax[%d]:%d, params.mainloop.lt_start_nblockmin[%d]:%d\n",
+                  i,params.mainloop.lt_start_nblockmax[i],    i,params.mainloop.lt_start_nblockmin[i]);
+
+        printf("\nparams.mainloop.ut_end_nblockmax[%d]:%d, params.mainloop.ut_end_nblockmin[%d]:%d\n",
+                  i,params.mainloop.ut_end_nblockmax[i],    i,params.mainloop.ut_end_nblockmin[i]);
+
+        printf("\ns_ut_end_nblockmax[%d]:%d, s_ut_end_nblockmin[%d]:%d\n",
+                 i, *(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 6 + i),
+                 i, *(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 7 + i));
+        }
+
+       for(int i=0;i < ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4; i++) {
+         int4 g_max_val = *(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmax) + i);
+         int4 g_min_val = *(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmin) + i);
+         int4 s_max_val = *(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 6 + i);
+         int4 s_min_val = *(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 7 + i);
+
+         printf("\ng_ut_end_nblockmax[%d].x:%d, g_ut_end_nblockmax[%d].y:%d, g_ut_end_nblockmax[%d].z:%d, g_ut_end_nblockmax[%d].w:%d\n",
+                   i,g_max_val.x, i,g_max_val.y, i,g_max_val.z, i,g_max_val.w);
+
+         printf("\ng_ut_end_nblockmin[%d].x:%d, g_ut_end_nblockmin[%d].y:%d, g_ut_end_nblockmin[%d].z:%d, g_ut_end_nblockmin[%d].w:%d\n",
+                   i,g_min_val.x, i,g_min_val.y, i,g_min_val.z, i,g_min_val.w);
+
+         printf("\ns_ut_end_nblockmax[%d].x:%d, s_ut_end_nblockmax[%d].y:%d, s_ut_end_nblockmax[%d].z:%d, s_ut_end_nblockmax[%d].w:%d\n",
+                   i,s_max_val.x, i,s_max_val.y, i,s_max_val.z, i,s_max_val.w);
+
+         printf("\ns_ut_end_nblockmin[%d].x:%d, s_ut_end_nblockmin[%d].y:%d, s_ut_end_nblockmin[%d].z:%d, s_ut_end_nblockmin[%d].w:%d\n",
+                   i,s_min_val.x, i,s_min_val.y, i,s_min_val.z, i,s_min_val.w);
+       }
+}
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -351,7 +519,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
-            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+//            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
@@ -403,11 +571,11 @@ public:
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write,
                                          flashmask_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
-                                         flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_, n_block_smem_);
+                                         flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
-            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+//            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;
@@ -471,18 +639,18 @@ public:
                         params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
                         flashmask_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
+                        flashmask_smem_, n_block_smem_, mask_state_smem_);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
                             params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, flashmask_maxmin_smem_consumer_, n_block_smem_, mask_state_smem_);
+                            flashmask_smem_, n_block_smem_, mask_state_smem_);
                     } else {
                         tile_valid = mainloop.mma_pv(
                             params.mainloop, pipeline_v, pipeline_flashmask, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, flashmask_maxmin_smem_consumer_ + 8 * CollectiveMainloop::NumMmaThreadsQK);
+                            flashmask_smem_);
                     }
                 }
                 // Do this here before the epilogue so that the next tile is ready to go.
