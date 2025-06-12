@@ -72,7 +72,9 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    static constexpr int Flashmask_n_block_buffer_length = ((32 * 1024 + kBlockN - 1) / kBlockN + 3) / 4 * 4;
+    static constexpr int Flashmask_max_seqlen_k = 32 * 1024;
+
+    static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4;
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
@@ -292,6 +294,7 @@ struct CollectiveMainloopFwdSm90 {
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
     using MainloopPipelineFlashMask = typename cutlass::PipelineAsync<kFlashMaskStages>;
+    using MainloopPipelineFlashMaskApply = typename cutlass::PipelineAsync<kStages>;
     using PipelineState = cutlass::PipelineState<kStages>;
 
     // If PackGQA, we use cp.async (instead of TMA) to load Q, so we want smem_q to be aligned
@@ -649,6 +652,7 @@ struct CollectiveMainloopFwdSm90 {
          MainloopPipelineV pipeline_v,
          MainloopPipelineVt pipeline_vt,
          MainloopPipelineFlashMask pipeline_flashmask,
+         MainloopPipelineFlashMaskApply pipeline_flashmask_apply,
          PipelineState& smem_pipe_write,
          cutlass::PipelineState<kFlashMaskStages>& flashmask_pipe_write,
          SharedStorage &shared_storage,
@@ -659,9 +663,10 @@ struct CollectiveMainloopFwdSm90 {
          int32_t* const flashmask_smem_,
          int32_t* const flashmask_maxmin_smem_,
          int32_t* const n_block_smem,
-         bool* const mask_state_smem_
+         bool* const mask_state_smem
          ) {
         int32_t* const n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
+        bool* const mask_state_smem_ = mask_state_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
 
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
@@ -854,16 +859,6 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_vt.consumer_release(smem_pipe_read);
         };
 
-        auto load_flashmask = [&] (auto const& smem_pipe_write) {
-#if 0
-            if constexpr (Is_flashmask) {
-                pipeline_flashmask.producer_acquire(smem_pipe_write);
-                flash_mask.load(thread_idx, NumProducerThreads, smem_pipe_write.index());
-                pipeline_flashmask.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
-            }
-#endif
-        };
-
         int n_block = n_block_max;
         int valid_n_block_num = 0;
 
@@ -924,35 +919,76 @@ struct CollectiveMainloopFwdSm90 {
                           m_block,    n_block,    lt_start_max,    lt_start_min,    lt_end_max,    lt_end_min,    ut_start_max,    ut_start_min,    ut_end_max,    ut_end_min);
             }
 
+            bool partially_masked;
+
             if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
                 continue;
             if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
                 continue;
-#if 0
             if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
                 partially_masked = true;
             else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
                 partially_masked = true;
             else
                 partially_masked = false;
-#endif
             n_block_smem_[valid_n_block_num] = n_block;
+            mask_state_smem_[valid_n_block_num] = partially_masked;
             valid_n_block_num++;
           }
           n_block_smem_[valid_n_block_num] = -1;
           for(int i=0;i<=valid_n_block_num; i++) {
-            printf("\nm_block:%d, valid_n_block_num:%d, n_block_smem_[%d]:%d\n", m_block, valid_n_block_num, i, n_block_smem_[i]);
+            printf("\nm_block:%d, valid_n_block_num:%d, n_block_smem_[%d]:%d, mask_state_smem_[%d]:%d\n", m_block, valid_n_block_num, i, n_block_smem_[i], i, mask_state_smem_[i]);
           }
         }
 
         pipeline_flashmask.producer_commit(flashmask_pipe_write);
         ++flashmask_pipe_write;
 
-//        __syncwarp();
+        auto load_flashmask = [&] (auto const& smem_pipe_write) {
+            if constexpr (Is_flashmask) {
+                pipeline_flashmask_apply.producer_acquire(smem_pipe_write);
+                if(mask_state_smem_[n_block]) {
+                  for(int64_t idx = thread_idx; idx < kBlockN; idx += NumProducerThreads) {
+                    if(params.lt_start_ptr != nullptr) {
+                      asm volatile(
+                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + idx)),
+                            "l"(params.lt_start_ptr + idx),
+                            "n"(4));
+                    }
+                    if(params.lt_end_ptr != nullptr) {
+                      asm volatile(
+                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + kBlockN + idx)),
+                            "l"(params.lt_end_ptr + idx),
+                            "n"(4));
+                    }
+
+                    if(params.ut_start_ptr != nullptr) {
+                      asm volatile(
+                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + 2 * kBlockN + idx)),
+                            "l"(params.ut_start_ptr + idx),
+                            "n"(4));
+                    }
+
+                    if(params.ut_end_ptr != nullptr) {
+                      asm volatile(
+                        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
+                          ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + 3 * kBlockN + idx)),
+                            "l"(params.ut_end_ptr + idx),
+                            "n"(4));
+                    }
+                  }
+                  asm volatile("cp.async.commit_group;\n" ::);
+                  asm volatile("cp.async.wait_group 0;\n" ::);
+                  cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+                }
+                pipeline_flashmask_apply.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+            }
+        };
 
         cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-
-//        valid_n_block_num = __shfl_sync(0xffffffff, valid_n_block_num, 0);
 
         int valid_n_block_idx = 0;
         n_block = n_block_smem_[valid_n_block_idx++];
@@ -1055,7 +1091,7 @@ if(thread_idx == 0) {
             }
             n_block_prev = n_block;
             if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
-//            load_flashmask(smem_pipe_write);
+            load_flashmask(smem_pipe_write);
 //            smem_pipe_write_v = smem_pipe_write;
 //            ++smem_pipe_write;
         }
@@ -1134,12 +1170,44 @@ if(thread_idx == 0) {
         }
     }
 
+  template <typename TiledMma, typename Engine, typename Layout>
+  CUTLASS_DEVICE
+  void flashmask_apply(Tensor<Engine, Layout> &tSrS, int const m_block, int const thread_idx, int const index, int32_t* const flashmask_smem_) {
+      auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
+
+      Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      Tensor tScS = thread_mma.partition_C(cS);
+      Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
+      Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+
+      static constexpr int Row = 0, Col = 1;
+
+      int32_t* s_lt_start = flashmask_smem_ + 4 * kBlockN * index;
+      int32_t* s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
+      int32_t* s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
+      int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
+
+      #pragma unroll
+      for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+        int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+        #pragma unroll
+        for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+          int const col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
+          if(row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx])
+              tSrS_rowcol(m, n) = -INFINITY;
+          if(row_idx >= s_ut_start[col_idx] && row_idx < s_ut_end[col_idx])
+              tSrS_rowcol(m, n) = -INFINITY;
+        }
+      }
+    }
+
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
     CUTLASS_DEVICE bool
     mma(Params const& params,
         MainloopPipelineK pipeline_k,
         MainloopPipelineV pipeline_v,
         MainloopPipelineFlashMask pipeline_flashmask,
+        MainloopPipelineFlashMaskApply pipeline_flashmask_apply,
         PipelineState& smem_pipe_read,
         cutlass::PipelineState<kFlashMaskStages>& flashmask_pipe_read,
         FrgTensorO& tOrO,
@@ -1151,9 +1219,11 @@ if(thread_idx == 0) {
         SharedStorage& shared_storage,
         int32_t* const flashmask_smem_,
         int32_t* const n_block_smem,
-        bool* const mask_state_smem_
+        bool* const mask_state_smem
         ) {
         int32_t* const n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * flashmask_pipe_read.index();
+        bool* const mask_state_smem_ = mask_state_smem + Flashmask_n_block_buffer_length * flashmask_pipe_read.index();
+
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -1355,11 +1425,11 @@ if(thread_idx == 0) {
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
 
             if constexpr(Is_flashmask) {
-#if 0
-              consumer_wait(pipeline_flashmask, smem_pipe_read);
-              flash_mask.template apply<TiledMmaQK>(tSrS, thread_idx, smem_pipe_read.index());
-              pipeline_flashmask.consumer_release(smem_pipe_read);
-#endif
+              consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
+              if (mask_state_smem_[n_block]) {
+                flashmask_apply<TiledMmaQK>(tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_);
+              }
+              pipeline_flashmask_apply.consumer_release(smem_pipe_read);
             }
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -1373,8 +1443,6 @@ if(thread_idx == 0) {
             if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
-//            PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
-//            ++smem_pipe_read;
             n_block = n_block_smem_[valid_n_block_idx++];
 
             // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
@@ -1413,11 +1481,11 @@ if(thread_idx == 0) {
                 mask_fn(tSrS, n_block);
 
                 if constexpr (Is_flashmask) {
-#if 0
-                  consumer_wait(pipeline_flashmask, smem_pipe_read);
-                  flash_mask.template apply<TiledMmaQK>(tSrS, thread_idx, smem_pipe_read.index());
-                  pipeline_flashmask.consumer_release(smem_pipe_read);
-#endif
+                  consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
+                  if (mask_state_smem_[n_block]) {
+                    flashmask_apply<TiledMmaQK>(tSrS, m_block, thread_idx, smem_pipe_read.index(), flashmask_smem_);
+                  }
+                  pipeline_flashmask_apply.consumer_release(smem_pipe_read);
                 }
 
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
@@ -1433,9 +1501,6 @@ if(thread_idx == 0) {
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
-
-//                smem_pipe_read_v = smem_pipe_read;
-//                ++smem_pipe_read;
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking

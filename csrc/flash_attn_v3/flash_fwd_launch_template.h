@@ -90,6 +90,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
 
     if constexpr (Is_flashmask) {
+        if (params.seqlen_k > CollectiveMainloop::Flashmask_max_seqlen_k) {
+            fprintf(stderr, "Invalid Argument (%s:%d): seqlen_k (%d) can not be greater than CollectiveMainloop::Flashmask_max_seqlen_k (%d)\n", __FILE__, __LINE__, params.seqlen_k, CollectiveMainloop::Flashmask_max_seqlen_k);
+            exit(1);
+        }
         flash::flashmask::prepare_block_maxmin<kBlockN>(params, stream);
     }
 

@@ -116,6 +116,7 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMask::SharedStorage pipeline_flashmask;
+            alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMaskApply::SharedStorage pipeline_flashmask_apply;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
@@ -193,12 +194,14 @@ public:
         using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
         using MainloopPipelineKVNew = typename CollectiveMainloop::MainloopPipelineKVNew;
         using MainloopPipelineFlashMask = typename CollectiveMainloop::MainloopPipelineFlashMask;
+        using MainloopPipelineFlashMaskApply = typename CollectiveMainloop::MainloopPipelineFlashMaskApply;
         using PipelineState = typename CollectiveMainloop::PipelineState;
         using PipelineParamsK = typename MainloopPipelineK::Params;
         using PipelineParamsV = typename MainloopPipelineV::Params;
         using PipelineParamsVt = typename MainloopPipelineVt::Params;
         using PipelineParamsKVNew = typename MainloopPipelineKVNew::Params;
         using PipelineParamsFlashMask = typename MainloopPipelineFlashMask::Params;
+        using PipelineParamsFlashMaskApply = typename MainloopPipelineFlashMaskApply::Params;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
@@ -207,36 +210,6 @@ public:
         __shared__ int32_t n_block_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kFlashMaskStages];
 
         __shared__ bool mask_state_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kStages];
-
-#if 0
-        if(threadIdx.x == 0 && blockIdx.x == 0) {
-          // lt
-          if(params.mainloop.lt_start_nblockmax != nullptr)
-            printf("\nlt_start_nblockmax:%p\n", params.mainloop.lt_start_nblockmax);
-
-          if(params.mainloop.lt_start_nblockmin != nullptr)
-            printf("\nlt_start_nblockmin:%p\n", params.mainloop.lt_start_nblockmin);
-
-          if(params.mainloop.lt_end_nblockmax != nullptr)
-            printf("\nlt_end_nblockmax:%p\n", params.mainloop.lt_end_nblockmax);
-
-          if(params.mainloop.lt_end_nblockmin != nullptr)
-            printf("\nlt_end_nblockmin:%p\n", params.mainloop.lt_end_nblockmin);
-
-          // ut
-          if(params.mainloop.ut_start_nblockmax != nullptr)
-            printf("\nut_start_nblockmax:%p\n", params.mainloop.ut_start_nblockmax);
-
-          if(params.mainloop.ut_start_nblockmin != nullptr)
-            printf("\nut_start_nblockmin:%p\n", params.mainloop.ut_start_nblockmin);
-
-          if(params.mainloop.ut_end_nblockmax != nullptr)
-            printf("\nut_end_nblockmax:%p\n", params.mainloop.ut_end_nblockmax);
-
-          if(params.mainloop.ut_end_nblockmin != nullptr)
-            printf("\nut_end_nblockmin:%p\n", params.mainloop.ut_end_nblockmin);
-        }
-#endif
 
         for(int64_t idx = threadIdx.x; idx < ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += blockDim.x) {
           // lt
@@ -299,7 +272,6 @@ public:
 
         }
 
-//        for(int64_t idx = threadIdx.x + (get<0>(params.mainloop.shape_K) / kBlockN + 3) / 4 * 4; idx < get<0>(params.mainloop.shape_Q) / kBlockM; idx += blockDim.x)
         for(int64_t idx = threadIdx.x + ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4 * 4; idx < (get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN; idx += blockDim.x) {
           // lt
           if(params.mainloop.lt_start_nblockmax != nullptr)
@@ -363,40 +335,6 @@ public:
         asm volatile("cp.async.wait_group 0;\n" ::);
 
         __syncthreads();
-
-if(threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("\nget<0>(params.mainloop.shape_K):%d, kBlockN:%d\n",get<0>(params.mainloop.shape_K), kBlockN);
-        for(int i=0;i<(get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN;i++) {
-        printf("\nparams.mainloop.lt_start_nblockmax[%d]:%d, params.mainloop.lt_start_nblockmin[%d]:%d\n",
-                  i,params.mainloop.lt_start_nblockmax[i],    i,params.mainloop.lt_start_nblockmin[i]);
-
-        printf("\nparams.mainloop.ut_end_nblockmax[%d]:%d, params.mainloop.ut_end_nblockmin[%d]:%d\n",
-                  i,params.mainloop.ut_end_nblockmax[i],    i,params.mainloop.ut_end_nblockmin[i]);
-
-        printf("\ns_ut_end_nblockmax[%d]:%d, s_ut_end_nblockmin[%d]:%d\n",
-                 i, *(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 6 + i),
-                 i, *(flashmask_maxmin_smem_producer_ + CollectiveMainloop::Flashmask_n_block_buffer_length * 7 + i));
-        }
-
-       for(int i=0;i < ((get<0>(params.mainloop.shape_K) + kBlockN - 1) / kBlockN) / 4; i++) {
-         int4 g_max_val = *(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmax) + i);
-         int4 g_min_val = *(reinterpret_cast<int4*>(params.mainloop.ut_end_nblockmin) + i);
-         int4 s_max_val = *(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 6 + i);
-         int4 s_min_val = *(reinterpret_cast<int4*>(flashmask_maxmin_smem_producer_) + CollectiveMainloop::Flashmask_n_block_buffer_length / 4 * 7 + i);
-
-         printf("\ng_ut_end_nblockmax[%d].x:%d, g_ut_end_nblockmax[%d].y:%d, g_ut_end_nblockmax[%d].z:%d, g_ut_end_nblockmax[%d].w:%d\n",
-                   i,g_max_val.x, i,g_max_val.y, i,g_max_val.z, i,g_max_val.w);
-
-         printf("\ng_ut_end_nblockmin[%d].x:%d, g_ut_end_nblockmin[%d].y:%d, g_ut_end_nblockmin[%d].z:%d, g_ut_end_nblockmin[%d].w:%d\n",
-                   i,g_min_val.x, i,g_min_val.y, i,g_min_val.z, i,g_min_val.w);
-
-         printf("\ns_ut_end_nblockmax[%d].x:%d, s_ut_end_nblockmax[%d].y:%d, s_ut_end_nblockmax[%d].z:%d, s_ut_end_nblockmax[%d].w:%d\n",
-                   i,s_max_val.x, i,s_max_val.y, i,s_max_val.z, i,s_max_val.w);
-
-         printf("\ns_ut_end_nblockmin[%d].x:%d, s_ut_end_nblockmin[%d].y:%d, s_ut_end_nblockmin[%d].z:%d, s_ut_end_nblockmin[%d].w:%d\n",
-                   i,s_min_val.x, i,s_min_val.y, i,s_min_val.z, i,s_min_val.w);
-       }
-}
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -505,6 +443,15 @@ if(threadIdx.x == 0 && blockIdx.x == 0) {
 
         MainloopPipelineFlashMask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
 
+        PipelineParamsFlashMaskApply pipeline_params_flashmask_apply;
+        pipeline_params_flashmask_apply.role = warp_group_idx == 0
+            ? MainloopPipelineFlashMask::ThreadCategory::Producer
+            : MainloopPipelineFlashMask::ThreadCategory::Consumer;
+        pipeline_params_flashmask_apply.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
+        pipeline_params_flashmask_apply.producer_arv_count = NumProducerThreads;
+
+        MainloopPipelineFlashMaskApply pipeline_flashmask_apply(shared_storage.pipelines.pipeline_flashmask_apply, pipeline_params_flashmask_apply);
+
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
@@ -568,7 +515,7 @@ if(threadIdx.x == 0 && blockIdx.x == 0) {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
-                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write,
+                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_write,
                                          flashmask_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
                                          flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
@@ -636,7 +583,7 @@ if(threadIdx.x == 0 && blockIdx.x == 0) {
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
-                        params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
+                        params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_read,
                         flashmask_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
                         flashmask_smem_, n_block_smem_, mask_state_smem_);
