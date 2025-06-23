@@ -117,7 +117,7 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ kv_batch_idx;
 
     // Paged KV cache
-    int * __restrict__ page_table;
+    int * __restrict__ page_table = nullptr;
     index_t page_table_batch_stride;
     int page_size;
     int num_pages;

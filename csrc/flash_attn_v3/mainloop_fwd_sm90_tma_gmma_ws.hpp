@@ -869,6 +869,7 @@ struct CollectiveMainloopFwdSm90 {
                                  m_block,    threadIdx.x,    blockIdx.x);
 
         if(thread_idx == 0) {
+#if 0
           int32_t lt_start_max = INT_MIN;
           int32_t lt_start_min = INT_MIN;
 
@@ -880,6 +881,33 @@ struct CollectiveMainloopFwdSm90 {
 
           int32_t ut_end_max = INT_MAX;
           int32_t ut_end_min = INT_MAX;
+#endif
+
+          // TODO(umiswing): refine default value
+#if 0
+          int32_t lt_start_max = INT_MAX;
+          int32_t lt_start_min = INT_MAX;
+
+          int32_t lt_end_max = INT_MAX;
+          int32_t lt_end_min = INT_MAX;
+
+          int32_t ut_start_max = INT_MIN;
+          int32_t ut_start_min = INT_MIN;
+
+          int32_t ut_end_max = INT_MIN;
+          int32_t ut_end_min = INT_MIN;
+#endif
+          int32_t lt_start_max;
+          int32_t lt_start_min;
+
+          int32_t lt_end_max;
+          int32_t lt_end_min;
+
+          int32_t ut_start_max;
+          int32_t ut_start_min;
+
+          int32_t ut_end_max;
+          int32_t ut_end_min;
 
           int32_t* s_lt_start_max = flashmask_maxmin_smem_;
           int32_t* s_lt_start_min = flashmask_maxmin_smem_ + Flashmask_n_block_buffer_length;
@@ -919,8 +947,45 @@ struct CollectiveMainloopFwdSm90 {
                           m_block,    n_block,    lt_start_max,    lt_start_min,    lt_end_max,    lt_end_min,    ut_start_max,    ut_start_min,    ut_end_max,    ut_end_min);
             }
 
-            bool partially_masked;
+            bool partially_masked = false;
 
+            if(params.lt_end_nblockmin != nullptr) {
+              if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
+                continue;
+            } else {
+              if(m_block * kBlockM >= lt_start_max)
+                continue;
+            }
+
+            if(params.ut_end_nblockmin != nullptr) {
+              if(params.ut_start_nblockmax != nullptr) {
+                if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
+                  continue;
+              } else {
+                if((m_block + 1) * kBlockM <= ut_end_min)
+                  continue;
+              }
+            }
+
+            if(params.lt_end_nblockmax != nullptr) {
+              if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
+                partially_masked = true;
+            } else {
+              if((m_block + 1) * kBlockM > lt_start_min)
+                partially_masked = true;
+            }
+
+            if(params.ut_end_nblockmax != nullptr) {
+              if(params.ut_start_nblockmin != nullptr) {
+                if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
+                  partially_masked = true;
+              } else {
+                if(m_block * kBlockM < ut_end_max)
+                  partially_masked = true;
+              }
+            }
+
+#if 0
             if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
                 continue;
             if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
@@ -931,6 +996,8 @@ struct CollectiveMainloopFwdSm90 {
                 partially_masked = true;
             else
                 partially_masked = false;
+#endif
+
             n_block_smem_[valid_n_block_num] = n_block;
             mask_state_smem_[valid_n_block_num] = partially_masked;
             valid_n_block_num++;
@@ -1127,7 +1194,7 @@ if(thread_idx == 0) {
             pipeline_k.producer_tail(smem_pipe_write);
             pipeline_v.producer_tail(smem_pipe_write);
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
-            if constexpr (Is_flashmask) pipeline_flashmask.producer_tail(flashmask_pipe_write);
+            // if constexpr (Is_flashmask) pipeline_flashmask.producer_tail(flashmask_pipe_write);
         }
     }
 
