@@ -77,11 +77,15 @@ public:
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
+    static_assert(NumMmaWarpGroups == 2 && Use_TMA_KV);
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
+//    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
+//    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 40 : 40) : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 232 : 232) : 160);
+
     // static constexpr uint32_t LoadRegisterRequirement = (NumMmaWarpGroups == 1 ? 72 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32));
     // static constexpr uint32_t MmaRegisterRequirement = (NumMmaWarpGroups == 1 ? 272 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160));
 
@@ -466,7 +470,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0) {  // Producer
-//            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
 
 
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
@@ -522,7 +526,7 @@ public:
             }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
-//            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;

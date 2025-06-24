@@ -244,7 +244,6 @@ namespace flashmask {
 
   template <int kBlockN>
   void prepare_block_maxmin(Flash_fwd_params &params, cudaStream_t stream) {
-    printf("\nprepare_block_maxmin kBlockN:%d\n", kBlockN);
     if (params.lt_start_ptr == nullptr &&
         params.ut_end_ptr == nullptr) {
       return;
