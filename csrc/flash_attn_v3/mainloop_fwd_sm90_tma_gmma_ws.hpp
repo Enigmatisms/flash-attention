@@ -864,7 +864,7 @@ struct CollectiveMainloopFwdSm90 {
 
         pipeline_flashmask.producer_acquire(flashmask_pipe_write);
 
-        if(thread_idx == 0) {
+        if(threadIdx.x / 32 == 0) {
           int32_t lt_start_max = INT_MAX;
           int32_t lt_start_min = INT_MAX;
 
@@ -889,7 +889,14 @@ struct CollectiveMainloopFwdSm90 {
           int32_t* s_ut_end_max = flashmask_maxmin_smem_ + 6 * Flashmask_n_block_buffer_length;
           int32_t* s_ut_end_min = flashmask_maxmin_smem_ + 7 * Flashmask_n_block_buffer_length;
 
-          for(n_block--; n_block >= n_block_min; n_block--) {
+//          for(n_block--; n_block >= n_block_min; n_block--)
+          for(n_block = n_block_max - 1 - thread_idx % 32; n_block >= (n_block_min - (32 - (n_block_max - n_block_min) % 32)); n_block -= 32) {
+            int prefix_sum = 0;
+            bool fully_masked = true;
+            bool partially_masked;
+            if(n_block >= n_block_min) {
+              prefix_sum = 1;
+              fully_masked = false;
             if(params.lt_start_nblockmax != nullptr)
               lt_start_max = s_lt_start_max[n_block];
             if(params.lt_start_nblockmin != nullptr)
@@ -910,24 +917,50 @@ struct CollectiveMainloopFwdSm90 {
             if(params.ut_end_nblockmin != nullptr)
               ut_end_min = s_ut_end_min[n_block];
 
-            bool partially_masked = false;
+//            bool partially_masked = false;
 
-            if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min)
-                continue;
-            if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min)
-                continue;
+            if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min) {
+                prefix_sum = 0;
+                fully_masked = true;
+            }
+            if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min) {
+                prefix_sum = 0;
+                fully_masked = true;
+            }
             if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
                 partially_masked = true;
             else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
                 partially_masked = true;
             else
                 partially_masked = false;
+            }
 
-            n_block_smem_[valid_n_block_num] = n_block;
-            mask_state_smem_[valid_n_block_num] = partially_masked;
-            valid_n_block_num++;
+            // warp-wide prefix-sum
+            #pragma unroll
+            for(int i=1; i<32; i*=2) {
+              int tmp_prefix_sum = __shfl_up_sync(0xffffffff, prefix_sum, i);
+              prefix_sum = threadIdx.x % 32 >= i ? prefix_sum + tmp_prefix_sum : prefix_sum;
+            }
+            if(!fully_masked) {
+              n_block_smem_[valid_n_block_num + prefix_sum - 1] = n_block;
+              mask_state_smem_[valid_n_block_num + prefix_sum -1] = partially_masked;
+            }
+            valid_n_block_num += __shfl_sync(0xffffffff, prefix_sum, 31, 32);
+//            n_block_smem_[valid_n_block_num] = n_block;
+//            mask_state_smem_[valid_n_block_num] = partially_masked;
+//            valid_n_block_num++;
           }
           n_block_smem_[valid_n_block_num] = -1;
+#if 0
+          if(m_block == 8 && thread_idx == 1) {
+            printf("\nvalid_n_block_num:%d\n", valid_n_block_num);
+            for(int i=0;i<=valid_n_block_num;i++) {
+              printf("\nm_block:%d, n_block_smem_[%d]:%d", m_block, i, n_block_smem_[i]);
+              if((i+1) % 5 == 0) printf("\n");
+            }
+            printf("\n");
+          }
+#endif
         }
 
         pipeline_flashmask.producer_commit(flashmask_pipe_write);
