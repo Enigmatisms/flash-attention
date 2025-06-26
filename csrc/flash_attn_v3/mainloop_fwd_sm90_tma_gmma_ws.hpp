@@ -32,7 +32,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Is_flashmask>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Is_flashmask_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -62,6 +62,7 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
+    static constexpr bool Is_flashmask = Is_flashmask_;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -645,7 +646,7 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    CUTLASS_DEVICE void
+    CUTLASS_DEVICE bool
     generate_n_block(Params const& params,
                      MainloopPipelineFlashMask pipeline_flashmask,
                      cutlass::PipelineState<kFlashMaskStages>& flashmask_pipe_write,
@@ -665,7 +666,13 @@ struct CollectiveMainloopFwdSm90 {
       // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
       if constexpr (Is_causal || Is_local || Varlen || Split) {
           if (n_block_max <= n_block_min) {
-              return;
+#if 0
+              if(threadIdx.x == 0) {
+                printf("\ngenerate m_block:%d, n_block_max:%d, n_block_min:%d, blockIdx.x:%d\n",
+                                   m_block,    n_block_max,    n_block_min,    blockIdx.x);
+              }
+#endif
+              return false;
           }
       }
 
@@ -674,7 +681,17 @@ struct CollectiveMainloopFwdSm90 {
 
       int32_t* const n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
       bool* const mask_state_smem_ = mask_state_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
+#if 0
+      if(threadIdx.x == 0) {
+        printf("\nm_block:%d, b4 acquire\n", m_block);
+      }
+#endif
       pipeline_flashmask.producer_acquire(flashmask_pipe_write);
+#if 0
+      if(threadIdx.x == 0) {
+        printf("\nm_block:%d, aft acquire\n", m_block);
+      }
+#endif
       __shared__ int s_prefix_sum[4];
       int32_t lt_start_max = INT_MAX;
       int32_t lt_start_min = INT_MAX;
@@ -756,8 +773,18 @@ struct CollectiveMainloopFwdSm90 {
           s_prefix_sum[threadIdx.x / 32] = prefix_sum;
         }
 
+#if 0
+        if(threadIdx.x == 0) {
+          printf("\nm_block:%d, b4 barrier\n", m_block);
+        }
+#endif
         cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
 
+#if 0
+        if(threadIdx.x == 0) {
+          printf("\nm_block:%d, aft barrier\n", m_block);
+        }
+#endif
         if(threadIdx.x / 32 == 1) {
           prefix_sum += s_prefix_sum[0];
         } else if(threadIdx.x / 32 == 2) {
@@ -777,9 +804,26 @@ struct CollectiveMainloopFwdSm90 {
         if(threadIdx.x / 32 == 3 && threadIdx.x % 32 == 31) {
           s_prefix_sum[3] = prefix_sum;
         }
+#if 0
+        if(threadIdx.x == 0) {
+          printf("\nm_block:%d, b4 barrier\n", m_block);
+        }
+#endif
+
         cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+#if 0
+        if(threadIdx.x == 0) {
+          printf("\nm_block:%d, aft barrier\n", m_block);
+        }
+#endif
         valid_n_block_num += s_prefix_sum[3];
       }
+
+#if 0
+      if(threadIdx.x == 0) {
+        printf("\nm_block:%d, aft loop\n", m_block);
+      }
+#endif
       n_block_smem_[valid_n_block_num] = -1;
 #if 0
       if(blockIdx.x == 32 && threadIdx.x == 0) {
@@ -791,6 +835,12 @@ struct CollectiveMainloopFwdSm90 {
       }
 #endif
       pipeline_flashmask.producer_commit(flashmask_pipe_write);
+#if 0
+      if(threadIdx.x == 0) {
+        printf("\nm_block:%d, aft commit\n", m_block);
+      }
+#endif
+      return true;
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -837,10 +887,22 @@ struct CollectiveMainloopFwdSm90 {
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
+#if 0
+                if(threadIdx.x == 0) {
+                  printf("\nload m_block:%d, n_block_max:%d, n_block_min:%d, blockIdx.x:%d\n",
+                                 m_block,    n_block_max,    n_block_min,    blockIdx.x);
+                }
+#endif
                 scheduler_prefetch();
                 return;
             }
         }
+
+#if 0
+        if(threadIdx.x == 0) {
+          printf("\nm_block:%d, b4 load\n", m_block);
+        }
+#endif
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -1285,6 +1347,11 @@ struct CollectiveMainloopFwdSm90 {
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
+#if 0
+        if(threadIdx.x == 0) {
+          printf("\nm_block:%d, aft load\n", m_block);
+        }
+#endif
     }
 
     template <typename SharedStorage>
@@ -1435,8 +1502,22 @@ struct CollectiveMainloopFwdSm90 {
             params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
-            if (n_block_max <= n_block_min) { return false; }
+            if (n_block_max <= n_block_min) {/*{ return false; }*/
+#if 0
+                if(thread_idx == 0) {
+                  printf("\nmma m_block:%d, n_block_max:%d, n_block_min:%d, blockIdx.x:%d\n",
+                                m_block,    n_block_max,    n_block_min,    blockIdx.x);
+                }
+#endif
+                return false;
+            }
         }
+
+#if 0
+        if(thread_idx == 0) {
+          printf("\nm_block:%d, b4 mma\n", m_block);
+        }
+#endif
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -1844,6 +1925,11 @@ struct CollectiveMainloopFwdSm90 {
         pipeline_flashmask.consumer_release(flashmask_pipe_read);
         ++flashmask_pipe_read;
         ++work_idx;
+#if 0
+        if(thread_idx == 0) {
+          printf("\nm_block:%d, aft mma\n", m_block);
+        }
+#endif
         return true;
     }
 
