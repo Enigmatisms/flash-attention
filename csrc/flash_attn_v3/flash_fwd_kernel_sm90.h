@@ -83,8 +83,8 @@ public:
     // If we use cp.async to load K and V, we need more registers for the producer WG.
 //    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
 //    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 40 : 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 232 : 232) : 160);
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 56 : 40) : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 224 : 232) : 160);
 
     // static constexpr uint32_t LoadRegisterRequirement = (NumMmaWarpGroups == 1 ? 72 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32));
     // static constexpr uint32_t MmaRegisterRequirement = (NumMmaWarpGroups == 1 ? 272 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160));
@@ -443,7 +443,8 @@ public:
             ? MainloopPipelineFlashMask::ThreadCategory::Producer
             : MainloopPipelineFlashMask::ThreadCategory::Consumer;
         pipeline_params_flashmask.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
-        pipeline_params_flashmask.producer_arv_count = NumProducerThreads;
+//        pipeline_params_flashmask.producer_arv_count = NumProducerThreads;
+        pipeline_params_flashmask.producer_arv_count = 128;
 
         MainloopPipelineFlashMask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
 
@@ -484,9 +485,12 @@ public:
             int work_idx = 0;
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
+            static_assert(SingleProducerWarp);
+#if 0
             if constexpr (SingleProducerWarp) {
                 if (warp_idx_in_warpgroup != 0) { return; }
             }
+#endif
             if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
 
             cutlass::arch::wait_on_dependent_grids();
@@ -518,13 +522,24 @@ public:
                 auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
+                mainloop.generate_n_block(params.mainloop, pipeline_flashmask, flashmask_pipe_write, seqlen_info, block_coord, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
                 // pipeline_vt won't be used if we don't need to transpose V.
+                if constexpr (SingleProducerWarp) {
+                  if (warp_idx_in_warpgroup == 0) {
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_write,
                                          flashmask_pipe_write,
                                          shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
                                          flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
+                  }
+                }
+                ++flashmask_pipe_write;
             }
+
+            if constexpr (SingleProducerWarp) {
+              if (warp_idx_in_warpgroup == 0) {
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
+              }
+            }
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
