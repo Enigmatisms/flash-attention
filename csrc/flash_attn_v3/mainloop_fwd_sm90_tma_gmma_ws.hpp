@@ -1165,7 +1165,7 @@ struct CollectiveMainloopFwdSm90 {
                   }
                   asm volatile("cp.async.commit_group;\n" ::);
                   asm volatile("cp.async.wait_group 0;\n" ::);
-                  cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+                  // cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
                 }
                 pipeline_flashmask_apply.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
             }
@@ -1366,6 +1366,34 @@ struct CollectiveMainloopFwdSm90 {
       int32_t* s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
       int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
 
+      int const row_idx = get<Row>(tScS_rowcol(_0{}, _0{})) + m_block * kBlockM;
+      int const col_idx = get<Col>(tScS_rowcol(_0{}, _0{})); // col_idx within a block
+
+#if 0
+      if(row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx])
+          tSrS_rowcol(0, 0) = -INFINITY;
+#endif
+      if(row_idx >= s_lt_start[col_idx])
+          tSrS_rowcol(0, 0) = -INFINITY;
+      if(row_idx < s_ut_end[col_idx])
+          tSrS_rowcol(0, 0) = -INFINITY;
+
+#if 0
+      #pragma unroll
+      for (int m = 0; m < 1; ++m) {
+        int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+        #pragma unroll
+        for (int n = 0; n < 1; ++n) {
+          int const col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
+          if(row_idx >= s_lt_start[col_idx] && row_idx < s_lt_end[col_idx])
+              tSrS_rowcol(m, n) = -INFINITY;
+          if(row_idx >= s_ut_start[col_idx] && row_idx < s_ut_end[col_idx])
+              tSrS_rowcol(m, n) = -INFINITY;
+        }
+      }
+#endif
+
+#if 0
       #pragma unroll
       for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
         int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
@@ -1378,6 +1406,7 @@ struct CollectiveMainloopFwdSm90 {
               tSrS_rowcol(m, n) = -INFINITY;
         }
       }
+#endif
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -1608,8 +1637,19 @@ struct CollectiveMainloopFwdSm90 {
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_qv, tSrQv, tSrV(_, _, _, smem_pipe_read.index()), tSrS);
             }
             scoremod_premask_fn(tSrS);
-            mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            if constexpr (Is_flashmask) {
+              consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
+              mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local, Is_flashmask>(tSrS, m_block, n_block,
+                                                                                            mask_state_smem_[n_block], smem_pipe_read.index(),
+                                                                                            flashmask_smem_,
+                                                                                            params.lt_start_ptr, params.lt_end_ptr,
+                                                                                            params.ut_start_ptr, params.ut_end_ptr);
+              pipeline_flashmask_apply.consumer_release(smem_pipe_read);
+            } else {
+              mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+            }
 
+#if 0
             if constexpr(Is_flashmask) {
               consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
               if (mask_state_smem_[n_block]) {
@@ -1617,6 +1657,7 @@ struct CollectiveMainloopFwdSm90 {
               }
               pipeline_flashmask_apply.consumer_release(smem_pipe_read);
             }
+#endif
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // Don't need to store scales to send to WG1 (in the case of LargeHeadDimV) since it's 1.f
@@ -1663,6 +1704,7 @@ struct CollectiveMainloopFwdSm90 {
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
 
+#if 0
                 if constexpr (Is_flashmask) {
                   consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
                   if (mask_state_smem_[n_block]) {
@@ -1670,6 +1712,7 @@ struct CollectiveMainloopFwdSm90 {
                   }
                   pipeline_flashmask_apply.consumer_release(smem_pipe_read);
                 }
+#endif
 
                 cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS), scores_scale);
                 if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
@@ -1687,7 +1730,19 @@ struct CollectiveMainloopFwdSm90 {
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                auto mask_fn = [&](auto& tSrS, int n_block) {
+                    if constexpr (Is_flashmask) {
+                      consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
+                      mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local, Is_flashmask>(tSrS, m_block, n_block,
+                                                                                                     mask_state_smem_[n_block], smem_pipe_read.index(),
+                                                                                                     flashmask_smem_,
+                                                                                                     params.lt_start_ptr, params.lt_end_ptr,
+                                                                                                     params.ut_start_ptr, params.ut_end_ptr);
+                      pipeline_flashmask_apply.consumer_release(smem_pipe_read);
+                    } else {
+                      mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
+                    }
+                };
                 int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
                 int const n_block_min_causal_local_mask =
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
@@ -1702,7 +1757,17 @@ struct CollectiveMainloopFwdSm90 {
                 ? n_block_min
                 : std::max(n_block_min,
                            cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
-            auto no_mask_fn = [](auto& tSrS, int n_block) { };
+            auto no_mask_fn = [&](auto& tSrS, int n_block) {
+                if constexpr (Is_flashmask) {
+                  consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
+                  mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, false /*Local_mask*/, Is_flashmask>(tSrS, m_block, n_block,
+                                                                                                             mask_state_smem_[n_block], smem_pipe_read.index(),
+                                                                                                             flashmask_smem_,
+                                                                                                             params.lt_start_ptr, params.lt_end_ptr,
+                                                                                                             params.ut_start_ptr, params.ut_end_ptr);
+                  pipeline_flashmask_apply.consumer_release(smem_pipe_read);
+                }
+            };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; n_block = n_block_smem_[valid_n_block_idx++]) {
                 fwd_step(n_block, no_mask_fn, cute::false_type{} /*check_inf*/);
@@ -1710,7 +1775,23 @@ struct CollectiveMainloopFwdSm90 {
 
             // Separate masking iterations on the left for local attention
             if constexpr (Is_local) {
+#if 0
                 auto local_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+#endif
+                auto local_mask_fn = [&](auto& tSrS, int n_block) {
+                    if constexpr (Is_flashmask) {
+                      consumer_wait(pipeline_flashmask_apply, smem_pipe_read);
+                      mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local, Is_flashmask>(tSrS, m_block, n_block,
+                                                                                                                 mask_state_smem_[n_block], smem_pipe_read.index(),
+                                                                                                                 flashmask_smem_,
+                                                                                                                 params.lt_start_ptr, params.lt_end_ptr,
+                                                                                                                 params.ut_start_ptr, params.ut_end_ptr);
+                      pipeline_flashmask_apply.consumer_release(smem_pipe_read);
+                    } else {
+                      mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
+                    }
+                };
+
                 #pragma unroll 1
                 for (; n_block >= n_block_min; n_block = n_block_smem_[valid_n_block_idx++]) {
                     fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);

@@ -38,12 +38,17 @@ struct Mask {
     {
     };
 
-    template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false,
+    template <bool Seqlenk_mask=false, bool Causal_mask=false, bool Local_mask=false, bool Is_flashmask=false,
         typename Engine, typename Layout>
     CUTLASS_DEVICE
-    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
+    void apply(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block,
+               bool const partially_masked = false, int32_t const index = 0,
+               int32_t* const flashmask_smem_ = nullptr,
+               int32_t* const lt_start_ptr = nullptr, int32_t* const lt_end_ptr = nullptr,
+               int32_t* const ut_start_ptr = nullptr, int32_t* const ut_end_ptr = nullptr) const {
         static_assert(!(Causal_mask && Local_mask), "Cannot be both causal and local");
         static_assert(Layout::rank == 3, "Only support 3D Tensor");
+        static_assert(!(SwapAB && Is_flashmask), "flashmask does not support SwapAB");
         if (!Seqlenk_mask && !Causal_mask && !Local_mask) { return; }
 
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
@@ -65,9 +70,49 @@ struct Mask {
             if constexpr (Seqlenk_mask) {  // Just masking based on col
                 #pragma unroll
                 for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                    if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit) {
+                    if (Is_flashmask || int(get<Col>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit) {
                         #pragma unroll
-                        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) { tSrS_rowcol(m, n) = -INFINITY; }
+                        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                          if constexpr (Is_flashmask) {
+                            if(int(get<Col>(t0ScS_rowcol(_0{}, n))) >= seqlenk_col_limit)
+                                tSrS_rowcol(m, n) = -INFINITY;
+                            else if(partially_masked) {
+                                int32_t* s_lt_start = flashmask_smem_ + 4 * kBlockN * index;
+                                int32_t* s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
+                                int32_t* s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
+                                int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
+                                
+                                int row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+                                int col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
+                                if(row_idx >= s_lt_start[col_idx] && (lt_end_ptr == nullptr || row_idx < s_lt_end[col_idx]))
+                                    tSrS_rowcol(m, n) = -INFINITY;
+                                if((ut_start_ptr == nullptr || row_idx >= s_ut_start[col_idx]) && row_idx < s_ut_end[col_idx])
+                                    tSrS_rowcol(m, n) = -INFINITY;
+                            }
+                          } else {
+                            tSrS_rowcol(m, n) = -INFINITY;
+                          }
+                        }
+                    }
+                }
+            } else if constexpr (Is_flashmask) {
+                if (partially_masked) {
+                    #pragma unroll
+                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                        #pragma unroll
+                        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                            int32_t* s_lt_start = flashmask_smem_ + 4 * kBlockN * index;
+                            int32_t* s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
+                            int32_t* s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
+                            int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
+                            
+                            int row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+                            int col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
+                            if(row_idx >= s_lt_start[col_idx] && (lt_end_ptr == nullptr || row_idx < s_lt_end[col_idx]))
+                                tSrS_rowcol(m, n) = -INFINITY;
+                            if((ut_start_ptr == nullptr || row_idx >= s_ut_start[col_idx]) && row_idx < s_ut_end[col_idx])
+                                tSrS_rowcol(m, n) = -INFINITY;
+                        }
                     }
                 }
             }
@@ -95,6 +140,21 @@ struct Mask {
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                             if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= col_limit_right) { tSrS_rowcol(m, n) = -INFINITY; }
+                            else if constexpr (Is_flashmask) {
+                                if (partially_masked) {
+                                    int32_t* s_lt_start = flashmask_smem_ + 4 * kBlockN * index;
+                                    int32_t* s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
+                                    int32_t* s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
+                                    int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
+                                    
+                                    int row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+                                    int col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
+                                    if(row_idx >= s_lt_start[col_idx] && (lt_end_ptr == nullptr || row_idx < s_lt_end[col_idx]))
+                                        tSrS_rowcol(m, n) = -INFINITY;
+                                    if((ut_start_ptr == nullptr || row_idx >= s_ut_start[col_idx]) && row_idx < s_ut_end[col_idx])
+                                        tSrS_rowcol(m, n) = -INFINITY;
+                                }
+                            }
                         }
                     }
                 } else {
@@ -114,6 +174,21 @@ struct Mask {
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                             int const col_idx = int(get<Col>(t0ScS_rowcol(m, n)));
                             if (col_idx >= col_limit_right || (col_idx < col_limit_left && col_idx >= col_limit_sink)) { tSrS_rowcol(m, n) = -INFINITY; }
+                            else if constexpr (Is_flashmask) {
+                                if (partially_masked) {
+                                    int32_t* s_lt_start = flashmask_smem_ + 4 * kBlockN * index;
+                                    int32_t* s_lt_end = flashmask_smem_ + 4 * kBlockN * index + kBlockN;
+                                    int32_t* s_ut_start = flashmask_smem_ + 4 * kBlockN * index + 2 * kBlockN;
+                                    int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
+                                    
+                                    int row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+                                    int col_idx = get<Col>(tScS_rowcol(m, n)); // col_idx within a block
+                                    if(row_idx >= s_lt_start[col_idx] && (lt_end_ptr == nullptr || row_idx < s_lt_end[col_idx]))
+                                        tSrS_rowcol(m, n) = -INFINITY;
+                                    if((ut_start_ptr == nullptr || row_idx >= s_ut_start[col_idx]) && row_idx < s_ut_end[col_idx])
+                                        tSrS_rowcol(m, n) = -INFINITY;
+                                }
+                            }
                         }
                     }
                 }
