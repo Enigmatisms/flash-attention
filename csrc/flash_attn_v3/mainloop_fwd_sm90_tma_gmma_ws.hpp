@@ -32,7 +32,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Is_flashmask>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Is_flashmask_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -55,6 +55,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
+    static constexpr bool Is_flashmask = Is_flashmask_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
@@ -645,6 +646,7 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
+    template<bool Is_causal>
     CUTLASS_DEVICE
     void
     load_max_min(Params const& params,
@@ -654,7 +656,9 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
-        for(int64_t idx = threadIdx.x; idx < ((get<0>(params.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += blockDim.x) {
+        constexpr int threads_num = Is_causal ? 32 : 128;
+        static_assert(threads_num == 32 || threads_num == 128, "load_max_min only support running with a warp or a warpgroup");
+        for(int64_t idx = threadIdx.x; idx < ((get<0>(params.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += threads_num) {
           // lt
           if(params.lt_start_nblockmax != nullptr)
             asm volatile(
@@ -715,7 +719,7 @@ struct CollectiveMainloopFwdSm90 {
 
         }
 
-        for(int64_t idx = threadIdx.x + ((get<0>(params.shape_K) + kBlockN - 1) / kBlockN) / 4 * 4; idx < (get<0>(params.shape_K) + kBlockN - 1) / kBlockN; idx += blockDim.x) {
+        for(int64_t idx = threadIdx.x + ((get<0>(params.shape_K) + kBlockN - 1) / kBlockN) / 4 * 4; idx < (get<0>(params.shape_K) + kBlockN - 1) / kBlockN; idx += threads_num) {
           // lt
           if(params.lt_start_nblockmax != nullptr)
             asm volatile(
@@ -778,9 +782,14 @@ struct CollectiveMainloopFwdSm90 {
         asm volatile("cp.async.wait_group 0;\n" ::);
 
 //        __syncthreads();
-        cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+        if constexpr (threads_num == 128) {
+          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+        } else if constexpr (threads_num == 32) {
+          __syncwarp();
+        }
     }
 
+    template<bool Is_causal>
     CUTLASS_DEVICE void
     generate_n_block(Params const& params,
                      MainloopPipelineFlashMask pipeline_flashmask,
@@ -807,6 +816,9 @@ struct CollectiveMainloopFwdSm90 {
 
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
+
+      constexpr int threads_num = Is_causal ? 32 : 128;
+      static_assert(threads_num == 32 || threads_num == 128, "generate_n_block only support running with a warp or a warpgroup");
 
       int32_t* const n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
       bool* const mask_state_smem_ = mask_state_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
@@ -838,7 +850,7 @@ struct CollectiveMainloopFwdSm90 {
 
       int32_t valid_n_block_num = 0;
 
-      for(int n_block = n_block_max - 1 - threadIdx.x % 128; n_block >= (n_block_min - (128 - (n_block_max - n_block_min) % 128)); n_block -= 128) {
+      for(int n_block = n_block_max - 1 - threadIdx.x % threads_num; n_block >= (n_block_min - (threads_num - (n_block_max - n_block_min) % threads_num)); n_block -= threads_num) {
         int prefix_sum = 0;
         bool fully_masked = true;
         bool partially_masked;
@@ -888,44 +900,40 @@ struct CollectiveMainloopFwdSm90 {
           prefix_sum = threadIdx.x % 32 >= i ? prefix_sum + tmp_prefix_sum : prefix_sum;
         }
 
-        if(threadIdx.x%32 == 31) {
-          s_prefix_sum[threadIdx.x / 32] = prefix_sum;
-        }
-
-        cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-
-        if(threadIdx.x / 32 == 1) {
-          prefix_sum += s_prefix_sum[0];
-        } else if(threadIdx.x / 32 == 2) {
-          prefix_sum += s_prefix_sum[0];
-          prefix_sum += s_prefix_sum[1];
-        } else if(threadIdx.x / 32 == 3) {
-          prefix_sum += s_prefix_sum[0];
-          prefix_sum += s_prefix_sum[1];
-          prefix_sum += s_prefix_sum[2];
+        if constexpr (threads_num == 128) {
+          if(threadIdx.x%32 == 31) {
+            s_prefix_sum[threadIdx.x / 32] = prefix_sum;
+          }
+          
+          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+          
+          if(threadIdx.x / 32 == 1) {
+            prefix_sum += s_prefix_sum[0];
+          } else if(threadIdx.x / 32 == 2) {
+            prefix_sum += s_prefix_sum[0];
+            prefix_sum += s_prefix_sum[1];
+          } else if(threadIdx.x / 32 == 3) {
+            prefix_sum += s_prefix_sum[0];
+            prefix_sum += s_prefix_sum[1];
+            prefix_sum += s_prefix_sum[2];
+          }
         }
 
         if(!fully_masked) {
           n_block_smem_[valid_n_block_num + prefix_sum - 1] = n_block;
-//          mask_state_smem_[valid_n_block_num + prefix_sum -1] = partially_masked;
           mask_state_smem_[n_block] = partially_masked;
         }
-        if(threadIdx.x / 32 == 3 && threadIdx.x % 32 == 31) {
-          s_prefix_sum[3] = prefix_sum;
+        if constexpr (threads_num == 128) {
+          if(threadIdx.x / 32 == 3 && threadIdx.x % 32 == 31) {
+            s_prefix_sum[3] = prefix_sum;
+          }
+          cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+          valid_n_block_num += s_prefix_sum[3];
+        } else if constexpr (threads_num == 32){
+          valid_n_block_num += __shfl_sync(0xffffffff, prefix_sum, 31, 32);
         }
-        cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-        valid_n_block_num += s_prefix_sum[3];
       }
       n_block_smem_[valid_n_block_num] = -1;
-#if 0
-      if(blockIdx.x == 32 && threadIdx.x == 0) {
-        printf("\nm_block:%d, valid_n_block_num:%d\n", m_block, valid_n_block_num);
-        for(int i=0;i<=valid_n_block_num;i++) {
-          printf("n_block_smem_[%d]:%d, mask_state_smem_[%d]:%d    ", i, n_block_smem_[i], i, mask_state_smem_[i]);
-          if((i+1)%5 == 0) printf("\n");
-        }
-      }
-#endif
       pipeline_flashmask.producer_commit(flashmask_pipe_write);
     }
 
