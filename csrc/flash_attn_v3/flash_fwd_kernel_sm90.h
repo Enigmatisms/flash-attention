@@ -320,7 +320,8 @@ public:
             : MainloopPipelineFlashMask::ThreadCategory::Consumer;
         pipeline_params_flashmask.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
 //        pipeline_params_flashmask.producer_arv_count = NumProducerThreads;
-        pipeline_params_flashmask.producer_arv_count = Is_flashmask && !Is_causal ? cutlass::NumThreadsPerWarpGroup : NumProducerThreads;
+//        pipeline_params_flashmask.producer_arv_count = Is_flashmask && !Is_causal ? cutlass::NumThreadsPerWarpGroup : NumProducerThreads;
+        pipeline_params_flashmask.producer_arv_count = Is_flashmask ? cutlass::NumThreadsPerWarpGroup : NumProducerThreads;
 
         MainloopPipelineFlashMask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
 
@@ -363,18 +364,18 @@ public:
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
             static_assert(SingleProducerWarp || !Is_flashmask);
 
-            if constexpr (SingleProducerWarp && !( Is_flashmask && !Is_causal)) {
+            if constexpr (SingleProducerWarp && !Is_flashmask) {
               if (warp_idx_in_warpgroup != 0) { return; }
             }
 
-            if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
+            if ((!SingleProducerWarp || Is_flashmask) && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
 
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
-            for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+            for (auto work_tile_info = SingleProducerWarp && !Is_flashmask || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
                  work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+                 work_tile_info = SingleProducerWarp && !Is_flashmask || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
@@ -399,13 +400,14 @@ public:
                     scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                 };
 
+                bool valid_tile;
                 if constexpr (Is_flashmask) {
-                  mainloop.load_max_min<Is_causal>(params.mainloop, seqlen_info, block_coord, flashmask_maxmin_smem_producer_);
-                  mainloop.generate_n_block<Is_causal>(params.mainloop, pipeline_flashmask, flashmask_pipe_write, seqlen_info, block_coord, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
+                  mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, flashmask_maxmin_smem_producer_);
+                  valid_tile = mainloop.generate_n_block(params.mainloop, pipeline_flashmask, flashmask_pipe_write, seqlen_info, block_coord, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
                 }
 
                 // pipeline_vt won't be used if we don't need to transpose V.
-                if constexpr (Is_flashmask && !Is_causal) {
+                if constexpr (Is_flashmask) {
                   if (warp_idx_in_warpgroup == 0) {
                     mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_write,
                                              flashmask_pipe_write,
@@ -418,10 +420,17 @@ public:
                                              shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
                                              flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
                 }
-                ++flashmask_pipe_write;
+
+                if constexpr (Is_flashmask && Is_causal) {
+                  if (valid_tile) {
+                    ++flashmask_pipe_write;
+                  }
+                } else {
+                  ++flashmask_pipe_write;
+                }
             }
 
-            if constexpr (Is_flashmask && !Is_causal) {
+            if constexpr (Is_flashmask) {
               if (warp_idx_in_warpgroup == 0) {
                 mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
               }

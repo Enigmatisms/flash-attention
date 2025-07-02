@@ -646,7 +646,6 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    template<bool Is_causal>
     CUTLASS_DEVICE
     void
     load_max_min(Params const& params,
@@ -656,8 +655,8 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
-        constexpr int threads_num = Is_causal ? 32 : 128;
-        static_assert(threads_num == 32 || threads_num == 128, "load_max_min only support running with a warp or a warpgroup");
+        constexpr int threads_num = 128;
+        static_assert(threads_num == 128, "load_max_min only support running with a warp or a warpgroup");
         for(int64_t idx = threadIdx.x; idx < ((get<0>(params.shape_K) + kBlockN - 1) / kBlockN) / 4; idx += threads_num) {
           // lt
           if(params.lt_start_nblockmax != nullptr)
@@ -781,16 +780,10 @@ struct CollectiveMainloopFwdSm90 {
         asm volatile("cp.async.commit_group;\n" ::);
         asm volatile("cp.async.wait_group 0;\n" ::);
 
-//        __syncthreads();
-        if constexpr (threads_num == 128) {
-          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
-        } else if constexpr (threads_num == 32) {
-          __syncwarp();
-        }
+        cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
     }
 
-    template<bool Is_causal>
-    CUTLASS_DEVICE void
+    CUTLASS_DEVICE bool
     generate_n_block(Params const& params,
                      MainloopPipelineFlashMask pipeline_flashmask,
                      cutlass::PipelineState<kFlashMaskStages>& flashmask_pipe_write,
@@ -810,15 +803,15 @@ struct CollectiveMainloopFwdSm90 {
       // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
       if constexpr (Is_causal || Is_local || Varlen || Split) {
           if (n_block_max <= n_block_min) {
-              return;
+              return false;
           }
       }
 
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
-      constexpr int threads_num = Is_causal ? 32 : 128;
-      static_assert(threads_num == 32 || threads_num == 128, "generate_n_block only support running with a warp or a warpgroup");
+      constexpr int threads_num = 128;
+      static_assert(threads_num == 128, "generate_n_block only support running with a warp or a warpgroup");
 
       int32_t* const n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
       bool* const mask_state_smem_ = mask_state_smem + Flashmask_n_block_buffer_length * flashmask_pipe_write.index();
@@ -927,14 +920,13 @@ struct CollectiveMainloopFwdSm90 {
           if(threadIdx.x / 32 == 3 && threadIdx.x % 32 == 31) {
             s_prefix_sum[3] = prefix_sum;
           }
-          cutlass::arch::NamedBarrier::sync(128, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
+          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
           valid_n_block_num += s_prefix_sum[3];
-        } else if constexpr (threads_num == 32){
-          valid_n_block_num += __shfl_sync(0xffffffff, prefix_sum, 31, 32);
         }
       }
       n_block_smem_[valid_n_block_num] = -1;
       pipeline_flashmask.producer_commit(flashmask_pipe_write);
+      return true;
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>

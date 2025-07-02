@@ -211,7 +211,7 @@ public:
 };
 
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
-        bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
+        bool Split=false, bool PackGQA=false, bool WarpSpecialized=true, bool Is_flashmask=false>
 class DynamicPersistentTileScheduler {
 
     // This scheduler targets the causal (or local) case where each tile takes different
@@ -224,7 +224,7 @@ class DynamicPersistentTileScheduler {
     // size of K & V and the L2 cache size.
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
-    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
+    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + (Is_flashmask ? 128 : NumProducerThreads) : NumMmaThreads;
 
 public:
     using SharedStorage = int;
