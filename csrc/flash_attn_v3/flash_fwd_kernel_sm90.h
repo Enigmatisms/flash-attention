@@ -421,6 +421,8 @@ public:
                                              flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
                 }
 
+                ++flashmask_pipe_write;
+#if 0
                 if constexpr (Is_flashmask && Is_causal) {
                   if (valid_tile) {
                     ++flashmask_pipe_write;
@@ -428,6 +430,7 @@ public:
                 } else {
                   ++flashmask_pipe_write;
                 }
+#endif
             }
 
             if constexpr (Is_flashmask) {
