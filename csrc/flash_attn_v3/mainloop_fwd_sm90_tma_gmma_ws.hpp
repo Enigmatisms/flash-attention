@@ -1266,20 +1266,21 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_flashmask) {
                 pipeline_flashmask_apply.producer_acquire(smem_pipe_write);
                 if(mask_state_smem_[n_block]) {
+                     int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
 //                  printf("\nm_block:%d, n_block:%d, threadIdx.x:%d, blockIdx.x:%d, mask_state_smem_[%d]:%d\n", m_block, n_block, threadIdx.x, blockIdx.x, n_block, mask_state_smem_[n_block]);
-                  for(int64_t idx = thread_idx; idx < kBlockN; idx += NumProducerThreads) {
+                  for(int64_t idx = thread_idx; idx < kBlockN  && n_block * kBlockN + idx < seqlen_info.seqlen_k; idx += NumProducerThreads) {
                     if(params.lt_start_ptr != nullptr) {
                       asm volatile(
                         "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
                           ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + idx)),
-                            "l"(params.lt_start_ptr + idx),
+                            "l"(params.lt_start_ptr + row_offset + n_block * kBlockN + idx),
                             "n"(4));
                     }
                     if(params.lt_end_ptr != nullptr) {
                       asm volatile(
                         "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
                           ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + kBlockN + idx)),
-                            "l"(params.lt_end_ptr + idx),
+                            "l"(params.lt_end_ptr + row_offset + n_block * kBlockN + idx),
                             "n"(4));
                     }
 
@@ -1287,7 +1288,7 @@ struct CollectiveMainloopFwdSm90 {
                       asm volatile(
                         "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
                           ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + 2 * kBlockN + idx)),
-                            "l"(params.ut_start_ptr + idx),
+                            "l"(params.ut_start_ptr + row_offset + n_block * kBlockN + idx),
                             "n"(4));
                     }
 
@@ -1295,7 +1296,7 @@ struct CollectiveMainloopFwdSm90 {
                       asm volatile(
                         "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n"
                           ::"r"(cutlass::arch::cutlass_get_smem_pointer(flashmask_smem_ + smem_pipe_write.index() * 4 * kBlockN + + 3 * kBlockN + idx)),
-                            "l"(params.ut_end_ptr + idx),
+                            "l"(params.ut_end_ptr + row_offset + n_block * kBlockN + idx),
                             "n"(4));
                     }
                   }
