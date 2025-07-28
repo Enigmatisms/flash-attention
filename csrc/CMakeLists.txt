@@ -34,28 +34,30 @@ if(NOT SKIP_BUILD_FA)
       message(FATAL_ERROR "Generating FA2 Python script execution failed with exit code ${result}: ${error}")
   endif()
   
-  file(GLOB FA2_SOURCES_CU_SOURCES "flash_attn/src/*_sm80.cu")
+  # file(GLOB FA2_SOURCES_CU_SOURCES "flash_attn/src/*_sm80.cu")
+  # file(GLOB FA2_SOURCES_CU_SOURCES "flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu")
+  file(GLOB FA2_SOURCES_CU_SOURCES "")
   
   message(STATUS "Auto generated CUDA source files: ${FA2_SOURCES_CU_SOURCES}")
   
   set(FA2_REDUCE_ATTNSCORE_SOURCES_CU
-      flash_attn/src/cuda_utils.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_bf16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_bf16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_bf16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_bf16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_bf16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_bf16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_bf16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_fp16_sm80.cu
-      flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_bf16_sm80.cu
+      # flash_attn/src/cuda_utils.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim32_bf16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim64_bf16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim96_bf16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim128_bf16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim160_bf16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim192_bf16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim224_bf16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_fp16_sm80.cu
+      # flash_attn/src/calc_reduced_attn_scores_dispatch/hdim256_bf16_sm80.cu
   )
   
   # merge FA2 cu sources
@@ -69,12 +71,12 @@ if(NOT SKIP_BUILD_FA)
   set(FA1_SOURCES_CU
       flash_attn_with_bias_and_mask/flash_attn_with_bias_mask.cu
       flash_attn_with_bias_and_mask/src/cuda_utils.cu
-      flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
-      flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
-      flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
-      flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
-      flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
-      flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
+      # flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim32.cu
+      # flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim64.cu
+      # flash_attn_with_bias_and_mask/src/fmha_fwd_with_mask_bias_hdim128.cu
+      # flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim32.cu
+      # flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim64.cu
+      # flash_attn_with_bias_and_mask/src/fmha_bwd_with_mask_bias_hdim128.cu
       flash_attn_with_bias_and_mask/src/utils.cu)
   
   add_library(flashattn_with_bias_mask STATIC
@@ -158,18 +160,18 @@ if(NOT SKIP_BUILD_FA)
     # Assume options or variables are defined elsewhere in the CMake project
     # You can define them for testing purposes like this:
     option(DISABLE_FP16 "Disable FP16" OFF)
-    option(DISABLE_FP8 "Disable FP8" OFF)
-    option(DISABLE_HDIM64 "Disable HDIM64" OFF)
-    option(DISABLE_HDIM96 "Disable HDIM96" OFF)
+    option(DISABLE_FP8 "Disable FP8" ON)
+    option(DISABLE_HDIM64 "Disable HDIM64" ON)
+    option(DISABLE_HDIM96 "Disable HDIM96" ON)
     option(DISABLE_HDIM128 "Disable HDIM128" OFF)
-    option(DISABLE_HDIM192 "Disable HDIM192" OFF)
-    option(DISABLE_HDIM256 "Disable HDIM256" OFF)
-    option(DISABLE_SPLIT "Disable Split" OFF)
-    option(DISABLE_PAGEDKV "Disable PagedKV" OFF)
-    option(DISABLE_SOFTCAP "Disable Softcap" OFF)
-    option(DISABLE_PACKGQA "Disable PackGQA" OFF)
+    option(DISABLE_HDIM192 "Disable HDIM192" ON)
+    option(DISABLE_HDIM256 "Disable HDIM256" ON)
+    option(DISABLE_SPLIT "Disable Split" ON)
+    option(DISABLE_PAGEDKV "Disable PagedKV" ON)
+    option(DISABLE_SOFTCAP "Disable Softcap" ON)
+    option(DISABLE_PACKGQA "Disable PackGQA" ON)
     option(DISABLE_BACKWARD "Disable Backward" OFF)
-    option(DISABLE_SM8X "Disable SM8x" OFF)
+    option(DISABLE_SM8X "Disable SM8x" ON)
 
     if(DISABLE_FP16)
       add_compile_definitions(FLASHATTENTION_DISABLE_FP16)
@@ -350,21 +352,23 @@ if(NOT SKIP_BUILD_FA)
     endif()
     
     set(FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_api.cu")
-    if(NOT DISABLE_SM8X)
-        list(APPEND FA3_SOURCES_CU_SOURCES ${sources_fwd_sm80})
-    endif()
-    list(APPEND FA3_SOURCES_CU_SOURCES ${sources_fwd_sm90})
-    if(NOT DISABLE_SM8X)
-        list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm80})
-    endif()
-    list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm90})
-    
-    if(NOT DISABLE_SPLIT)
-        list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_fwd_combine.cu")
-    endif()
+    # if(NOT DISABLE_SM8X)
+    #     list(APPEND FA3_SOURCES_CU_SOURCES ${sources_fwd_sm80})
+    # endif()
+    # list(APPEND FA3_SOURCES_CU_SOURCES ${sources_fwd_sm90})
+    # if(NOT DISABLE_SM8X)
+    #     list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm80})
+    # endif()
+    # list(APPEND FA3_SOURCES_CU_SOURCES ${sources_bwd_sm90})
+    # 
+    # if(NOT DISABLE_SPLIT)
+    #     list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_fwd_combine.cu")
+    # endif()
     
     list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/flash_prepare_scheduler.cu")
 
+    # list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim128_bf16_sm90.cu" "flash_attn_v3/instantiations/flash_bwd_hdim128_bf16_sm90.cu")
+    list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim128_bf16_sm90.cu")
     message(STATUS "Auto generated CUDA source files: ${FA3_SOURCES_CU_SOURCES}")
     add_library(flashattnv3 SHARED
         ${FA3_SOURCES_CU_SOURCES}
@@ -374,10 +378,17 @@ if(NOT SKIP_BUILD_FA)
         flash_attn_v3
         flash_attn_v3/cutlass/include
       )
+
+    # set_target_properties(flashattnv3 PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    # set_target_properties(flashattnv3 PROPERTIES CUDA_ARCHITECTURES "90")
+    # target_compile_definitions(flashattnv3 PRIVATE CUTLASS_ENABLE_SYNCLOG)
   
     target_compile_options(flashattnv3 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
       -Xcompiler="-fPIC"
       -Xcompiler="-O3"
+      # -G
+      # -g
+      # -O0
       -std=c++17
       --ftemplate-backtrace-limit=0
       --use_fast_math
