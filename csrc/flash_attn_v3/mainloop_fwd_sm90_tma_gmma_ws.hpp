@@ -655,15 +655,9 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
 
-        // const int nblock_seqlen = (seqlen_info.seqlen_k + kBlockN - 1) / kBlockN;
         const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
 
-        // int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
         int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * nblock_seqlen;
-
-        if(bidb == 15 && bidh == 15 && threadIdx.x == 0 && blockIdx.x == 0) {
-            printf("\nload_max_min row_offset:%d, blockIdx.x:%d\n", row_offset, blockIdx.x);
-        }
 
         constexpr int threads_num = 128;
         static_assert(threads_num == 128, "load_max_min only support running with a warp or a warpgroup");
@@ -820,14 +814,6 @@ struct CollectiveMainloopFwdSm90 {
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
-
-      if(bidb == 15 && bidh == 15 && threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("\n========================\n");
-        printf("\nkBlockM:%d, kBlockN:%d, n_block_max:%d, n_block_min:%d, Is_causal:%d\n",
-                  kBlockM,    kBlockN,    n_block_max,    n_block_min,    Is_causal);
-        printf("\n========================\n");
-      }
-
       constexpr int threads_num = 128;
       static_assert(threads_num == 128, "generate_n_block only support running with a warp or a warpgroup");
 
@@ -860,34 +846,6 @@ struct CollectiveMainloopFwdSm90 {
       int32_t* s_ut_end_min = flashmask_maxmin_smem_ + 7 * Flashmask_n_block_buffer_length;
 
       int32_t valid_n_block_num = 0;
-      if(bidb == 15 && bidh == 15 && threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("\n========================\n");
-        for(int n_block = n_block_max - 1; n_block >= n_block_min; n_block--) {
-          if(params.lt_start_nblockmax != nullptr)
-            lt_start_max = s_lt_start_max[n_block];
-          if(params.lt_start_nblockmin != nullptr)
-            lt_start_min = s_lt_start_min[n_block];
-
-          if(params.lt_end_nblockmax != nullptr)
-            lt_end_max = s_lt_end_max[n_block];
-          if(params.lt_end_nblockmin != nullptr)
-            lt_end_min = s_lt_end_min[n_block];
-
-          if(params.ut_start_nblockmax != nullptr)
-            ut_start_max = s_ut_start_max[n_block];
-          if(params.ut_start_nblockmin != nullptr)
-            ut_start_min = s_ut_start_min[n_block];
-
-          if(params.ut_end_nblockmax != nullptr)          
-            ut_end_max = s_ut_end_max[n_block];
-          if(params.ut_end_nblockmin != nullptr)
-            ut_end_min = s_ut_end_min[n_block];
-
-          printf("\nm_block:%d, n_block:%d, lt_start_max:%d, lt_start_min:%d, ut_end_max:%d, ut_end_min:%d\n",
-                    m_block,    n_block,    lt_start_max,    lt_start_min,    ut_end_max,    ut_end_min);
-        }
-        printf("\n========================\n");
-      }
 
       for(int n_block = n_block_max - 1 - threadIdx.x % threads_num; n_block >= (n_block_min - (threads_num - (n_block_max - n_block_min) % threads_num)); n_block -= threads_num) {
         int prefix_sum = 0;
@@ -973,14 +931,6 @@ struct CollectiveMainloopFwdSm90 {
       n_block_smem_[valid_n_block_num] = -1;
       pipeline_flashmask.producer_commit(flashmask_pipe_write);
 
-      if(bidb == 15 && bidh == 15 && threadIdx.x == 0 && blockIdx.x == 0) {
-          printf("\n========================\n");
-          for(int i=0;i<valid_n_block_num;i++) {
-            printf("\nn_block_smem_[%d]: %d, mask_state_smem_[%d]: %d\n", i, n_block_smem_[i], n_block_smem_[i], mask_state_smem_[n_block_smem_[i]]);
-          }
-          printf("\n========================\n");
-      }
-
       return true;
     }
 
@@ -1009,15 +959,6 @@ struct CollectiveMainloopFwdSm90 {
 
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
-#if 0
-      if(blockIdx.x == 32 && threadIdx.x == 0) {
-        printf("\nm_block:%d\n", m_block);
-        for(int i=0;i<=10;i++) {
-          printf("n_block_smem_[%d]:%d, mask_state_smem_[%d]:%d    ", i, n_block_smem_[i], i, mask_state_smem_[i]);
-          if((i+1)%5 == 0) printf("\n");
-        }
-      }
-#endif
 
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
@@ -1209,113 +1150,6 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         int n_block = n_block_max;
-#if 0
-        int valid_n_block_num = 0;
-
-        pipeline_flashmask.producer_acquire(flashmask_pipe_write);
-
-        if(threadIdx.x / 32 == 0) {
-          int32_t lt_start_max = INT_MAX;
-          int32_t lt_start_min = INT_MAX;
-
-          int32_t lt_end_max = INT_MAX;
-          int32_t lt_end_min = INT_MAX;
-
-          int32_t ut_start_max = INT_MIN;
-          int32_t ut_start_min = INT_MIN;
-
-          int32_t ut_end_max = INT_MIN;
-          int32_t ut_end_min = INT_MIN;
-
-          int32_t* s_lt_start_max = flashmask_maxmin_smem_;
-          int32_t* s_lt_start_min = flashmask_maxmin_smem_ + Flashmask_n_block_buffer_length;
-
-          int32_t* s_lt_end_max = flashmask_maxmin_smem_ + 2 * Flashmask_n_block_buffer_length;
-          int32_t* s_lt_end_min = flashmask_maxmin_smem_ + 3 * Flashmask_n_block_buffer_length;
-
-          int32_t* s_ut_start_max = flashmask_maxmin_smem_ + 4 * Flashmask_n_block_buffer_length;
-          int32_t* s_ut_start_min = flashmask_maxmin_smem_ + 5 * Flashmask_n_block_buffer_length;
-
-          int32_t* s_ut_end_max = flashmask_maxmin_smem_ + 6 * Flashmask_n_block_buffer_length;
-          int32_t* s_ut_end_min = flashmask_maxmin_smem_ + 7 * Flashmask_n_block_buffer_length;
-
-//          for(n_block--; n_block >= n_block_min; n_block--)
-          for(n_block = n_block_max - 1 - thread_idx % 32; n_block >= (n_block_min - (32 - (n_block_max - n_block_min) % 32)); n_block -= 32) {
-            int prefix_sum = 0;
-            bool fully_masked = true;
-            bool partially_masked;
-            if(n_block >= n_block_min) {
-              prefix_sum = 1;
-              fully_masked = false;
-            if(params.lt_start_nblockmax != nullptr)
-              lt_start_max = s_lt_start_max[n_block];
-            if(params.lt_start_nblockmin != nullptr)
-              lt_start_min = s_lt_start_min[n_block];
-
-            if(params.lt_end_nblockmax != nullptr)
-              lt_end_max = s_lt_end_max[n_block];
-            if(params.lt_end_nblockmin != nullptr)
-              lt_end_min = s_lt_end_min[n_block];
-
-            if(params.ut_start_nblockmax != nullptr)
-              ut_start_max = s_ut_start_max[n_block];
-            if(params.ut_start_nblockmin != nullptr)
-              ut_start_min = s_ut_start_min[n_block];
-  
-            if(params.ut_end_nblockmax != nullptr)          
-              ut_end_max = s_ut_end_max[n_block];
-            if(params.ut_end_nblockmin != nullptr)
-              ut_end_min = s_ut_end_min[n_block];
-
-//            bool partially_masked = false;
-
-            if(m_block * kBlockM >= lt_start_max && (m_block + 1) * kBlockM <= lt_end_min) {
-                prefix_sum = 0;
-                fully_masked = true;
-            }
-            if(m_block * kBlockM >= ut_start_max && (m_block + 1) * kBlockM <= ut_end_min) {
-                prefix_sum = 0;
-                fully_masked = true;
-            }
-            if(m_block * kBlockM < lt_end_max && (m_block + 1) * kBlockM > lt_start_min)
-                partially_masked = true;
-            else if(m_block * kBlockM < ut_end_max && (m_block + 1) * kBlockM > ut_start_min)
-                partially_masked = true;
-            else
-                partially_masked = false;
-            }
-
-            // warp-wide prefix-sum
-            #pragma unroll
-            for(int i=1; i<32; i*=2) {
-              int tmp_prefix_sum = __shfl_up_sync(0xffffffff, prefix_sum, i);
-              prefix_sum = threadIdx.x % 32 >= i ? prefix_sum + tmp_prefix_sum : prefix_sum;
-            }
-            if(!fully_masked) {
-              n_block_smem_[valid_n_block_num + prefix_sum - 1] = n_block;
-              mask_state_smem_[valid_n_block_num + prefix_sum -1] = partially_masked;
-            }
-            valid_n_block_num += __shfl_sync(0xffffffff, prefix_sum, 31, 32);
-//            n_block_smem_[valid_n_block_num] = n_block;
-//            mask_state_smem_[valid_n_block_num] = partially_masked;
-//            valid_n_block_num++;
-          }
-          n_block_smem_[valid_n_block_num] = -1;
-#if 0
-          if(m_block == 8 && thread_idx == 1) {
-            printf("\nvalid_n_block_num:%d\n", valid_n_block_num);
-            for(int i=0;i<=valid_n_block_num;i++) {
-              printf("\nm_block:%d, n_block_smem_[%d]:%d", m_block, i, n_block_smem_[i]);
-              if((i+1) % 5 == 0) printf("\n");
-            }
-            printf("\n");
-          }
-#endif
-        }
-
-        pipeline_flashmask.producer_commit(flashmask_pipe_write);
-        ++flashmask_pipe_write;
-#endif
 
         auto load_flashmask = [&] (auto const& smem_pipe_write) {
             if constexpr (Is_flashmask) {
@@ -1323,11 +1157,6 @@ struct CollectiveMainloopFwdSm90 {
                 if(mask_state_smem_[n_block]) {
                      int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
 
-                     if(bidb == 15 && bidh == 15 && threadIdx.x == 0 && blockIdx.x == 0) {
-                         printf("\nload_flashmask row_offset:%d, blockIdx.x:%d\n", row_offset, blockIdx.x);
-                     }
-
-//                  printf("\nm_block:%d, n_block:%d, threadIdx.x:%d, blockIdx.x:%d, mask_state_smem_[%d]:%d\n", m_block, n_block, threadIdx.x, blockIdx.x, n_block, mask_state_smem_[n_block]);
                   for(int64_t idx = thread_idx; idx < kBlockN  && n_block * kBlockN + idx < seqlen_info.seqlen_k; idx += NumProducerThreads) {
                     if(params.lt_start_ptr != nullptr) {
                       asm volatile(
@@ -1571,19 +1400,6 @@ struct CollectiveMainloopFwdSm90 {
       int32_t* s_ut_end = flashmask_smem_ + 4 * kBlockN * index + 3 * kBlockN;
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
-#if 0
-      if(bidb == 15 && bidh == 15 && threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("\n========================\n");
-        printf("lt_end_ptr == nullptr:%d, ut_start_ptr == nullptr:%d, ut_end_ptr != nullptr:%d\n",
-                lt_end_ptr == nullptr,    ut_start_ptr == nullptr,    ut_end_ptr != nullptr);
-        for(int col = 0; col < kBlockN; col++) {
-          printf("\ns_lt_start[%d]:%d, s_lt_end[%d]:%d, s_ut_start[%d]:%d, s_ut_end[%d]:%d\n",
-                    col, s_lt_start[col], col, s_lt_end[col], col, s_ut_start[col], col, s_ut_end[col]);
-        }
-        printf("\n========================\n");
-      }
-#endif
-
       #pragma unroll
       for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
         int const row_idx = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
@@ -1629,22 +1445,6 @@ struct CollectiveMainloopFwdSm90 {
 
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
         int const m_block = get<0>(block_coord);
-
-#if 0
-      if(blockIdx.x == 32 && thread_idx == 0) {
-        printf("\nm_block:%d\n", m_block);
-        for(int i=0;i<=10;i++) {
-          printf("n_block_smem_[%d]:%d,    ", i, n_block_smem_[i]);
-          if((i+1)%5 == 0) printf("\n");
-        }
-        printf("\n");
-        for(int i=0;i<=10;i++) {
-          printf("mask_state_smem_[%d]:%d,    ", i, mask_state_smem_[i]);
-          if((i+1)%5 == 0) printf("\n");
-        }
-        printf("\n");
-      }
-#endif
 
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
@@ -1994,14 +1794,6 @@ struct CollectiveMainloopFwdSm90 {
                 }
                 scoremod_premask_fn(tSrS);
                 mask_fn(tSrS, n_block);
-
-                if constexpr (Is_flashmask) {
-#if 0
-                  consumer_wait(pipeline_flashmask, smem_pipe_read);
-                  flash_mask.template apply<TiledMmaQK>(tSrS, thread_idx, smem_pipe_read.index());
-                  pipeline_flashmask.consumer_release(smem_pipe_read);
-#endif
-                }
 
                 Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
                 if constexpr (LargeHeadDimV && !Is_first_iter) { store_scales(scores_scale, smem_pipe_read_prev.index()); }
