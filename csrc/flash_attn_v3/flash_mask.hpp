@@ -53,6 +53,15 @@ namespace flash {
 
 namespace flashmask {
 
+  __global__
+  void my_print(int* ptr, int nblock_seqlen, int row) {
+    printf("\n======lt_start_nblockmax======\n");
+    for(int col=0;col<nblock_seqlen;col++) {
+        printf("%d: %d\n",col, ptr[row * nblock_seqlen + col]);
+    }
+    printf("\n======end lt_start_nblockmax======\n");
+  }
+
   template<int kBlockN>
   __global__
   void scanMaxMinKernel(
@@ -63,7 +72,8 @@ namespace flashmask {
     }
     int i_offset = bid * n;
     input = input + i_offset;
-    const int o_n = (n + kBlockN - 1) / kBlockN;
+    // const int o_n = (n + kBlockN - 1) / kBlockN;
+    const int o_n = ((n + kBlockN - 1) / kBlockN + 3) /4 * 4;
     // constexpr int nums = kBlockN / 32;  // ensure N % 32 == 0
     constexpr int nums = (kBlockN + 31) / 32;
     int warpId = blockIdx.x;      // ensure blockDim.x == 32
@@ -119,8 +129,13 @@ namespace flashmask {
       return;
     }
     int *nblock_smask = params.flashmask_maxmin_ptr;
-    const int nblock_seqlen = (params.seqlen_k + kBlockN - 1) / kBlockN;
-    const int nblock_masklen = (params.b * params.h_flashmask * nblock_seqlen + 3) / 4 * 4; // umiswing: padding for int4 load
+
+    // const int nblock_seqlen = (params.seqlen_k + kBlockN - 1) / kBlockN;
+    // const int nblock_masklen = (params.b * params.h_flashmask * nblock_seqlen + 3) / 4 * 4; // umiswing: padding for int4 load
+
+    const int nblock_seqlen = ((params.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
+    const int nblock_masklen = params.b * params.h_flashmask * nblock_seqlen;
+
     params.lt_start_nblockmax = nblock_smask;
     params.lt_start_nblockmin = nblock_smask + nblock_masklen;
     params.ut_end_nblockmax = nblock_smask + 2 * nblock_masklen;
@@ -177,6 +192,8 @@ namespace flashmask {
       params.ut_start_nblockmax = nullptr;
       params.ut_start_nblockmin = nullptr;
     }
+    my_print<<<1, 1, 0, stream>>>(params.lt_start_nblockmax, nblock_seqlen, 15);
+    cudaDeviceSynchronize();
   }
 } // namespace flashmask
 } // namespace flash
