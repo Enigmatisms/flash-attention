@@ -18,14 +18,16 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             // https://github.com/NVIDIA/cutlass/blob/833f6990e031b48b4cd2fcf55e0849c51ef6bac2/include/cute/container/tuple.hpp#L131
             // Switch to tile size 192 x 192 for now
             bool const use_blockN_128 = is_causal || is_local;
-            return {same_hdim ? 192 : 64, same_hdim ? (use_blockN_128 ? 128 : 192) : 64, same_hdim && use_blockN_128, same_hdim};
+            // return {same_hdim ? 192 : 64, same_hdim ? (use_blockN_128 ? 128 : 192) : 64, same_hdim && use_blockN_128, same_hdim};
+            return {192, use_blockN_128 ? 80 : 144, same_hdim && use_blockN_128, same_hdim};
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
             // return {192, is_causal || is_local ? 192 : 176, true, false};
         } else if (headdim <= 96) {
             return {192, is_local || paged_kv_non_TMA ? 128 : 144, false, true};
         } else if (headdim <= 128) {
 //            return {128, 96, true, true};
-            return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
+            // return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
+            return {128, 128, true, true};
             // {128, 192, false, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS
         } else if (headdim <= 192) {
