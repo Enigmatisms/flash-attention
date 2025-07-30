@@ -161,7 +161,7 @@ if(NOT SKIP_BUILD_FA)
     # You can define them for testing purposes like this:
     option(DISABLE_FP16 "Disable FP16" OFF)
     option(DISABLE_FP8 "Disable FP8" ON)
-    option(DISABLE_HDIM64 "Disable HDIM64" ON)
+    option(DISABLE_HDIM64 "Disable HDIM64" OFF)
     option(DISABLE_HDIM96 "Disable HDIM96" ON)
     option(DISABLE_HDIM128 "Disable HDIM128" OFF)
     option(DISABLE_HDIM192 "Disable HDIM192" ON)
