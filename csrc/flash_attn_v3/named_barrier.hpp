@@ -59,9 +59,8 @@ enum class FwdNamedBarriers {
     QueryRotated = 8,
     PFull = 9,
     PEmpty = 6,  // HACK: PEmpty is only used when we don't have 3 WGs
-    FlashMaskLoad = 7, // HACK: share with AppendKV
-    FlashMaskQK = 8, // HACK: share with FlashMaskQK
-    FlashMaskPV = 12, // TODO: to hack
+    FlashMaskNBlock = 7, // HACK: share with AppendKV
+    FlashMaskApply = 8, // HACK: share with QueryRotated
 };
 
 enum class BwdNamedBarriers {

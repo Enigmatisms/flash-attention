@@ -73,8 +73,10 @@ public:
     using TileSchedulerArguments = typename flash::TileSchedulerArguments;
     using TileSchedulerParams = typename TileScheduler::Params;
 
+    static constexpr uint32_t NumGenerateWarpGroups = 1;
     static constexpr uint32_t NumLoadWarpGroups = 1;
     static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaPV{})) / cutlass::NumThreadsPerWarpGroup;
+//    static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup) + (NumGenerateWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
     static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
@@ -86,16 +88,9 @@ public:
     // static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
 
-#if 0
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? (Is_flashmask ? 56 : 24 ): 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? (Is_flashmask ? 224 : 240) : 232) : 160);
-#endif
-
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? (Is_flashmask ? 56 : 24 ): 40) : 56);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? (Is_flashmask ? 224 : 240) : 232) : 152);
-
-    // static constexpr uint32_t LoadRegisterRequirement = (NumMmaWarpGroups == 1 ? 72 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32));
-    // static constexpr uint32_t MmaRegisterRequirement = (NumMmaWarpGroups == 1 ? 272 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160));
+//    static constexpr uint32_t NBlockRegisterRequirement = NumMmaWarpGroups == 1 ? 24 : (NumMmaWarpGroups == 2 ? 24 : 24);
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
 
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
@@ -127,7 +122,7 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineVt::SharedStorage pipeline_vt;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_k_new;
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
-            alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMask::SharedStorage pipeline_flashmask;
+            alignas(16) typename CollectiveMainloop::MainloopPipelineNBlock::SharedStorage pipeline_n_block;
             alignas(16) typename CollectiveMainloop::MainloopPipelineFlashMaskApply::SharedStorage pipeline_flashmask_apply;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
@@ -197,6 +192,7 @@ public:
     operator()(Params const& params, char* smem_buf) {
 
         static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
+        // static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup + NumGenerateWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int MmaThreadOffset = NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -205,23 +201,23 @@ public:
         using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
         using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
         using MainloopPipelineKVNew = typename CollectiveMainloop::MainloopPipelineKVNew;
-        using MainloopPipelineFlashMask = typename CollectiveMainloop::MainloopPipelineFlashMask;
+        using MainloopPipelineNBlock = typename CollectiveMainloop::MainloopPipelineNBlock;
         using MainloopPipelineFlashMaskApply = typename CollectiveMainloop::MainloopPipelineFlashMaskApply;
         using PipelineState = typename CollectiveMainloop::PipelineState;
         using PipelineParamsK = typename MainloopPipelineK::Params;
         using PipelineParamsV = typename MainloopPipelineV::Params;
         using PipelineParamsVt = typename MainloopPipelineVt::Params;
         using PipelineParamsKVNew = typename MainloopPipelineKVNew::Params;
-        using PipelineParamsFlashMask = typename MainloopPipelineFlashMask::Params;
+        using PipelineParamsNBlock = typename MainloopPipelineNBlock::Params;
         using PipelineParamsFlashMaskApply = typename MainloopPipelineFlashMaskApply::Params;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         __shared__ int32_t flashmask_smem_[4 * kBlockN * CollectiveMainloop::kStages];
-        __shared__ __align__(16) int32_t flashmask_maxmin_smem_producer_[8 * CollectiveMainloop::Flashmask_n_block_buffer_length];
-        __shared__ int32_t n_block_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kFlashMaskStages];
+        __shared__ __align__(16) int32_t flashmask_maxmin_smem[8 * CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
+        __shared__ int32_t n_block_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
 
-        __shared__ bool mask_state_smem_[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kStages];
+        __shared__ bool partially_masked_smem[CollectiveMainloop::Flashmask_n_block_buffer_length * CollectiveMainloop::kNBlockStages];
 
         int const lane_predicate = cute::elect_one_sync();
         int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -235,6 +231,7 @@ public:
         // Obtain warp index
         int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
         int warp_group_idx = cutlass::canonical_warp_group_idx();
+        int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
 
         if (warp_idx == 0 && lane_predicate) {
             shared_storage.pipelines.barrier_Q.init(Use_TMA_Q ? 1 : NumProducerThreads /*numThreads*/);
@@ -244,102 +241,14 @@ public:
             shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) * (Use_TMA_O ? 1 : NumMmaThreads) /*numThreads*/);
         }
 
-        // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
-        PipelineParamsK pipeline_params_k;
-        pipeline_params_k.role = warp_group_idx == 0
-            ? MainloopPipelineK::ThreadCategory::Producer
-            : MainloopPipelineK::ThreadCategory::Consumer;
-        if constexpr (Use_TMA_KV) {
-            pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
-            pipeline_params_k.is_leader = warp_group_thread_idx == 0;
-            pipeline_params_k.num_consumers = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
-        } else {
-            pipeline_params_k.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
-            pipeline_params_k.producer_arv_count = NumProducerThreads;
-        }
+        PipelineParamsNBlock pipeline_params_n_block;
+        pipeline_params_n_block.role = warp_group_idx == 0 && warp_idx_in_warpgroup != 0
+            ? MainloopPipelineNBlock::ThreadCategory::Producer
+            : MainloopPipelineNBlock::ThreadCategory::Consumer;
+        pipeline_params_n_block.consumer_arv_count = (!LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup) + NumProducerThreads; // TODO(umiswing): how to deal with LargeHeadDimV?
+        pipeline_params_n_block.producer_arv_count = cutlass::NumThreadsPerWarpGroup - NumProducerThreads;
 
-        static_assert(is_same_v<PipelineParamsK, PipelineParamsVt>);
-        PipelineParamsVt pipeline_params_vt = pipeline_params_k;
-        if constexpr (Use_TMA_KV && !SameHeadDim) {
-            pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
-            if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
-        } else {
-            if constexpr (LargeHeadDimV) { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
-        }
-
-        MainloopPipelineK pipeline_k = [&] {
-            if constexpr (Use_TMA_KV) {
-                return MainloopPipelineK(shared_storage.pipelines.pipeline_k, pipeline_params_k, ClusterShape{});
-            } else {
-                return MainloopPipelineK(shared_storage.pipelines.pipeline_k, pipeline_params_k);
-            }
-        }();
-        // MainloopPipelineV pipeline_v(shared_storage.pipelines.pipeline_v, pipeline_params_v, ClusterShape{});
-        MainloopPipelineV pipeline_v = [&] {
-            if constexpr (!Transpose_V) {
-                static_assert(is_same_v<PipelineParamsK, PipelineParamsV>);
-                if constexpr (Use_TMA_KV) {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_vt, ClusterShape{});
-                } else {
-                    return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_vt);
-                }
-            } else {
-                PipelineParamsV pipeline_params_v;
-                pipeline_params_v.role = warp_group_idx == 0
-                    ? MainloopPipelineV::ThreadCategory::Producer
-                    : MainloopPipelineV::ThreadCategory::Consumer;
-                pipeline_params_v.producer_arv_count = NumProducerThreads;
-                pipeline_params_v.consumer_arv_count = NumMmaThreads;
-                return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v);
-            }
-        }();
-        // If we need to transpose V (e.g. FP8 and V is row-major), we use pipeline_vt for the TMA, then
-        // the producer WG will read from pipeline_vt and write to pipeline_v.
-        // If we don't need to transpose V, we use pipeline_v for the TMA, and pipeline_vt won't be used.
-        // Technically for pipeline_params_vt, warp0 of WG0 is the producer and all of WG0 are consumers.
-        // However, the thread role isn't used in the pipeline implementation.
-        MainloopPipelineVt pipeline_vt = [&] {
-            if constexpr (Use_TMA_KV) {
-                pipeline_params_vt.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_vt, ClusterShape{});
-            } else {
-                pipeline_params_vt.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
-                return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_vt);
-            }
-        }();
-
-        PipelineParamsKVNew pipeline_params_kv_new;
-        pipeline_params_kv_new.role = warp_group_idx == 0
-            ? MainloopPipelineKVNew::ThreadCategory::Producer
-            : MainloopPipelineKVNew::ThreadCategory::Consumer;
-        pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
-        pipeline_params_kv_new.is_leader = warp_group_thread_idx == 0;
-        pipeline_params_kv_new.num_consumers = NumMmaThreads;
-        auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
-        if constexpr (!SameHeadDim) {
-            pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
-        }
-        auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
-
-        PipelineParamsFlashMask pipeline_params_flashmask;
-        pipeline_params_flashmask.role = warp_group_idx == 0
-            ? MainloopPipelineFlashMask::ThreadCategory::Producer
-            : MainloopPipelineFlashMask::ThreadCategory::Consumer;
-        pipeline_params_flashmask.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
-//        pipeline_params_flashmask.producer_arv_count = NumProducerThreads;
-//        pipeline_params_flashmask.producer_arv_count = Is_flashmask && !Is_causal ? cutlass::NumThreadsPerWarpGroup : NumProducerThreads;
-        pipeline_params_flashmask.producer_arv_count = Is_flashmask ? cutlass::NumThreadsPerWarpGroup : NumProducerThreads;
-
-        MainloopPipelineFlashMask pipeline_flashmask(shared_storage.pipelines.pipeline_flashmask, pipeline_params_flashmask);
-
-        PipelineParamsFlashMaskApply pipeline_params_flashmask_apply;
-        pipeline_params_flashmask_apply.role = warp_group_idx == 0
-            ? MainloopPipelineFlashMask::ThreadCategory::Producer
-            : MainloopPipelineFlashMask::ThreadCategory::Consumer;
-        pipeline_params_flashmask_apply.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
-        pipeline_params_flashmask_apply.producer_arv_count = NumProducerThreads;
-
-        MainloopPipelineFlashMaskApply pipeline_flashmask_apply(shared_storage.pipelines.pipeline_flashmask_apply, pipeline_params_flashmask_apply);
+        MainloopPipelineNBlock pipeline_n_block(shared_storage.pipelines.pipeline_n_block, pipeline_params_n_block);
 
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
@@ -354,35 +263,166 @@ public:
 
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
+        if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
+          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+          cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
+          for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); scheduler.get_next_work(params.scheduler, work_tile_info)) {
+              auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+              int const m_block = get<0>(block_coord);
+              int const bidh = get<1>(block_coord);
+              int const bidb = get<2>(block_coord);
+              int const split_idx = get<3>(block_coord);
+              SeqlenInfo_t seqlen_info{
+                  get<2>(block_coord) /*bidb*/,
+                  get<0>(params.mainloop.shape_Q),
+                  !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                  get<0>(params.mainloop.shape_K_new),
+                  params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
+                  params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+              };
+              auto [n_block_min, n_block_max] = CollectiveMainloop::BlockMN_t::get_n_block_min_max(
+                  seqlen_info, m_block, bidb, split_idx, params.mainloop.num_splits,
+                  params.mainloop.window_size_left, params.mainloop.window_size_right, params.mainloop.qhead_per_khead_divmod);
+
+              // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
+              if constexpr (Is_causal || Is_local || Varlen || Split) {
+                  if (n_block_max <= n_block_min) {
+                      //return false;
+                      // how to release lock?
+                      continue;
+                  }
+              }
+
+              const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
+              const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_length;
+              // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
+              for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
+                pipeline_n_block.producer_acquire(n_block_pipe_write);
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem);
+                mainloop.generate_n_block(params.mainloop,
+                                          seqlen_info,
+                                          block_coord,
+                                          reverse_chunk_idx,
+                                          reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,
+                                          flashmask_maxmin_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
+                                          n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
+                                          partially_masked_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
+                pipeline_n_block.producer_commit(n_block_pipe_write);
+                ++n_block_pipe_write;
+            }
+          }
+        } else {
+          // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
+          PipelineParamsK pipeline_params_k;
+          pipeline_params_k.role = warp_group_idx == 0
+              ? MainloopPipelineK::ThreadCategory::Producer
+              : MainloopPipelineK::ThreadCategory::Consumer;
+          if constexpr (Use_TMA_KV) {
+              pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+              pipeline_params_k.is_leader = warp_group_thread_idx == 0;
+              pipeline_params_k.num_consumers = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+          } else {
+              pipeline_params_k.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
+              pipeline_params_k.producer_arv_count = NumProducerThreads;
+          }
+          
+          static_assert(is_same_v<PipelineParamsK, PipelineParamsVt>);
+          PipelineParamsVt pipeline_params_vt = pipeline_params_k;
+          if constexpr (Use_TMA_KV && !SameHeadDim) {
+              pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+              if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
+          } else {
+              if constexpr (LargeHeadDimV) { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
+          }
+          
+          MainloopPipelineK pipeline_k = [&] {
+              if constexpr (Use_TMA_KV) {
+                  return MainloopPipelineK(shared_storage.pipelines.pipeline_k, pipeline_params_k, ClusterShape{});
+              } else {
+                  return MainloopPipelineK(shared_storage.pipelines.pipeline_k, pipeline_params_k);
+              }
+          }();
+          // MainloopPipelineV pipeline_v(shared_storage.pipelines.pipeline_v, pipeline_params_v, ClusterShape{});
+          MainloopPipelineV pipeline_v = [&] {
+              if constexpr (!Transpose_V) {
+                  static_assert(is_same_v<PipelineParamsK, PipelineParamsV>);
+                  if constexpr (Use_TMA_KV) {
+                      return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_vt, ClusterShape{});
+                  } else {
+                      return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_vt);
+                  }
+              } else {
+                  PipelineParamsV pipeline_params_v;
+                  pipeline_params_v.role = warp_group_idx == 0
+                      ? MainloopPipelineV::ThreadCategory::Producer
+                      : MainloopPipelineV::ThreadCategory::Consumer;
+                  pipeline_params_v.producer_arv_count = NumProducerThreads;
+                  pipeline_params_v.consumer_arv_count = NumMmaThreads;
+                  return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_v);
+              }
+          }();
+          // If we need to transpose V (e.g. FP8 and V is row-major), we use pipeline_vt for the TMA, then
+          // the producer WG will read from pipeline_vt and write to pipeline_v.
+          // If we don't need to transpose V, we use pipeline_v for the TMA, and pipeline_vt won't be used.
+          // Technically for pipeline_params_vt, warp0 of WG0 is the producer and all of WG0 are consumers.
+          // However, the thread role isn't used in the pipeline implementation.
+          MainloopPipelineVt pipeline_vt = [&] {
+              if constexpr (Use_TMA_KV) {
+                  pipeline_params_vt.num_consumers = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                  return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_vt, ClusterShape{});
+              } else {
+                  pipeline_params_vt.consumer_arv_count = NumProducerThreads; // TMA_V is only consumed by the producer WG
+                  return MainloopPipelineVt(shared_storage.pipelines.pipeline_vt, pipeline_params_vt);
+              }
+          }();
+          
+          PipelineParamsKVNew pipeline_params_kv_new;
+          pipeline_params_kv_new.role = warp_group_idx == 0
+              ? MainloopPipelineKVNew::ThreadCategory::Producer
+              : MainloopPipelineKVNew::ThreadCategory::Consumer;
+          pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+          pipeline_params_kv_new.is_leader = warp_group_thread_idx == 0;
+          pipeline_params_kv_new.num_consumers = NumMmaThreads;
+          auto pipeline_k_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_k_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+          if constexpr (!SameHeadDim) {
+              pipeline_params_kv_new.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+          }
+          auto pipeline_v_new = cute::conditional_return<AppendKV>(MainloopPipelineKVNew(shared_storage.pipelines.pipeline_v_new, pipeline_params_kv_new, ClusterShape{}), nullptr);
+          cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_read;
+
+          PipelineParamsFlashMaskApply pipeline_params_flashmask_apply;
+          pipeline_params_flashmask_apply.role = warp_group_idx == 0
+              ? MainloopPipelineFlashMaskApply::ThreadCategory::Producer
+              : MainloopPipelineFlashMaskApply::ThreadCategory::Consumer;
+          pipeline_params_flashmask_apply.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup; // TODO(umiswing): how to deal with LargeHeadDimV?
+          pipeline_params_flashmask_apply.producer_arv_count = NumProducerThreads;
+          
+          MainloopPipelineFlashMaskApply pipeline_flashmask_apply(shared_storage.pipelines.pipeline_flashmask_apply, pipeline_params_flashmask_apply);
+
         if (warp_group_idx == 0) {  // Producer
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
-
-
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
             // KV_new. Since the pipeline states are different, we have to manually sync to make
             // sure the two pipelines don't race when accessing smem_k and smem_v.
             PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipelineK>();
             PipelineState smem_pipe_write_new = cutlass::make_producer_start_state<MainloopPipelineKVNew>();
-            cutlass::PipelineState<CollectiveMainloop::kFlashMaskStages> flashmask_pipe_write = cutlass::make_producer_start_state<MainloopPipelineFlashMask>();
+
 
             int work_idx = 0;
-            int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
-            static_assert(SingleProducerWarp || !Is_flashmask);
+            static_assert(SingleProducerWarp);
 
-            if constexpr (SingleProducerWarp && !Is_flashmask) {
+            if constexpr (SingleProducerWarp) {
               if (warp_idx_in_warpgroup != 0) { return; }
             }
 
-            if ((!SingleProducerWarp || Is_flashmask) && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
+            if (!SingleProducerWarp && warp_idx_in_warpgroup != 0) { scheduler.init_consumer(); }
 
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
-            for (auto work_tile_info = SingleProducerWarp && !Is_flashmask || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
-                 work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = SingleProducerWarp && !Is_flashmask || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+            for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); scheduler.get_next_work(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
@@ -393,60 +433,14 @@ public:
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
-                if constexpr (AppendKV) {
-                    bool tile_new_valid = mainloop.load_kv_new(
-                        params.mainloop, pipeline_k_new, pipeline_v_new,
-                        smem_pipe_write_new, shared_storage, seqlen_info, block_coord, work_idx);
-                    if (tile_new_valid) {
-                        // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
-                        cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
-                        // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
-                    }
-                }
-                auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
-                    scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-                };
 
-                bool valid_tile;
-                if constexpr (Is_flashmask) {
-                  mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, flashmask_maxmin_smem_producer_);
-                  valid_tile = mainloop.generate_n_block(params.mainloop, pipeline_flashmask, flashmask_pipe_write, seqlen_info, block_coord, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
-                }
-
-                // pipeline_vt won't be used if we don't need to transpose V.
-                if constexpr (Is_flashmask) {
-                  if (warp_idx_in_warpgroup == 0) {
-                    mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_write,
-                                             flashmask_pipe_write,
-                                             shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
-                                             flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
-                  }
-                } else {
-                    mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_write,
-                                             flashmask_pipe_write,
-                                             shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx,
-                                             flashmask_smem_, flashmask_maxmin_smem_producer_, n_block_smem_, mask_state_smem_);
-                }
-
-                ++flashmask_pipe_write;
-#if 0
-                if constexpr (Is_flashmask && Is_causal) {
-                  if (valid_tile) {
-                    ++flashmask_pipe_write;
-                  }
-                } else {
-                  ++flashmask_pipe_write;
-                }
-#endif
+                mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
+                              n_block_pipe_read,
+                              shared_storage, seqlen_info, block_coord, work_idx,
+                              flashmask_smem_, n_block_smem, partially_masked_smem);
             }
 
-            if constexpr (Is_flashmask) {
-              if (warp_idx_in_warpgroup == 0) {
-                mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
-              }
-            } else {
-              mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, pipeline_flashmask, smem_pipe_write, flashmask_pipe_write, shared_storage, work_idx);
-            }
+            mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
@@ -455,7 +449,6 @@ public:
 
             PipelineState smem_pipe_read;
             PipelineState smem_pipe_read_new;
-            cutlass::PipelineState<CollectiveMainloop::kFlashMaskStages> flashmask_pipe_read;
             // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
             // (like in Cutlass's gemm) because the read and release pipeline states are always the same.
 
@@ -478,63 +471,34 @@ public:
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
-                if constexpr (AppendKV) {
-                    bool tile_new_valid = mainloop.store_kv_new(
-                        params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read_new,
-                        threadIdx.x - MmaThreadOffset, shared_storage, seqlen_info, block_coord);
-                    if (tile_new_valid) {
-                        // if (threadIdx.x == 128) { printf("Consumer: Before sync\n"); }
-                        // We need this sync so that the gmem write from the consumers is visible to the producer
-                        // that might do TMA read after that.
-                        asm volatile ("fence.proxy.async.global;");
-                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
-                        // arrive is enough, we don't need sync. The producer will sync, which means
-                        // after that sync we're guaranteed that the AppendKV pipeline have finished
-                        // loading and consumer smem_k and smem_v.
-                        // if (threadIdx.x == 128) { printf("Consumer: After sync\n"); }
-                    }
-                }
                 // If there's tanh softcap, the scaling will be done before tanh.
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
-                if constexpr (Is_FP8 && !Has_softcap) {
-                    int const bidh = get<1>(block_coord);
-                    int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
-                    float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
-                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
-                    softmax_scale_log2 *= q_descale * k_descale;
-                }
                 flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
                     tile_valid = mainloop.mma(
-                        params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, pipeline_flashmask_apply, smem_pipe_read,
-                        flashmask_pipe_read,
+                        params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
+                        n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                        flashmask_smem_, n_block_smem_, mask_state_smem_);
+                        flashmask_smem_, n_block_smem, partially_masked_smem);
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
-                            params.mainloop, pipeline_k, pipeline_v, pipeline_flashmask, smem_pipe_read,
+                            params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
-                            flashmask_smem_, n_block_smem_, mask_state_smem_);
+                            flashmask_smem_, n_block_smem, partially_masked_smem);
                     } else {
                         tile_valid = mainloop.mma_pv(
-                            params.mainloop, pipeline_v, pipeline_flashmask, smem_pipe_read,
+                            params.mainloop, pipeline_v, pipeline_n_block, smem_pipe_read,
                             tOrO, softmax, threadIdx.x - MmaThreadOffset, seqlen_info, block_coord, shared_storage,
                             flashmask_smem_);
                     }
                 }
                 // Do this here before the epilogue so that the next tile is ready to go.
                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
-                if constexpr (Split && Varlen) {
-                    if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
-                        cutlass::arch::launch_dependent_grids();
-                    }
-                }
                 if (tile_valid) {
-                    // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d, bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n", blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
                     epilogue.store(params.epilogue, tOrO, softmax.row_sum, shared_storage, tiled_mma_pv,
                                    threadIdx.x - MmaThreadOffset, block_coord);
                 } else {
@@ -544,7 +508,7 @@ public:
             }
             epilogue.store_tail();
         }
-
+      }
     }
 
 };

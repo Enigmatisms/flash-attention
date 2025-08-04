@@ -369,6 +369,7 @@ if(NOT SKIP_BUILD_FA)
 
     # list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim128_bf16_sm90.cu" "flash_attn_v3/instantiations/flash_bwd_hdim128_bf16_sm90.cu")
     list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim128_bf16_sm90.cu")
+    list(APPEND FA3_SOURCES_CU_SOURCES "flash_attn_v3/instantiations/flash_fwd_hdim64_bf16_sm90.cu")
     message(STATUS "Auto generated CUDA source files: ${FA3_SOURCES_CU_SOURCES}")
     add_library(flashattnv3 SHARED
         ${FA3_SOURCES_CU_SOURCES}
