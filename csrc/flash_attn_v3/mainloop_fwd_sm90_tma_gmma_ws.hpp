@@ -657,17 +657,30 @@ struct CollectiveMainloopFwdSm90 {
                  int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
                  int32_t* const flashmask_maxmin_smem) {
         int32_t bidh = get<1>(block_coord);
-        int32_t bidb = get<1>(block_coord);
+        int32_t bidb = get<2>(block_coord);
+        int const m_block = get<0>(block_coord);
 
         const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
 
         int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * nblock_seqlen; // row_offset
-        offset += (nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_length);
+        offset += std::max((nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_length), 0);
 
         constexpr int threads_num = 96;
         static_assert(threads_num == 96, "load_max_min only support running with 3 warp");
+        int const thread_idx = threadIdx.x - 32;
+
+        if(thread_idx == 0 && m_block == 20 && bidb == 1 && bidh == 0) {
+          printf("\n");
+          for(int i = 0; i < nblock_seqlen; i++) {
+            printf("lt_start_max[%d]:%d, lt_start_min[%d]:%d\n",
+                    i, *(reinterpret_cast<int32_t*>(params.lt_start_nblockmax + offset + i)), i, *(reinterpret_cast<int32_t*>(params.lt_start_nblockmin + offset + i)));
+          }
+        }
+
+       int length  = Flashmask_n_block_buffer_length < nblock_seqlen ? Flashmask_n_block_buffer_length : nblock_seqlen;
+
         // how to fix oob?
-        for(int64_t idx = threadIdx.x; idx < Flashmask_n_block_buffer_length / 4 && (offset + idx * 4) >= 0; idx += threads_num) {
+        for(int64_t idx = thread_idx; idx < length / 4 && (offset + idx * 4) >= 0; idx += threads_num) {
           // lt
           if(params.lt_start_nblockmax != nullptr)
             asm volatile(
@@ -728,7 +741,7 @@ struct CollectiveMainloopFwdSm90 {
 
         }
 
-        for(int64_t idx = threadIdx.x + Flashmask_n_block_buffer_length / 4 * 4; idx < Flashmask_n_block_buffer_length && (offset + idx >= 0); idx += threads_num) {
+        for(int64_t idx = thread_idx + length / 4 * 4; idx < length && (offset + idx >= 0); idx += threads_num) {
           // lt
           if(params.lt_start_nblockmax != nullptr)
             asm volatile(
@@ -815,6 +828,7 @@ struct CollectiveMainloopFwdSm90 {
 
       constexpr int threads_num = 96;
       static_assert(threads_num == 96, "generate_n_block only support running with 3 warps");
+      int const thread_idx = threadIdx.x - 32;
 
       __shared__ int s_prefix_sum[4];
       int32_t lt_start_max = INT_MAX;
@@ -847,14 +861,44 @@ struct CollectiveMainloopFwdSm90 {
 
       const int32_t nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
 
-      int32_t base_offset = nblock_seqlen - reverse_chunk_idx * Flashmask_n_block_buffer_length;
+      int32_t base_offset = std::max(nblock_seqlen - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_length, 0);
+
+      if(thread_idx == 0 && m_block == 20 && bidb == 1 && bidh == 0) {
+        printf("\n");
+        for(int32_t idx = Flashmask_n_block_buffer_length - 1;idx >= (0 - (threads_num - Flashmask_n_block_buffer_length % threads_num)); idx--) {
+          int32_t n_block = base_offset + idx;
+          if(n_block >= n_block_min && n_block < n_block_max) {
+            if(params.lt_start_nblockmax != nullptr)
+              lt_start_max = s_lt_start_max[idx];
+            if(params.lt_start_nblockmin != nullptr)
+              lt_start_min = s_lt_start_min[idx];
+            
+            if(params.lt_end_nblockmax != nullptr)
+              lt_end_max = s_lt_end_max[idx];
+            if(params.lt_end_nblockmin != nullptr)
+              lt_end_min = s_lt_end_min[idx];
+            
+            if(params.ut_start_nblockmax != nullptr)
+              ut_start_max = s_ut_start_max[idx];
+            if(params.ut_start_nblockmin != nullptr)
+              ut_start_min = s_ut_start_min[idx];
+            
+            if(params.ut_end_nblockmax != nullptr)          
+              ut_end_max = s_ut_end_max[idx];
+            if(params.ut_end_nblockmin != nullptr)
+              ut_end_min = s_ut_end_min[idx];
+            printf("idx:%d, n_block:%d, lt_start_max:%d, lt_start_min:%d, lt_end_max:%d, lt_end_min:%d, ut_start_max:%d, ut_start_min:%d, ut_end_max:%d, ut_end_min:%d\n",
+                    idx,    n_block,    lt_start_max,    lt_start_min,    lt_end_max,    lt_end_min,    ut_start_max,    ut_start_min,    ut_end_max,    ut_end_min);
+          }
+        }
+      }
 
       // for(int n_block = n_block_max - 1 - threadIdx.x % threads_num; n_block >= (n_block_min - (threads_num - (n_block_max - n_block_min) % threads_num)); n_block -= threads_num)
       // explanation for the loop condition:
       // -2, -1,  0,  1,  2
       // t4, t3, t2, t1, t0
       // although t4 and t3 are oob, they should not exit the loop, otherwise, the prefix-sum inside the loop will hang, just keep a default value is fine
-      for(int32_t idx = Flashmask_n_block_buffer_length - 1 - threadIdx.x % threads_num; idx >= (0 - (threads_num - Flashmask_n_block_buffer_length % threads_num)); idx -= threads_num) {
+      for(int32_t idx = Flashmask_n_block_buffer_length - 1 - thread_idx % threads_num; idx >= (0 - (threads_num - Flashmask_n_block_buffer_length % threads_num)); idx -= threads_num) {
         int32_t n_block = base_offset + idx;
         int prefix_sum = 0;
         bool fully_masked = true;
@@ -902,20 +946,20 @@ struct CollectiveMainloopFwdSm90 {
         #pragma unroll
         for(int i=1; i<32; i*=2) {
           int tmp_prefix_sum = __shfl_up_sync(0xffffffff, prefix_sum, i);
-          prefix_sum = threadIdx.x % 32 >= i ? prefix_sum + tmp_prefix_sum : prefix_sum;
+          prefix_sum = thread_idx % 32 >= i ? prefix_sum + tmp_prefix_sum : prefix_sum;
         }
 
         // inter-warp prefix-sum
         if constexpr (threads_num == 96) {
-          if(threadIdx.x%32 == 31) {
-            s_prefix_sum[threadIdx.x / 32] = prefix_sum;
+          if(thread_idx % 32 == 31) {
+            s_prefix_sum[thread_idx / 32] = prefix_sum;
           }
           
           cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
           
-          if(threadIdx.x / 32 == 1) {
+          if(thread_idx / 32 == 1) {
             prefix_sum += s_prefix_sum[0];
-          } else if(threadIdx.x / 32 == 2) {
+          } else if(thread_idx / 32 == 2) {
             prefix_sum += s_prefix_sum[0];
             prefix_sum += s_prefix_sum[1];
           }
@@ -926,7 +970,7 @@ struct CollectiveMainloopFwdSm90 {
           partially_masked_smem_[n_block] = partially_masked;
         }
         if constexpr (threads_num == 96) {
-          if(threadIdx.x / 32 == 2 && threadIdx.x % 32 == 31) {
+          if(thread_idx / 32 == 2 && thread_idx % 32 == 31) {
             s_prefix_sum[2] = prefix_sum;
           }
           cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
@@ -934,6 +978,14 @@ struct CollectiveMainloopFwdSm90 {
         }
       }
       n_block_smem_[valid_n_block_num] = end_flag;
+
+      if(thread_idx == 0 && m_block == 20 && bidb == 1 && bidh == 0) {
+        printf("\n");
+        for(int i = 0; i <= valid_n_block_num; i++) {
+          printf("threadIdx.x:%d, blockIdx.x:%d, m_block:%d, bidb:%d, bidh:%d, split_idx:%d, reverse_chunk_idx:%d, n_block_smem_[%d]: %d\n",
+                  threadIdx.x,    blockIdx.x,    m_block,    bidb,    bidh,    split_idx,    reverse_chunk_idx,    i, n_block_smem_[i]);
+        }
+      }
       return true;
     }
 

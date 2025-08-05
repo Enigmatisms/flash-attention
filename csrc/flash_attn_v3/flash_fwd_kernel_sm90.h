@@ -264,9 +264,9 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
-          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+//          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
-          for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); scheduler.get_next_work(params.scheduler, work_tile_info)) {
+          for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
               auto block_coord = work_tile_info.get_block_coord(params.scheduler);
               int const m_block = get<0>(block_coord);
               int const bidh = get<1>(block_coord);
@@ -298,13 +298,13 @@ public:
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
                 pipeline_n_block.producer_acquire(n_block_pipe_write);
-                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem);
+                mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
                 mainloop.generate_n_block(params.mainloop,
                                           seqlen_info,
                                           block_coord,
                                           reverse_chunk_idx,
                                           reverse_chunk_idx == num_chunk - 1 ? CollectiveMainloop::Flashmask_n_block_finish : CollectiveMainloop::Flashmask_n_block_chunk_end,
-                                          flashmask_maxmin_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
+                                          flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
                                           n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
                                           partially_masked_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
                 pipeline_n_block.producer_commit(n_block_pipe_write);
@@ -400,7 +400,7 @@ public:
           MainloopPipelineFlashMaskApply pipeline_flashmask_apply(shared_storage.pipelines.pipeline_flashmask_apply, pipeline_params_flashmask_apply);
 
         if (warp_group_idx == 0) {  // Producer
-            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+//            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
             // KV_new. Since the pipeline states are different, we have to manually sync to make
@@ -422,7 +422,7 @@ public:
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
-            for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); scheduler.get_next_work(params.scheduler, work_tile_info)) {
+            for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
 
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
@@ -442,7 +442,7 @@ public:
 
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
-            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+//            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;
