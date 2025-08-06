@@ -294,10 +294,20 @@ public:
               }
 
               const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
-              const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_length;
+              const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
+#if 0
+                if(threadIdx.x == 32) {
+                  printf("blockIdx.x:%d before producer_acquire\n", blockIdx.x);
+                }
+#endif
                 pipeline_n_block.producer_acquire(n_block_pipe_write);
+#if 0
+                if(threadIdx.x == 32) {
+                  printf("blockIdx.x:%d after producer_acquire\n", blockIdx.x);
+                }
+#endif
                 mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
                 mainloop.generate_n_block(params.mainloop,
                                           seqlen_info,
@@ -433,11 +443,20 @@ public:
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
-
+#if 0
+                if (threadIdx.x == 0) {
+                  printf("blockIdx.x:%d before mainloop.load\n", blockIdx.x);
+                }
+#endif
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
                               flashmask_smem_, n_block_smem, partially_masked_smem);
+#if 0
+                if (threadIdx.x == 0) {
+                  printf("blockIdx.x:%d after mainloop.load\n", blockIdx.x);
+                }
+#endif
             }
 
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
