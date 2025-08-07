@@ -1381,10 +1381,12 @@ struct CollectiveMainloopFwdSm90 {
 #endif
 
         n_block = n_block_smem_[++n_block_idx];
+#if 0
         if(n_block < n_block_min && n_block != Flashmask_n_block_chunk_end) {
             pipeline_n_block.consumer_release(n_block_pipe_read);
             ++n_block_pipe_read;
         }
+#endif
 
         #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
         for (; n_block >= n_block_min || n_block == Flashmask_n_block_chunk_end;) {
@@ -1429,8 +1431,10 @@ struct CollectiveMainloopFwdSm90 {
             }
 #endif
           }
+#if 0
           pipeline_n_block.consumer_release(n_block_pipe_read);
           ++n_block_pipe_read;
+#endif
 
 #if 0
           if(threadIdx.x == 0 && blockIdx.x == 34) {
@@ -1439,6 +1443,8 @@ struct CollectiveMainloopFwdSm90 {
 #endif
 
           if (n_block == Flashmask_n_block_chunk_end) {
+            pipeline_n_block.consumer_release(n_block_pipe_read);
+            ++n_block_pipe_read;
             n_block_wait(pipeline_n_block, n_block_pipe_read);
             n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
             partially_masked_smem_ = partially_masked_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
@@ -1451,6 +1457,9 @@ struct CollectiveMainloopFwdSm90 {
           }
 #endif
         }
+
+        pipeline_n_block.consumer_release(n_block_pipe_read);
+        ++n_block_pipe_read;
 
 #if 0
         if(threadIdx.x == 0 && blockIdx.x == 34) {
@@ -1827,10 +1836,12 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             n_block = n_block_smem_[++n_block_idx];
 
+#if 0
             if(n_block < n_block_min && n_block != Flashmask_n_block_chunk_end) {
                 pipeline_n_block.consumer_release(n_block_pipe_read);
                 ++n_block_pipe_read;
             }
+#endif
 
 #if 0
             if(threadIdx.x == 128 && blockIdx.x == 34) {
@@ -1910,11 +1921,15 @@ struct CollectiveMainloopFwdSm90 {
                   for (; n_block >= n_block_min_causal_local_mask; n_block = n_block_smem_[++n_block_idx]) {
                       fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);
                   }
+#if 0
                   if (n_block == Flashmask_n_block_chunk_end || n_block == Flashmask_n_block_finish || n_block_min_causal_local_mask == n_block_min_before_local_mask) {
                     pipeline_n_block.consumer_release(n_block_pipe_read);
                     ++n_block_pipe_read;
                   }
+#endif
                   if (n_block == Flashmask_n_block_chunk_end) {
+                    pipeline_n_block.consumer_release(n_block_pipe_read);
+                    ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
                     n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
                     partially_masked_smem_ = partially_masked_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
@@ -1936,9 +1951,13 @@ struct CollectiveMainloopFwdSm90 {
               for (; n_block >= n_block_min_before_local_mask; n_block = n_block_smem_[++n_block_idx]) {
                   fwd_step(n_block, no_mask_fn, cute::bool_constant<Is_flashmask>{} /*check_inf*/);
               }
+#if 0
               pipeline_n_block.consumer_release(n_block_pipe_read);
               ++n_block_pipe_read;
+#endif
               if (n_block == Flashmask_n_block_chunk_end) {
+                pipeline_n_block.consumer_release(n_block_pipe_read);
+                ++n_block_pipe_read;
                 consumer_wait(pipeline_n_block, n_block_pipe_read);
                 n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
                 partially_masked_smem_ = partially_masked_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
@@ -1955,9 +1974,13 @@ struct CollectiveMainloopFwdSm90 {
                   for (; n_block >= n_block_min; n_block = n_block_smem_[++n_block_idx]) {
                       fwd_step(n_block, local_mask_fn, cute::bool_constant<Is_local>{} /*check_inf*/);
                   }
+#if 0
                   pipeline_n_block.consumer_release(n_block_pipe_read);
                   ++n_block_pipe_read;
+#endif
                   if (n_block == Flashmask_n_block_chunk_end) {
+                    pipeline_n_block.consumer_release(n_block_pipe_read);
+                    ++n_block_pipe_read;
                     consumer_wait(pipeline_n_block, n_block_pipe_read);
                     n_block_smem_ = n_block_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
                     partially_masked_smem_ = partially_masked_smem + Flashmask_n_block_buffer_length * n_block_pipe_read.index();
@@ -1966,6 +1989,8 @@ struct CollectiveMainloopFwdSm90 {
                   }
                 }
             }
+            pipeline_n_block.consumer_release(n_block_pipe_read);
+            ++n_block_pipe_read;
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
