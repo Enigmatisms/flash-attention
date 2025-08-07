@@ -89,13 +89,13 @@ public:
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
 
 //    static constexpr uint32_t NBlockRegisterRequirement = NumMmaWarpGroups == 1 ? 24 : (NumMmaWarpGroups == 2 ? 24 : 24);
-//    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
-//    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
 
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
-    static constexpr uint32_t LoadRegisterRequirement = 40;
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
+//    static constexpr uint32_t LoadRegisterRequirement = 40;
+//    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
 
     // Kernel level shared memory storage
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v
@@ -297,26 +297,10 @@ public:
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
-#if 0
-              if (threadIdx.x == 32 && blockIdx.x == 99) {
-//                printf("blockIdx.x:%d before generator\n", blockIdx.x);
-                printf("valid_chunk:%d m_block:%d before generator\n", valid_chunk, m_block);
-              }
-#endif
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
-#if 0
-                if(threadIdx.x == 32) {
-                  printf("blockIdx.x:%d before producer_acquire\n", blockIdx.x);
-                }
-#endif
                 if (valid_chunk) {
                   pipeline_n_block.producer_acquire(n_block_pipe_write);
                 }
-#if 0
-                if(threadIdx.x == 32) {
-                  printf("blockIdx.x:%d after producer_acquire\n", blockIdx.x);
-                }
-#endif
                 mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
                 valid_chunk = mainloop.generate_n_block(params.mainloop,
                                           seqlen_info,
@@ -331,12 +315,6 @@ public:
                   ++n_block_pipe_write;
                 }
             }
-#if 0
-            if (threadIdx.x == 32 && blockIdx.x == 99) {
-//              printf("blockIdx.x:%d after generator\n", blockIdx.x);
-              printf("valid_chunk:%d m_block:%d after generator\n", valid_chunk, m_block);
-            }
-#endif
           }
         } else {
           // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
@@ -460,20 +438,10 @@ public:
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
                 };
-#if 0
-                if (threadIdx.x == 0) {
-                  printf("blockIdx.x:%d before mainloop.load\n", blockIdx.x);
-                }
-#endif
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_write,
                               n_block_pipe_read,
                               shared_storage, seqlen_info, block_coord, work_idx,
                               flashmask_smem_, n_block_smem, partially_masked_smem);
-#if 0
-                if (threadIdx.x == 0) {
-                  printf("blockIdx.x:%d after mainloop.load\n", blockIdx.x);
-                }
-#endif
             }
 
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
@@ -514,21 +482,11 @@ public:
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
-#if 0
-                    if (threadIdx.x == 128) {
-                      printf("blockIdx.x:%d before mma\n", blockIdx.x);
-                    }
-#endif
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
                         flashmask_smem_, n_block_smem, partially_masked_smem);
-#if 0
-                    if (threadIdx.x == 128) {
-                      printf("blockIdx.x:%d after mma\n", blockIdx.x);
-                    }
-#endif
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
