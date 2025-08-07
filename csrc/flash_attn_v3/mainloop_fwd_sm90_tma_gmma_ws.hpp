@@ -75,7 +75,7 @@ struct CollectiveMainloopFwdSm90 {
 
     static constexpr int Flashmask_max_seqlen_k = 16 * 1024;
 
-    static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4;
+    static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4 + 4;
     static constexpr int Flashmask_n_block_buffer_valid_length = Flashmask_n_block_buffer_length - 4;
 
     static constexpr int Flashmask_n_block_chunk_end = -1;
@@ -909,7 +909,7 @@ struct CollectiveMainloopFwdSm90 {
         int prefix_sum = 0;
         bool fully_masked = true;
         bool partially_masked;
-        if(n_block >= n_block_min && n_block < n_block_max) {
+        if(n_block >= n_block_min && n_block < n_block_max && idx >= 0) {
           prefix_sum = 1;
           fully_masked = false;
           if(params.lt_start_nblockmax != nullptr)
@@ -960,7 +960,7 @@ struct CollectiveMainloopFwdSm90 {
           if(thread_idx % 32 == 31) {
             s_prefix_sum[thread_idx / 32] = prefix_sum;
           }
-          
+
           cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
           
           if(thread_idx / 32 == 1) {
@@ -1021,9 +1021,11 @@ struct CollectiveMainloopFwdSm90 {
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
 
+#if 0
         if (threadIdx.x == 0 && blockIdx.x == 99) {
             printf("m_block:%d producer before\n", m_block);
         }
+#endif
 
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
@@ -1225,6 +1227,13 @@ struct CollectiveMainloopFwdSm90 {
                 if(partially_masked_smem_[n_block_idx]) {
                      int row_offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * seqlen_info.seqlen_k;
 
+#if 0
+                  __nanosleep(1000000);
+                  if (threadIdx.x == 0 && blockIdx.x == 76) {
+                    printf("row_offset:%d, n_block:%d, n_block_idx:%d, m_block:%d, bidb:%d, bidh:%d\n",
+                            row_offset,    n_block,    n_block_idx,    m_block,    bidb,    bidh);
+                  }
+#endif
                   for(int64_t idx = thread_idx; idx < kBlockN  && n_block * kBlockN + idx < seqlen_info.seqlen_k; idx += NumProducerThreads) {
                     if(params.lt_start_ptr != nullptr) {
                       asm volatile(
@@ -1422,7 +1431,10 @@ struct CollectiveMainloopFwdSm90 {
               printf("n_block:%d before load_flashmask\n", n_block);
             }
 #endif
-
+            if (threadIdx.x == 0 && blockIdx.x == 76 && m_block == 0 && bidb == 0 && bidh == 7) {
+                printf("n_block:%d n_block_idx:%d partially_masked_smem_:%d\n",
+                        n_block,   n_block_idx,   partially_masked_smem_[n_block_idx]);
+            }
             load_flashmask(smem_pipe_write);
 
 #if 0
@@ -1477,9 +1489,11 @@ struct CollectiveMainloopFwdSm90 {
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
 
+#if 0
         if (threadIdx.x == 0 && blockIdx.x == 99) {
             printf("m_block:%d producer after\n", m_block);
         }
+#endif
     }
 
     template <typename SharedStorage>
@@ -1605,9 +1619,11 @@ struct CollectiveMainloopFwdSm90 {
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
         int const m_block = get<0>(block_coord);
 
+#if 0
         if(threadIdx.x == 128 && blockIdx.x == 99) {
           printf("m_block:%d mma before\n", m_block);
         }
+#endif
 
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
@@ -2105,9 +2121,11 @@ struct CollectiveMainloopFwdSm90 {
             ++smem_pipe_read;
         }
         ++work_idx;
+#if 0
         if(threadIdx.x == 128 && blockIdx.x == 99) {
           printf("m_block:%d mma after\n", m_block);
         }
+#endif
         return true;
     }
 

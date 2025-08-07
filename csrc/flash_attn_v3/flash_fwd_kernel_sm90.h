@@ -297,10 +297,12 @@ public:
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
               bool valid_chunk = true;
+#if 0
               if (threadIdx.x == 32 && blockIdx.x == 99) {
 //                printf("blockIdx.x:%d before generator\n", blockIdx.x);
                 printf("valid_chunk:%d m_block:%d before generator\n", valid_chunk, m_block);
               }
+#endif
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
 #if 0
                 if(threadIdx.x == 32) {
@@ -329,10 +331,12 @@ public:
                   ++n_block_pipe_write;
                 }
             }
+#if 0
             if (threadIdx.x == 32 && blockIdx.x == 99) {
 //              printf("blockIdx.x:%d after generator\n", blockIdx.x);
               printf("valid_chunk:%d m_block:%d after generator\n", valid_chunk, m_block);
             }
+#endif
           }
         } else {
           // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
