@@ -89,13 +89,13 @@ public:
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
 
 //    static constexpr uint32_t NBlockRegisterRequirement = NumMmaWarpGroups == 1 ? 24 : (NumMmaWarpGroups == 2 ? 24 : 24);
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
+//    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? 24 : 32);
+//    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? 240 : 160);
 
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
-    // static constexpr uint32_t LoadRegisterRequirement = 40;
-    // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
+    static constexpr uint32_t LoadRegisterRequirement = 40;
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
 
     // Kernel level shared memory storage
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v
@@ -264,7 +264,7 @@ public:
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
         if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
-//          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+          cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           for (auto work_tile_info = scheduler.get_initial_work(params.scheduler); work_tile_info.is_valid(params.scheduler); work_tile_info = scheduler.get_next_work(params.scheduler, work_tile_info)) {
               auto block_coord = work_tile_info.get_block_coord(params.scheduler);
@@ -296,20 +296,27 @@ public:
               const int nblock_seqlen = ((seqlen_info.seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4; // umiswing: padding for int4 load
               const int num_chunk = (nblock_seqlen + CollectiveMainloop::Flashmask_n_block_buffer_valid_length -1) / CollectiveMainloop::Flashmask_n_block_buffer_valid_length;
               // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0], and fwd kernel scans from right to left
+              bool valid_chunk = true;
+              if (threadIdx.x == 32 && blockIdx.x == 99) {
+//                printf("blockIdx.x:%d before generator\n", blockIdx.x);
+                printf("valid_chunk:%d m_block:%d before generator\n", valid_chunk, m_block);
+              }
               for(int reverse_chunk_idx = 0; reverse_chunk_idx < num_chunk; reverse_chunk_idx++) {
 #if 0
                 if(threadIdx.x == 32) {
                   printf("blockIdx.x:%d before producer_acquire\n", blockIdx.x);
                 }
 #endif
-                pipeline_n_block.producer_acquire(n_block_pipe_write);
+                if (valid_chunk) {
+                  pipeline_n_block.producer_acquire(n_block_pipe_write);
+                }
 #if 0
                 if(threadIdx.x == 32) {
                   printf("blockIdx.x:%d after producer_acquire\n", blockIdx.x);
                 }
 #endif
                 mainloop.load_max_min(params.mainloop, seqlen_info, block_coord, reverse_chunk_idx, flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
-                mainloop.generate_n_block(params.mainloop,
+                valid_chunk = mainloop.generate_n_block(params.mainloop,
                                           seqlen_info,
                                           block_coord,
                                           reverse_chunk_idx,
@@ -317,8 +324,14 @@ public:
                                           flashmask_maxmin_smem + 8 * CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
                                           n_block_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index(),
                                           partially_masked_smem + CollectiveMainloop::Flashmask_n_block_buffer_length * n_block_pipe_write.index());
-                pipeline_n_block.producer_commit(n_block_pipe_write);
-                ++n_block_pipe_write;
+                if (valid_chunk) {
+                  pipeline_n_block.producer_commit(n_block_pipe_write);
+                  ++n_block_pipe_write;
+                }
+            }
+            if (threadIdx.x == 32 && blockIdx.x == 99) {
+//              printf("blockIdx.x:%d after generator\n", blockIdx.x);
+              printf("valid_chunk:%d m_block:%d after generator\n", valid_chunk, m_block);
             }
           }
         } else {
@@ -410,7 +423,7 @@ public:
           MainloopPipelineFlashMaskApply pipeline_flashmask_apply(shared_storage.pipelines.pipeline_flashmask_apply, pipeline_params_flashmask_apply);
 
         if (warp_group_idx == 0) {  // Producer
-//            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
             // The pipelines for AppendKV and main attention are different, since e.g. main attention
             // might use cp.async to load KV (if PagedKVNonTMA) while AppendKV always uses TMA to load
             // KV_new. Since the pipeline states are different, we have to manually sync to make
@@ -461,7 +474,7 @@ public:
 
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
-//            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
+            cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
 
             // Initialize matmul objects.
             TiledMmaPV tiled_mma_pv;
@@ -497,11 +510,21 @@ public:
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
                 if constexpr (!LargeHeadDimV) {
+#if 0
+                    if (threadIdx.x == 128) {
+                      printf("blockIdx.x:%d before mma\n", blockIdx.x);
+                    }
+#endif
                     tile_valid = mainloop.mma(
                         params.mainloop, pipeline_k, pipeline_v, pipeline_n_block, pipeline_flashmask_apply, smem_pipe_read,
                         n_block_pipe_read,
                         tOrO, softmax, threadIdx.x - MmaThreadOffset, work_idx, seqlen_info, block_coord, shared_storage,
                         flashmask_smem_, n_block_smem, partially_masked_smem);
+#if 0
+                    if (threadIdx.x == 128) {
+                      printf("blockIdx.x:%d after mma\n", blockIdx.x);
+                    }
+#endif
                 } else {  // mma_pv might not compile if !LargeHeadDimV
                     if (warp_group_idx == 1) {
                         tile_valid = mainloop.mma(
