@@ -981,6 +981,7 @@ struct CollectiveMainloopFwdSm90 {
           }
           cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
           valid_n_block_num += s_prefix_sum[2];
+          cutlass::arch::NamedBarrier::sync(threads_num, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
         }
       }
       n_block_smem_[valid_n_block_num] = end_flag;
