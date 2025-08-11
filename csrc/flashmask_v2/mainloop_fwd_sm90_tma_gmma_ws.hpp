@@ -1206,7 +1206,7 @@ struct CollectiveMainloopFwdSm90 {
                   asm volatile("cp.async.wait_group 0;\n" ::);
 //                  cutlass::arch::NamedBarrier::sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskLoad));
                 }
-                pipeline_flashmask_apply.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                pipeline_flashmask_apply.producer_commit(smem_pipe_write);
             }
         };
 
