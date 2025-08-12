@@ -233,45 +233,42 @@ public:
             // }
 
             int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
-            if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
-                PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
-                PipelineState_dO smem_pipe_write_do = cutlass::make_producer_start_state<MainloopPipeline_dO>();
-                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler);
-                     work_tile_info.is_valid(params.scheduler);
-                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)) {
-                    auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-                    cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
-                        scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-                    };
-                    mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                    mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
-                                  smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,flashmask_smem_);
-                    // mainloop.wait_for_load_n_block_info();
+            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler);
+                 work_tile_info.is_valid(params.scheduler);
+                 work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)) {
+                auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+                auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+                cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
+                    PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
+                    PipelineState_dO smem_pipe_write_do = cutlass::make_producer_start_state<MainloopPipeline_dO>();
+//                        auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+//                        auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+//                        cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+                        auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
+                            scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                        };
+//                        mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                        mainloop.load(params.mainloop, pipeline_q, pipeline_do, smem_pipe_write,
+                                      smem_pipe_write_do, shared_storage, scheduler_prefetch, block_coord,flashmask_smem_);
+//                        mainloop.wait_for_release_n_block_info();
+                    mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
+                } else if (warp_idx_in_warpgroup == 1) {
+//                        auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+//                        auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+//                        cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+//                        mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+                        mainloop.store_dq(params.mainloop, shared_storage, block_coord,flashmask_smem_);
+//                        mainloop.wait_for_release_n_block_info();
+                }else{
+//                        auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
+//                        auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
+//                        cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
+//                        mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
+//                        mainloop.wait_for_release_n_block_info();
                 }
-                mainloop.load_tail(pipeline_q, pipeline_do, smem_pipe_write, smem_pipe_write_do);
-            } else if (warp_idx_in_warpgroup == 1) {
-                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
-                     work_tile_info.is_valid(params.scheduler);
-                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
-                    auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-                    cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                    mainloop.store_dq(params.mainloop, shared_storage, block_coord,flashmask_smem_);
-                    mainloop.wait_for_load_n_block_info();
-                }
-            }else{
-                for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
-                     work_tile_info.is_valid(params.scheduler);
-                     work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
-                    auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
-                    auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
-                    cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                    mainloop.load_n_block_info(flashmask_smem_,flashmask_index_smem_,block_coord, params.mainloop);
-                    mainloop.wait_for_load_n_block_info();
-                }
+                mainloop.wait_for_release_n_block_info();
             }
         } else {  // Consumer
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
@@ -310,7 +307,7 @@ public:
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
                 }
-                mainloop.wait_for_load_n_block_info();
+                mainloop.release_n_block_info();
             }
             epilogue.store_tail();
         }

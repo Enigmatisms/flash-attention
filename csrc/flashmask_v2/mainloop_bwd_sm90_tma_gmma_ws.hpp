@@ -537,12 +537,25 @@ struct CollectiveMainloopBwdSm90 {
         if(thread_idx < kBlockN) flashmask_index_smem_[thread_idx + 3 * kBlockN] = is_oob ? INT_MAX : (params.ut_end_ptr == nullptr ? (params.ut_start_ptr == nullptr? INT_MIN :INT_MAX) : params.ut_end_ptr[thread_idx + row_offset]);
         // if(thread_idx < kBlockN) if(bidb ==1 and bidh == 0) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d\n", thread_idx,bidb,bidh,n_block,thread_idx + row_offset-seqlen,thread_idx,flashmask_index_smem_[thread_idx + 3 * kBlockN]);
             // if(bidb ==0 and (bidh == 0 or bidh == 2) and n_block * kBlockN + i < seqlen and params.ut_end_ptr != nullptr) printf("threadidx: %d,bidb: %d,bidh: %d,n_block: %d, row_offset: %d, ut_end_flashmask_index_smem_%d: %d, params.ut_end_ptr_val: %d, params.ut_end_ptr_ptr: %p\n", thread_idx,bidb,bidh,n_block,row_offset,i,flashmask_index_smem_[i + 3 * kBlockN],params.ut_end_ptr[i + row_offset],params.ut_end_ptr + i + row_offset);
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
+        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskProducer) /*id*/);
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskFull) /*id*/);
         // printf("pass\n");
     }
+
+    CUTLASS_DEVICE
+    void release_n_block_info() {
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskEmpty) /*id*/);
+    }
+
     CUTLASS_DEVICE
     void wait_for_load_n_block_info(){
-        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskFull) /*id*/);
+    }
+
+
+    CUTLASS_DEVICE
+    void wait_for_release_n_block_info() {
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::FlashmaskEmpty) /*id*/);
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -710,7 +723,7 @@ struct CollectiveMainloopBwdSm90 {
             }
         }
         scheduler_prefetch(); //xiehaoyang: add sync?
-         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
+//         cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp * 4, static_cast<uint32_t>(BwdNamedBarriers::Flashmask) /*id*/);
         if constexpr (Q_dO_same_stages) { smem_pipe_write_do = smem_pipe_write; }
     }
 
