@@ -23,14 +23,14 @@ struct BlockMN {
         if constexpr (Is_causal || Is_local) {
             int m_idx_max = (m_block + 1) * kBlockM;
             // TODO: check off-by-1 error
-            if (PackGQA) { m_idx_max = qhead_per_khead_divmod.divide(m_idx_max - 1) + 1 ; }
+            if constexpr (PackGQA) { m_idx_max = qhead_per_khead_divmod.divide(m_idx_max - 1) + 1 ; }
             n_block_max = std::min(n_block_max,
                                    cute::ceil_div(m_idx_max + seqlen_k - seqlen_q + window_size_right, kBlockN));
         }
         int n_block_min = 0;
         if constexpr (Is_local) {
             int m_idx_min = m_block * kBlockM;
-            if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
+            if constexpr (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
             n_block_min = std::max(int(0), (m_idx_min + seqlen_k - seqlen_q - window_size_left) / kBlockN);
         }
         // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }

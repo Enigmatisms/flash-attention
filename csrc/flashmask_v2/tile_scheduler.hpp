@@ -304,7 +304,7 @@ public:
     void
     prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
         // only producer will call this method
-        if (threadIdx.x == 96) {    // hard-coded, since n_block producer threads are in [32, 128)
+        if (threadIdx.x == NumProducerThreads) {    // hard-coded, since n_block producer threads are in [32, 128)
             // the next job we are going to process: number of currently blocks done
             current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1);
         }
@@ -318,7 +318,7 @@ public:
             // only threadIdx.x == 96 has the correct `current_work.tile_idx` (see prefetch next_work)
             // so there is no need to use shfl_sync to broadcast. Also shfl cannot broadcast across warps
             flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-            if (threadIdx.x == 96) {    // hard-coded, since n_block producer threads are in [32, 128)
+            if (threadIdx.x == NumProducerThreads) {    // hard-coded, since n_block producer threads are in [32, 128)
                 *tile_count_smem = current_work.tile_idx;
             }
             flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
