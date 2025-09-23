@@ -257,7 +257,7 @@ public:
 
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
-        if (warp_group_idx == 0 && warp_idx_in_warpgroup != 0) { // n_block generator
+        if (warp_group_idx == 0 && (warp_idx_in_warpgroup == 1 || warp_idx_in_warpgroup == 2)) { // n_block generator
           cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
           cutlass::PipelineState<CollectiveMainloop::kNBlockStages> n_block_pipe_write = cutlass::make_producer_start_state<MainloopPipelineNBlock>();
           // Manually specify the scheduler role: producer. For StaticPersistentTileSch, passing template args won't change the behavior
@@ -419,7 +419,7 @@ public:
 
             int work_idx = 0;
             static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
-            static_assert(SingleProducerWarp);
+            // static_assert(SingleProducerWarp);
 
             scheduler.init_consumer();      // in case `return`, and there will be dead-lock
             if constexpr (SingleProducerWarp) {

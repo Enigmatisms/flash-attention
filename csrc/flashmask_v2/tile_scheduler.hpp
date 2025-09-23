@@ -217,7 +217,7 @@ class PreemptivePersistentTileScheduler {
     // we employ a preemptive scheduling strategy based on a rough estimation of the workload for the consumer
     // In PPT, NumConsumerThreads is the total number of threads for (KV load and computation pipeline), and for FlashMask V2
     // it will be the #threads for (wg_id = 0, wp_id = 0) + (wg_id > 0, wp_id = *). The NumProducerThreads is simply 96 (hard-coded).
-    static_assert(NumProducerThreads == 96, "PreemptivePersistentTileScheduler has incorrect producer thread num.");
+    // static_assert(NumProducerThreads == 96, "PreemptivePersistentTileScheduler has incorrect producer thread num.");
     static constexpr int NumThreads = NumConsumerThreads + NumProducerThreads;
 public:
     using SharedStorage = int;

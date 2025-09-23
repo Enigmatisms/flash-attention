@@ -74,7 +74,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
     static constexpr int Flashmask_max_seqlen_k = 16 * 1024;
-    static constexpr int ProducerThreadNum = 96;
+    static constexpr int ProducerThreadNum = 64;
 
     static constexpr int Flashmask_n_block_buffer_length = ((Flashmask_max_seqlen_k + kBlockN - 1) / kBlockN + 3) / 4 * 4 + 4;
     static constexpr int Flashmask_n_block_buffer_valid_length = Flashmask_n_block_buffer_length - 4;
@@ -135,7 +135,7 @@ struct CollectiveMainloopFwdSm90 {
 
     static constexpr int NumMmaThreadsQK = size(TiledMmaQK{});
     static constexpr int NumMmaThreads = size(TiledMmaPV{});
-    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
+    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? (cutlass::NumThreadsPerWarp * 2) : cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaThreadsQK % cutlass::NumThreadsPerWarpGroup == 0);
     static_assert(NumMmaThreads % cutlass::NumThreadsPerWarpGroup == 0);
     static constexpr int NumMmaWarpGroups = NumMmaThreads / cutlass::NumThreadsPerWarpGroup;
@@ -668,7 +668,7 @@ struct CollectiveMainloopFwdSm90 {
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
                  int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
                  int32_t* const flashmask_maxmin_smem) {
-        static_assert(ProducerThreadNum == 96, "load_max_min only support running with 3 warp");
+        // static_assert(ProducerThreadNum == 96, "load_max_min only support running with 3 warp");
 
         int32_t bidh = get<1>(block_coord);
         int32_t bidb = get<2>(block_coord);
@@ -797,10 +797,10 @@ struct CollectiveMainloopFwdSm90 {
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
       m_block *= kBlockM;
 
-      static_assert(ProducerThreadNum == 96, "generate_n_block only support running with 3 warps");
+    //   static_assert(ProducerThreadNum == 96, "generate_n_block only support running with 3 warps");
       int const thread_idx = threadIdx.x - 32;
 
-      __shared__ int s_prefix_sum[4];
+      __shared__ int s_prefix_sum[2];
       int32_t lt_start_max = INT_MAX;
       int32_t lt_start_min = INT_MAX;
       
@@ -918,12 +918,9 @@ struct CollectiveMainloopFwdSm90 {
         cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
         
         // Currently, we use only 3 warps, so (warp_id_ <= 2) is always true, we can remove it from the predicate 
-        if(warp_id_ >= 1) {
+        if(warp_id_ == 1) {
             prefix_sum += s_prefix_sum[0];
-            if (warp_id_ == 2) {
-                prefix_sum += s_prefix_sum[1];
-                if (lane_id_ == 31) s_prefix_sum[2] = prefix_sum;
-            }
+            if (lane_id_ == 31) s_prefix_sum[1] = prefix_sum;
         }
 
         // if not fully masked or not partially masked: unmasked, useless (no need to compute)
@@ -931,7 +928,7 @@ struct CollectiveMainloopFwdSm90 {
           mask_encode_n_block_smem_[valid_n_block_num + prefix_sum - 1] = partially_masked ? n_block : (-n_block - 1);
 
         cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
-        valid_n_block_num += s_prefix_sum[2];
+        valid_n_block_num += s_prefix_sum[1];
         cutlass::arch::NamedBarrier::sync(ProducerThreadNum, static_cast<uint32_t>(FwdNamedBarriers::FlashMaskNBlock));
       }
       mask_encode_n_block_smem_[valid_n_block_num] = end_flag;

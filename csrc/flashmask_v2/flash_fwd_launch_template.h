@@ -61,7 +61,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
-    static constexpr int _NumProducerThreads = cutlass::NumThreadsPerWarpGroup - cutlass::NumThreadsPerWarp;      // expect: 96
+    static constexpr int _NumProducerThreads = cutlass::NumThreadsPerWarpGroup - cutlass::NumThreadsPerWarp * 2;      // expect: 96
     static constexpr int _NumConsumerThreads = CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarpGroup - _NumProducerThreads;    // expect: 384 - 96
     using Scheduler = std::conditional_t<
         Arch >= 90,
