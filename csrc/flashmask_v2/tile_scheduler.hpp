@@ -306,7 +306,7 @@ public:
         // only producer will call this method
         if (threadIdx.x == NumProducerThreads) {    // hard-coded, since n_block producer threads are in [32, 128)
             // the next job we are going to process: number of currently blocks done
-            current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1);
+            *tile_count_smem = atomicAdd(params.tile_count_semaphore, 1);
         }
     }
 
@@ -318,13 +318,10 @@ public:
             // only threadIdx.x == 96 has the correct `current_work.tile_idx` (see prefetch next_work)
             // so there is no need to use shfl_sync to broadcast. Also shfl cannot broadcast across warps
             flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
-            if (threadIdx.x == NumProducerThreads) {    // hard-coded, since n_block producer threads are in [32, 128)
-                *tile_count_smem = current_work.tile_idx;
-            }
+            int tile_idx = *tile_count_smem;
             flash::named_barrier_arrive(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             // Sync all the producers in case some of the producers return before the smem is updated
-            flash::named_barrier_sync(NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::NBlockProducer) /*id*/);
-            return {*tile_count_smem};
+            return {tile_idx};
         } else {
             flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
             int tile_idx = *tile_count_smem;
@@ -332,7 +329,6 @@ public:
             return {tile_idx};
         }
     }
-
 };
 
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
