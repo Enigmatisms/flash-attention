@@ -1418,15 +1418,16 @@ struct CollectiveMainloopFwdSm90 {
 
   template <typename TiledMma, PtrExistDispatchTag tag, typename Engine, typename Layout>
   CUTLASS_DEVICE
-  void flashmask_apply(Tensor<Engine, Layout> &tSrS, int m_block, int const thread_idx, int const index, int32_t* const flashmask_smem_,
-                       int32_t* const lt_start_ptr, int32_t* const lt_end_ptr,
-                       int32_t* const ut_start_ptr, int32_t* const ut_end_ptr) {
+  void flashmask_apply(Tensor<Engine, Layout> &tSrS, int m_block, int const thread_idx, 
+                       int const index, int32_t* const __restrict__ flashmask_smem_,
+                       int32_t* const __restrict__ lt_start_ptr, int32_t* const __restrict__ lt_end_ptr,
+                       int32_t* const __restrict__ ut_start_ptr, int32_t* const __restrict__ ut_end_ptr) {
       auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
 
-      Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-      Tensor tScS = thread_mma.partition_C(cS);
       Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
-      Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+      Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+      const Tensor tScS = thread_mma.partition_C(std::move(cS));
+      const Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
 
       static constexpr int Row = 0, Col = 1;
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -1452,14 +1453,17 @@ struct CollectiveMainloopFwdSm90 {
         #pragma unroll
         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
             int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
-            int lts = s_lt_start[col_idx] - m_block;
-            int lte = s_lt_end[col_idx] - m_block;
-            int uts = s_ut_start[col_idx] - m_block;
-            int ute = s_ut_end[col_idx] - m_block;
+            int lts = s_lt_start[col_idx];
+            int uts = s_ut_start[col_idx];
+            const uint32_t lt_diff = s_lt_end[col_idx] - lts;
+            const uint32_t ut_diff = s_ut_end[col_idx] - uts;
+            lts -= m_block;
+            uts -= m_block;
             #pragma unroll
             for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                 int const row_idx = get<Row>(tScS_rowcol(m, n));
-                if((row_idx >= lts && row_idx < lte) || (row_idx >= uts && row_idx < ute))
+                if ((static_cast<uint32_t>(row_idx - lts) < lt_diff) | 
+                    (static_cast<uint32_t>(row_idx - uts) < ut_diff))
                     tSrS_rowcol(m, n) = -INFINITY;
             }
         }
@@ -1469,12 +1473,13 @@ struct CollectiveMainloopFwdSm90 {
             #pragma unroll
             for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                 int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
-                int lts = s_lt_start[col_idx] - m_block;
-                int lte = s_lt_end[col_idx] - m_block;
+                int lts = s_lt_start[col_idx];
+                uint32_t lt_diff = s_lt_end[col_idx] - lts;
+                lts -= m_block;
                 #pragma unroll
                 for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                     int const row_idx = get<Row>(tScS_rowcol(m, n));
-                    if(row_idx >= lts && row_idx < lte)
+                    if(static_cast<uint32_t>(row_idx - lts) < lt_diff)
                         tSrS_rowcol(m, n) = -INFINITY;
                 }
             }
@@ -1483,12 +1488,13 @@ struct CollectiveMainloopFwdSm90 {
             #pragma unroll
             for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                 int const col_idx = get<Col>(tScS_rowcol(_0{}, n)); // col_idx within a block
-                int lts = s_lt_start[col_idx] - m_block;
-                int ute = s_ut_end[col_idx] - m_block;
+                int lts = s_lt_start[col_idx];
+                const uint32_t ul_diff = s_ut_end[col_idx] - lts;
+                lts -= m_block;
                 #pragma unroll
                 for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                     int const row_idx = get<Row>(tScS_rowcol(m, n));
-                    if((row_idx >= lts) || (row_idx < ute))
+                    if (static_cast<uint32_t>(row_idx - lts) < ul_diff)
                         tSrS_rowcol(m, n) = -INFINITY;
                 }
             }
