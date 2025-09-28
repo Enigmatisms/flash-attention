@@ -356,7 +356,7 @@ protected:
     SharedStorage* const tile_count_smem;
     uint32_t sch_stage_;
 public:
-    static constexpr int BLOCK_ID = 0;
+    static constexpr int BLOCK_ID = 8;
     // Device side kernel params
 
     struct Params {
@@ -484,10 +484,10 @@ public:
             // if (threadIdx.x == 0) {
             //     printf("[Block: %d] Consumer Syncing: barrier id = %u, sch_stage_ = %u\n", blockIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1), sch_stage_);
             // }
-            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1) /*id*/);
             if (threadIdx.x == NumConsumerThreads) {    // thread 288 hard-coded, since n_block consumer threads are in [128, 384)
                 tile_count_smem[sch_stage_] = atomicAdd(params.tile_count_semaphore, 1);
             }
+            flash::named_barrier_sync(NumThreads, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) + (sch_stage_ << 1) /*id*/);
             if (blockIdx.x == BLOCK_ID) {
                 printf("[Arr] Consumer Thread %03d arrive: barrier id = %u, sch_stage_ = %u\n", threadIdx.x, static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) + (sch_stage_ << 1), sch_stage_);
             }

@@ -336,6 +336,9 @@ public:
           if (blockIdx.x == TileScheduler::BLOCK_ID) {
                 printf("[End Producer] ThreadIdx.x: %03d / %03d, All work for nblock end.\n", threadIdx.x, params.scheduler.total_blocks);
           }
+          if (threadIdx.x == 0) {
+                printf("[Notify] End NBlock. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
+            }
         } else {
           // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
           PipelineParamsK pipeline_params_k;
@@ -473,6 +476,9 @@ public:
             if (blockIdx.x == TileScheduler::BLOCK_ID) {
                 printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for KV load end.\n", threadIdx.x, params.scheduler.total_blocks);
             }
+            if (threadIdx.x == 0) {
+                printf("[Notify] End KV load. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
+            }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
             // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
@@ -545,6 +551,9 @@ public:
             }
             if (blockIdx.x == TileScheduler::BLOCK_ID) {
                 printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for MMA end.\n", threadIdx.x, params.scheduler.total_blocks);
+            }
+            if (threadIdx.x == 128) {
+                printf("[Notify] End MMA. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
             }
             epilogue.store_tail();
         }
