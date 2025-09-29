@@ -274,9 +274,9 @@ public:
                work_tile_info.is_valid(params.scheduler); 
                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
           ) {
-              if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                printf("[B0 Producer] new work: %d, counter: %d, threadIdx.x: %03d, stage: %d\n", work_tile_info.tile_idx, counter ++, threadIdx.x, scheduler.stage());
-              }
+            //   if (blockIdx.x == TileScheduler::BLOCK_ID) {
+            //     printf("[B0 Producer] new work: %d, counter: %d, threadIdx.x: %03d, stage: %d\n", work_tile_info.tile_idx, counter ++, threadIdx.x, scheduler.stage());
+            //   }
               auto block_coord = work_tile_info.get_block_coord(params.scheduler);
               int const m_block = get<0>(block_coord);
               int const bidh = get<1>(block_coord);
@@ -333,12 +333,12 @@ public:
               // the workload of computation pipeline, but I think it is good enough.
               scheduler.prefetch_next_work(params.scheduler, work_tile_info);
           }
-          if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                printf("[End Producer] ThreadIdx.x: %03d / %03d, All work for nblock end.\n", threadIdx.x, params.scheduler.total_blocks);
-          }
-          if (threadIdx.x == 0) {
-                printf("[Notify] End NBlock. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
-            }
+        //   if (blockIdx.x == TileScheduler::BLOCK_ID) {
+        //         printf("[End Producer] ThreadIdx.x: %03d / %03d, All work for nblock end.\n", threadIdx.x, params.scheduler.total_blocks);
+        //   }
+        //   if (threadIdx.x == 0) {
+        //         printf("[Notify] End NBlock. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
+        //     }
         } else {
           // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
           PipelineParamsK pipeline_params_k;
@@ -454,9 +454,9 @@ public:
                 // if (threadIdx.x == 0) {
                 //     printf("[Block: %03d/%03d] Current work_tile_info: %d, counter: %d, sch stage: %u\n", blockIdx.x, gridDim.x, work_tile_info.tile_idx, counter, scheduler.stage());
                 // }
-                if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                    printf("[B0 Consumer KV Load] Thread: %03d, Current work_tile_info: %d / %d, counter: %d, sch stage: %u\n", threadIdx.x, work_tile_info.tile_idx, params.scheduler.total_blocks, counter, scheduler.stage());
-                }
+                // if (blockIdx.x == TileScheduler::BLOCK_ID) {
+                //     printf("[B0 Consumer KV Load] Thread: %03d, Current work_tile_info: %d / %d, counter: %d, sch stage: %u\n", threadIdx.x, work_tile_info.tile_idx, params.scheduler.total_blocks, counter, scheduler.stage());
+                // }
                 counter ++;
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 SeqlenInfo_t seqlen_info{
@@ -473,12 +473,12 @@ public:
                               shared_storage, seqlen_info, block_coord, work_idx,
                               flashmask_smem_, n_block_smem, cppl_stage);
             }
-            if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for KV load end.\n", threadIdx.x, params.scheduler.total_blocks);
-            }
-            if (threadIdx.x == 0) {
-                printf("[Notify] End KV load. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
-            }
+            // if (blockIdx.x == TileScheduler::BLOCK_ID) {
+            //     printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for KV load end.\n", threadIdx.x, params.scheduler.total_blocks);
+            // }
+            // if (threadIdx.x == 0) {
+            //     printf("[Notify] End KV load. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
+            // }
             mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx);
         } else {  // Consumer
             // cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
@@ -500,9 +500,9 @@ public:
                  work_tile_info.is_valid(params.scheduler);
                  // get_next_work will be called before the epilogue
                  ) {
-                if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                    printf("[B0 Consumer MMA] Thread: %03d, Current work_tile_info: %d / %d, counter: %d, sch stage: %u\n", threadIdx.x, work_tile_info.tile_idx, params.scheduler.total_blocks, counter++, scheduler.stage());
-                }
+                // if (blockIdx.x == TileScheduler::BLOCK_ID) {
+                //     printf("[B0 Consumer MMA] Thread: %03d, Current work_tile_info: %d / %d, counter: %d, sch stage: %u\n", threadIdx.x, work_tile_info.tile_idx, params.scheduler.total_blocks, counter++, scheduler.stage());
+                // }
                 auto block_coord = work_tile_info.get_block_coord(params.scheduler);
                 int const bidb = get<2>(block_coord);
                 SeqlenInfo_t seqlen_info{
@@ -549,12 +549,12 @@ public:
                     epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
                 }
             }
-            if (blockIdx.x == TileScheduler::BLOCK_ID) {
-                printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for MMA end.\n", threadIdx.x, params.scheduler.total_blocks);
-            }
-            if (threadIdx.x == 128) {
-                printf("[Notify] End MMA. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
-            }
+            // if (blockIdx.x == TileScheduler::BLOCK_ID) {
+            //     printf("[End Consumer] ThreadIdx.x: %03d / %03d, All work for MMA end.\n", threadIdx.x, params.scheduler.total_blocks);
+            // }
+            // if (threadIdx.x == 128) {
+            //     printf("[Notify] End MMA. BlockIdx.x: %03d / %03d\n", blockIdx.x, gridDim.x);
+            // }
             epilogue.store_tail();
         }
       }
