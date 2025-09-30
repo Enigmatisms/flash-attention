@@ -47,6 +47,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
+    // if true: use Dual PPTX, else, use PPT
+    static constexpr int Use_Scheduler_Pipeline = true;
+
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
@@ -62,10 +65,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
     static constexpr int _NumProducerThreads = cutlass::NumThreadsPerWarpGroup - cutlass::NumThreadsPerWarp;      // expect: 96
-    static constexpr int _NumConsumerThreads = CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarpGroup - _NumProducerThreads;    // expect: 384 - 96
+    static constexpr int _NumConsumerThreads = CollectiveMainloop::NumMmaThreads + cutlass::NumThreadsPerWarpGroup - _NumProducerThreads;       // expect: 384 - 96
     using Scheduler = std::conditional_t<
         Arch >= 90,
-        flash::PreemptivePersistentTileScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
+        std::conditional_t<
+            Use_Scheduler_Pipeline,
+            flash::DualPreemptivePersistentTileExecutionScheduler<_NumConsumerThreads, _NumProducerThreads, Split>,
+            flash::PreemptivePersistentTileScheduler<_NumConsumerThreads, _NumProducerThreads, Split>
+        >,
         flash::StaticPersistentTileScheduler<Split>
     >;
 
@@ -155,7 +162,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     };
 
     if constexpr (Arch >= 90) {
-        prepare_preemptive_scheduler(params, stream, params.num_sm);
+        prepare_preemptive_scheduler(params, stream, params.num_sm, Scheduler::pipelining);
     }
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
