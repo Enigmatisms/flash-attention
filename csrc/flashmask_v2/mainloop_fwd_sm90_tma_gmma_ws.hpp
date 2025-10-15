@@ -679,9 +679,8 @@ struct CollectiveMainloopFwdSm90 {
         // change this to num_chunk * chunk_size (should be Flashmask_n_block_buffer_length)
         const int chunks_size = total_num_chunks * Flashmask_n_block_buffer_length;
 
-        // offset is the multiple of 32, and here we use forward traversing
         const int offset = (bidb * params.h_flashmask + bidh / params.h_h_flashmask_ratio) * chunks_size +
-                    reverse_chunk_idx * Flashmask_n_block_buffer_length;
+                    (chunks_size - (reverse_chunk_idx + 1) * Flashmask_n_block_buffer_length);
 
         const int thread_idx = threadIdx.x - 32;
         const int length = Flashmask_n_block_buffer_valid_length < nblock_seqlen ? Flashmask_n_block_buffer_valid_length : nblock_seqlen;
@@ -752,6 +751,7 @@ struct CollectiveMainloopFwdSm90 {
                      SeqlenInfo_t const& seqlen_info,
                      cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
                      int32_t reverse_chunk_idx, // reverse_chunk_idx, start from right to left: [5, 4, 3, 2, 1, 0]
+                     int32_t total_num_chunks,
                      int32_t end_flag,
                      int32_t* const flashmask_maxmin_smem,
                      int32_t* const mask_encode_n_block_smem_,
@@ -808,13 +808,12 @@ struct CollectiveMainloopFwdSm90 {
       }
       
       int32_t valid_n_block_num = 0;
-      const int32_t base_offset = reverse_chunk_idx * Flashmask_n_block_buffer_valid_length;
+      const int32_t base_offset = (total_num_chunks - 1 - reverse_chunk_idx) * Flashmask_n_block_buffer_valid_length;
 
       // explanation for the loop condition:
       // -2, -1,  0,  1,  2
       // t4, t3, t2, t1, t0
       // although t4 and t3 are oob, they should not exit the loop, otherwise, the prefix-sum inside the loop will hang, just keep a default value is fine
-      // TODO(heqianyue): if using forward chunking, we can use forwad traversal, which simplifies the loop condition 
       for(int32_t idx = Flashmask_n_block_buffer_valid_length - 1 - thread_idx % ProducerThreadNum; 
           idx >= (0 - (ProducerThreadNum - Flashmask_n_block_buffer_valid_length % ProducerThreadNum)); idx -= ProducerThreadNum
       ) {
