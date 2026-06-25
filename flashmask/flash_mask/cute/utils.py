@@ -673,6 +673,37 @@ def domain_offset_aligned(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, i
 
 
 @dsl_user_op
+def make_gmem_tensor_from_addr(
+    addr: int,
+    shape,
+    stride,
+    dtype: Type[cutlass.Numeric],
+    *,
+    align: int = 16,
+    loc=None,
+    ip=None,
+) -> cute.Tensor:
+    """Wrap a raw global-memory device address as a cute.Tensor (zero-copy).
+
+    This does NOT allocate or own any memory. It only describes an existing
+    device pointer (e.g. an FM-4 overlap SRBuffer pointer returned across the
+    C-ABI boundary as an int) with the given layout so cute kernels can read or
+    write it like any other gmem tensor. Data readiness is a separate concern,
+    enforced upstream by events/semaphores, not by this view.
+
+    Args:
+        addr: device pointer as a plain Python int (must be a valid pointer on
+            the current CUDA device).
+        shape: tensor shape, e.g. (B, S, H, D).
+        stride: tensor stride in elements, e.g. (S*H*D, H*D, D, 1).
+        dtype: element type, e.g. cutlass.BFloat16.
+        align: assumed alignment in bytes for the base pointer (default 16).
+    """
+    ptr = cute.make_ptr(dtype, addr, cute.AddressSpace.gmem, assumed_align=align)
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+
+
+@dsl_user_op
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
