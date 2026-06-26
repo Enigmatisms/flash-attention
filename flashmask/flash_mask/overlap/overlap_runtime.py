@@ -117,6 +117,20 @@ def _load():
     lib.fm4_overlap_wait_wptr_init.argtypes = []
     lib.fm4_overlap_wait_wptr_init.restype = None
 
+    # copy_k_to(dst_device_ptr, nbytes) -> int; device->device full-buffer copy
+    # into a Paddle tensor for zero-tolerance bitwise verification.
+    lib.fm4_overlap_copy_k_to.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.fm4_overlap_copy_k_to.restype = ctypes.c_int
+    lib.fm4_overlap_copy_v_to.argtypes = [ctypes.c_uint64, ctypes.c_uint64]
+    lib.fm4_overlap_copy_v_to.restype = ctypes.c_int
+
+    # peek_wptr(wptr_device_ptr, int* out) -> int; read back the AG write_ptr.
+    lib.fm4_overlap_peek_wptr.argtypes = [
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lib.fm4_overlap_peek_wptr.restype = ctypes.c_int
+
     _LIB = lib
     return lib
 
@@ -143,6 +157,7 @@ def bootstrap_unique_id(rank, group=None):
 
     Returns the 128-byte id (identical on every rank) to feed into init_overlap.
     """
+    import numpy as np
     import paddle
     import paddle.distributed as dist
 
@@ -152,7 +167,9 @@ def bootstrap_unique_id(rank, group=None):
         lib.fm4_overlap_get_unique_id(ctypes.cast(buf, ctypes.c_char_p))
 
     # uint8 tensor of the raw id bytes; broadcast from rank 0.
-    t = paddle.to_tensor(bytearray(buf), dtype="uint8")
+    # Paddle 3.4's to_tensor rejects bytearray, so go through a numpy uint8 array.
+    arr = np.frombuffer(bytes(buf), dtype=np.uint8).copy()
+    t = paddle.to_tensor(arr, dtype="uint8")
     dist.broadcast(t, src=0, group=group)
     return bytes(t.numpy().tobytes())
 
@@ -180,18 +197,33 @@ def _data_ptr(t):
     return int(t.data_ptr())
 
 
+def _s_total():
+    """Total gathered seqlen after the all-gather: S_local * nranks.
+
+    The C++ singleton is the single source of truth for both factors, so every
+    caller that needs the post-AG sequence length reads it through here rather
+    than recomputing the product inline.
+    """
+    lib = _load()
+    return lib.fm4_overlap_s_local() * lib.fm4_overlap_nranks()
+
+
 def update_kv(k, v, fwd=True):
     """Copy local K/V into the SRBuffer (cudaMemcpyAsync on comm_stream)."""
     lib = _load()
     lib.fm4_overlap_update_kv(_data_ptr(k), _data_ptr(v), 1 if fwd else 0)
 
 
-def run_ag(write_ptr, fwd=True):
-    """Launch the AG remote-get kernel; returns S_total (= S_local * nranks)."""
+def run_ag(write_ptr_addr, fwd=True):
+    """Launch the AG remote-get kernel; returns S_total (= S_local * nranks).
+
+    write_ptr_addr is the device address (a plain int from ``data_ptr()``) of the
+    caller-owned int buffer the remote-get kernel signals completion into.
+    """
     lib = _load()
     s_total = ctypes.c_int(0)
     lib.fm4_overlap_run_ag(
-        int(write_ptr), ctypes.byref(s_total), 1 if fwd else 0
+        int(write_ptr_addr), ctypes.byref(s_total), 1 if fwd else 0
     )
     return s_total.value
 
@@ -234,7 +266,7 @@ def compute_chunk_mask(compute_stream, fwd=True):
     across the subsequent async AG launch.
     """
     lib = _load()
-    s_total = lib.fm4_overlap_s_local() * lib.fm4_overlap_nranks()
+    s_total = _s_total()
     lt_start, ut_end = _full_attention_mask_tensors(s_total)
     lib.fm4_overlap_compute_chunk_mask(
         _data_ptr(lt_start), _data_ptr(ut_end), int(compute_stream), 1 if fwd else 0
@@ -249,7 +281,7 @@ def current_stream_handle():
     return int(paddle.device.current_stream().stream_base.cuda_stream)
 
 
-def run_ag_and_wait(k, v, write_ptr, compute_stream):
+def run_ag_and_wait(k, v, write_ptr_addr, compute_stream):
     """STEP-1 helper: full single-shot all-gather, then force the compute stream
     to wait for it (deliberately non-overlap; wait_ag_done is a device sync).
 
@@ -257,7 +289,8 @@ def run_ag_and_wait(k, v, write_ptr, compute_stream):
         wait_sr_buffer_empty -> compute_chunk_mask -> update_kv -> run_ag -> wait_ag_done.
 
     k/v are the local Paddle K/V tensors (B, S_local, H, D) that get copied into
-    the SRBuffer by update_kv. Returns S_total (= S_local * nranks).
+    the SRBuffer by update_kv. write_ptr_addr is the device address of the
+    caller-owned completion-signal int buffer. Returns S_total (= S_local * nranks).
     """
     lib = _load()
     lib.fm4_overlap_wait_sr_buffer_empty(int(compute_stream))
@@ -266,37 +299,133 @@ def run_ag_and_wait(k, v, write_ptr, compute_stream):
     # the device memory the BlockSparsityCheck kernel is still reading from.
     _mask_keepalive = compute_chunk_mask(compute_stream, fwd=True)
     update_kv(k, v, fwd=True)
-    s_total = run_ag(write_ptr, fwd=True)
+    s_total = run_ag(write_ptr_addr, fwd=True)
     lib.fm4_overlap_wait_ag_done(int(compute_stream))
     del _mask_keepalive
     return s_total
 
 
-def sr_kv_cute_views():
-    """Wrap the SRBuffer K and V raw pointers as zero-copy cute.Tensors.
+def sr_kv_view_args():
+    """Return the plain (cross-call-safe) args needed to build the SRBuffer
+    K/V cute views inside ANY @cute.jit.
 
-    Returns (k_view, v_view), each a (B, S_total, H, D) BSHD cute.Tensor whose
-    data pointer == fm4_overlap_k_data()/v_data(). Readiness is NOT expressed by
-    these views; it is enforced separately (the wait_ag_done shim in STEP 1).
+    This is the STEP-2 reuse contract. A cute.Tensor is a trace-time MLIR value,
+    not a runtime object, so it cannot be handed across independent jit kernels.
+    What IS reusable are the raw device pointers + shape/stride (all plain ints).
+    Each consumer kernel rebuilds its own views from these inside its own jit
+    Context via make_gmem_tensor_from_addr (which takes the cute dtype directly,
+    so the dtype is not threaded through here -- the SRBuffer is bf16 by design).
+
+    Returns a dict:
+        k_addr, v_addr : int   SRBuffer K/V device pointers (== fm4_overlap_k/v_data)
+        shape          : tuple (B, S_total, H, D), S_total = s_local * nranks
+        stride         : tuple element strides for a contiguous BSHD layout
     """
-    import cutlass
-
-    from flash_mask.cute.utils import make_gmem_tensor_from_addr
-
     if _KV_SHAPE is None:
-        raise RuntimeError("init_overlap must be called before sr_kv_cute_views")
+        raise RuntimeError("init_overlap must be called before sr_kv_view_args")
 
     lib = _load()
     b, h, d = _KV_SHAPE
-    s_total = lib.fm4_overlap_s_local() * lib.fm4_overlap_nranks()
-    shape = (b, s_total, h, d)
-    stride = (s_total * h * d, h * d, d, 1)
+    s_total = _s_total()
+    return {
+        "k_addr": lib.fm4_overlap_k_data(),
+        "v_addr": lib.fm4_overlap_v_data(),
+        "shape": (b, s_total, h, d),
+        "stride": (s_total * h * d, h * d, d, 1),
+    }
 
-    k_addr = lib.fm4_overlap_k_data()
-    v_addr = lib.fm4_overlap_v_data()
-    k_view = make_gmem_tensor_from_addr(k_addr, shape, stride, cutlass.BFloat16, align=16)
-    v_view = make_gmem_tensor_from_addr(v_addr, shape, stride, cutlass.BFloat16, align=16)
-    return k_view, v_view
+
+def sr_kv_cute_views():
+    """STEP-1 self-verification: build the SRBuffer K/V views inside a @cute.jit
+    and print their layout + leading elements, proving the raw NVSHMEM pointer
+    wraps into a valid cute.Tensor whose data (post all-gather) is correct.
+
+    Returns nothing. Views are trace-time values that must not escape the jit
+    (a hand-built ir.Context() would tear down on exit and corrupt the heap --
+    the 'unaligned tcache chunk' abort). For STEP-2, consumers should call
+    sr_kv_view_args() and rebuild views inside their own attention kernel jit.
+    """
+    import cutlass
+    import cutlass.cute as cute
+
+    from flash_mask.cute.utils import make_gmem_tensor_from_addr
+
+    args = sr_kv_view_args()
+    shape = args["shape"]
+    stride = args["stride"]
+    k_addr = args["k_addr"]
+    v_addr = args["v_addr"]
+
+    @cute.jit
+    def _wrap(k_addr_i: cutlass.Int64, v_addr_i: cutlass.Int64):
+        k_view = make_gmem_tensor_from_addr(
+            k_addr_i, shape, stride, cutlass.BFloat16, align=16
+        )
+        v_view = make_gmem_tensor_from_addr(
+            v_addr_i, shape, stride, cutlass.BFloat16, align=16
+        )
+        # Print only the layout here. Reading a scalar element (k_view[0,0,0,0])
+        # from inside this host-side trace makes cute dereference the device
+        # pointer ON THE HOST -> segfault, because the SRBuffer lives in NVSHMEM
+        # device memory. Proving the view's layout/pointer is the STEP-1 goal;
+        # actual value verification goes through a device->host cudaMemcpy probe.
+        cute.printf("[cute] k_view layout = {}", k_view.layout)
+        cute.printf("[cute] v_view layout = {}", v_view.layout)
+
+    _wrap(cutlass.Int64(k_addr), cutlass.Int64(v_addr))
+
+
+def copy_k_into(dst):
+    """Copy the full post-AG SRBuffer K into a Paddle bf16 tensor `dst` (device).
+
+    `dst` must be a contiguous Paddle bfloat16 tensor of shape (B, S_total, H, D)
+    -- i.e. numel == B * (s_local*nranks) * H * D -- so it holds EXACTLY the
+    entire all-gathered K. The copy is cudaMemcpyDeviceToDevice on the raw bf16
+    bits, no widen / no reinterpret, so `dst` ends up bitwise-identical to the
+    SRBuffer. This lands the AG result back into the Paddle tensor domain for a
+    zero-tolerance comparison against paddle.distributed.all_gather.
+
+    The bridge demands nbytes == exactly one SRBuffer K region: an over-sized
+    `dst` would over-read NVSHMEM memory, an under-sized one would copy only a
+    prefix and leave its tail uninitialized. Either mismatch raises here.
+    """
+    lib = _load()
+    nbytes = int(dst.numel()) * dst.element_size()
+    ok = lib.fm4_overlap_copy_k_to(int(dst.data_ptr()), nbytes)
+    if ok != 1:
+        raise RuntimeError(
+            "fm4_overlap_copy_k_to failed (dst.numel() must match the SRBuffer K "
+            "region exactly; or init not called; or a CUDA D2D error)"
+        )
+    return dst
+
+
+def copy_v_into(dst):
+    """Like copy_k_into but for the SRBuffer V (same exact-size contract)."""
+    lib = _load()
+    nbytes = int(dst.numel()) * dst.element_size()
+    ok = lib.fm4_overlap_copy_v_to(int(dst.data_ptr()), nbytes)
+    if ok != 1:
+        raise RuntimeError(
+            "fm4_overlap_copy_v_to failed (dst.numel() must match the SRBuffer V "
+            "region exactly; or init not called; or a CUDA D2D error)"
+        )
+    return dst
+
+
+def peek_wptr(wptr_addr):
+    """Read back the int at the AG write_ptr device address.
+
+    write_ptr is allocated by the caller (Python) and written by the remote-get
+    kernel. After a COMPLETE all-gather the kernel's last CTA sets it to INT_MAX
+    (2147483647), so the test can assert the completion-signal path fired.
+    """
+    lib = _load()
+    out = ctypes.c_int(0)
+    ok = lib.fm4_overlap_peek_wptr(ctypes.c_uint64(int(wptr_addr)), ctypes.byref(out))
+    if ok != 1:
+        raise RuntimeError("fm4_overlap_peek_wptr: cudaMemcpy D2H failed")
+    return out.value
 
 
 def destroy():

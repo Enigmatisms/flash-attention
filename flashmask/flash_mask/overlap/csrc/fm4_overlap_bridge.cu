@@ -36,6 +36,17 @@ inline cudaStream_t as_stream(uint64_t handle) {
     return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(handle));
 }
 
+// Byte size of ONE of the SRBuffer's K / V regions, cached at init and used to
+// bound the device->device copies below. The SRBuffer holds K and V back-to-back
+// in a single nvshmem_malloc slab (sr_buffer.cuh:50-55); a copy whose nbytes
+// differs from this region would either over-read into V / the semaphore area /
+// past the symmetric heap, or under-read and leave the destination tail
+// uninitialized. The value is OverlapConfig::sr_buffer_numel() (= the active K ==
+// V region in elements, overlap_comm.cuh:29-30) times sizeof(bf16). 0 until
+// fm4_overlap_init runs, so any copy attempted before init is rejected. Single
+// process-local value, like the C++ singleton.
+size_t g_sr_region_bytes = 0;
+
 }  // namespace
 
 extern "C" {
@@ -78,6 +89,29 @@ int fm4_overlap_init(int b_kv, int s_kv, int h_kv, int d_kv,
         b_kv, s_kv, h_kv, d_kv,
         rank, nranks,
         unique_id, mask_head);
+    // STEP-1 second-line probe: read the freshly-built singleton back out and
+    // print it from the bridge side. This corroborates the constructor's own
+    // print: if the singleton were null or the SRBuffer were not allocated,
+    // these calls would crash instead of printing valid values.
+    auto& c = flashmask::comm::singleton();
+    // Cache the byte size of ONE SRBuffer K (or V) region for the copy bounds
+    // checks below. Rather than re-deriving the layout formula here (B*S_local*
+    // H*D*nranks) -- which would be a third copy of an invariant the
+    // communicator already owns, and would mix the Python init-args b/h/d with
+    // the singleton's NVSHMEM-derived accessors -- we read it straight from the
+    // single source of truth: OverlapConfig::sr_buffer_numel()
+    // (overlap_comm.cuh:29-30), reached via the public current_config()
+    // accessor (overlap_comm.cuh:90). This tracks the logically-active region
+    // (== the K and == the V region size), not the *1.5-padded capacity left
+    // behind by a reconfigure growth, which is exactly the bound a full-region
+    // copy must respect.
+    g_sr_region_bytes = c.current_config().sr_buffer_numel() * sizeof(bf16);
+    printf("[FM4-bridge] init done: in_rank=%d in_nranks=%d -> "
+           "singleton s_local=%d nranks=%d K=%p V=%p\n",
+           rank, nranks, c.s_local(), c.nranks(),
+           reinterpret_cast<void*>(c.k_data()),
+           reinterpret_cast<void*>(c.v_data()));
+    fflush(stdout);
     return 1;
 }
 
@@ -100,6 +134,74 @@ uint64_t fm4_overlap_k_data() {
 
 uint64_t fm4_overlap_v_data() {
     return reinterpret_cast<uint64_t>(flashmask::comm::singleton().v_data());
+}
+
+// Copy the whole SRBuffer K (post all-gather) into a caller-provided DEVICE
+// buffer via cudaMemcpyDeviceToDevice. dst_dev_ptr is a device pointer (e.g. a
+// Paddle bf16 tensor's data_ptr) sized to hold `nbytes`. bf16 bits are copied
+// verbatim -- no widen, no reinterpret -- so the destination tensor ends up
+// holding the exact AG result for a zero-tolerance bitwise comparison against
+// paddle.distributed.all_gather. A cudaDeviceSynchronize first ensures the AG /
+// forced-wait has fully landed. Returns 1 on success, 0 on failure.
+//
+// nbytes is supplied by Python (dst.numel()*2). It MUST equal exactly one
+// SRBuffer K/V region (g_sr_region_bytes, cached at init). We reject any other
+// value: the K and V regions sit back-to-back in a single nvshmem_malloc slab
+// followed by the semaphore area (sr_buffer.cuh:50-55), so an over-sized copy
+// would read past K into V / the semaphores / past the symmetric heap, while an
+// under-sized copy would land only a PREFIX of the all-gather and leave the
+// destination tail uninitialized -- which a downstream bitwise .all() compare
+// against a full reference could silently FALSE-PASS on. Demanding an exact-region
+// copy surfaces any caller-side shape mismatch loudly instead of producing a
+// partially-correct comparison. Returns 0 if called before init
+// (g_sr_region_bytes == 0) or with a non-matching nbytes.
+int fm4_overlap_copy_k_to(uint64_t dst_dev_ptr, uint64_t nbytes) {
+    if (g_sr_region_bytes == 0 || nbytes != g_sr_region_bytes) {
+        return 0;
+    }
+    const void* src = reinterpret_cast<const void*>(
+        flashmask::comm::singleton().k_data());
+    void* dst = reinterpret_cast<void*>(static_cast<uintptr_t>(dst_dev_ptr));
+    cudaDeviceSynchronize();
+    cudaError_t e = cudaMemcpy(dst, src, static_cast<size_t>(nbytes),
+                               cudaMemcpyDeviceToDevice);
+    return e == cudaSuccess ? 1 : 0;
+}
+
+// Same as fm4_overlap_copy_k_to (same exact-region contract, same FALSE-PASS
+// rationale) but for the SRBuffer V. nbytes MUST equal exactly one SRBuffer
+// region (g_sr_region_bytes); any other value is rejected.
+int fm4_overlap_copy_v_to(uint64_t dst_dev_ptr, uint64_t nbytes) {
+    if (g_sr_region_bytes == 0 || nbytes != g_sr_region_bytes) {
+        return 0;
+    }
+    const void* src = reinterpret_cast<const void*>(
+        flashmask::comm::singleton().v_data());
+    void* dst = reinterpret_cast<void*>(static_cast<uintptr_t>(dst_dev_ptr));
+    cudaDeviceSynchronize();
+    cudaError_t e = cudaMemcpy(dst, src, static_cast<size_t>(nbytes),
+                               cudaMemcpyDeviceToDevice);
+    return e == cudaSuccess ? 1 : 0;
+}
+
+// Read back the int value at a device pointer (the AG write_ptr is allocated by
+// the caller, written by the remote-get kernel). After a COMPLETE all-gather the
+// kernel's last CTA does atomicMax(wptr, INT_MAX) (remote_get_kernel.cuh:325,360),
+// so the expected terminal value is INT_MAX (2147483647). This lets the test
+// assert the kernel's completion-signal path actually fired. Returns 1 on
+// success and writes *out; 0 on a CUDA error. (write_ptr readiness semantics are
+// only USED for real overlap in a later step; here we just verify the signal.)
+int fm4_overlap_peek_wptr(uint64_t wptr_dev, int* out) {
+    cudaDeviceSynchronize();
+    int v = 0;
+    cudaError_t e = cudaMemcpy(&v, reinterpret_cast<const void*>(
+                                   static_cast<uintptr_t>(wptr_dev)),
+                               sizeof(int), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        return 0;
+    }
+    *out = v;
+    return 1;
 }
 
 // Local seqlen chunk length (S_local). After AG, S_total = s_local * nranks.
@@ -183,22 +285,19 @@ void fm4_overlap_wait_reset_stream_coordinator(uint64_t stream) {
     flashmask::comm::singleton().wait_reset_stream_coordinator(as_stream(stream));
 }
 
-// Step-1 forced-wait shim. Make the compute stream wait until the AG transfer
-// done on comm_stream is visible. We reuse the communicator's existing
-// sr_usable event: record it on the comm_stream, then have the compute stream
-// wait on it. This deliberately serializes (no overlap) and is only here to
-// prove pointer hand-off + layout + cute consumption are correct. Step 3
-// replaces this with in-kernel write_ptr readiness checks.
+// Step-1 forced-wait shim. Block until the AG transfer issued on the internal
+// comm_stream has fully landed, so the SRBuffer is safe for the compute stream
+// (and the D2D copy / cute consumption downstream) to read. This deliberately
+// serializes -- there is no overlap -- and exists only to prove pointer
+// hand-off + layout + cute consumption are correct. Step 3 replaces it with
+// in-kernel write_ptr readiness checks for true overlap.
 void fm4_overlap_wait_ag_done(uint64_t compute_stream) {
-    // sr_usable is a public cudaEvent_t on the communicator. The comm_stream
-    // is private, but wait_reset_stream_coordinator already guarantees the comm
-    // kernel is scheduled; to make the data visible we synchronize the comm work
-    // onto the compute stream via the event recorded on the comm side.
-    //
-    // The communicator does not expose comm_stream directly, so the simplest
-    // faithful step-1 barrier is a full device synchronize here. This is the
-    // bluntest possible "AG is finished" guarantee and is acceptable because
-    // step 1 is explicitly non-overlap correctness-only.
+    // The communicator keeps comm_stream private and exposes no "AG done" event
+    // recorded on it, so the simplest faithful step-1 barrier is a full device
+    // synchronize: the bluntest possible "AG is finished" guarantee. The
+    // compute_stream argument is unused here (a device sync waits on all
+    // streams); it is kept in the signature so the C-ABI stays stable when
+    // step 3 swaps this shim for a real per-stream / in-kernel wait.
     (void)compute_stream;
     cudaDeviceSynchronize();
 }
