@@ -126,4 +126,11 @@ void fm4_overlap_wait_reset_stream_coordinator(uint64_t stream) {
     flashmask::comm::singleton().wait_reset_stream_coordinator(as_stream(stream));
 }
 
+// Host-block until the internal comm_stream drains. The FM-4 bwd step-1 path runs
+// the sparse AG without the in-kernel gate, so the caller must sync here before
+// launching the grad kernel that consumes the gathered SRBuffer.
+void fm4_overlap_sync_comm_stream() {
+    flashmask::comm::singleton().sync_comm_stream();
+}
+
 }  // extern "C"

@@ -72,6 +72,9 @@ def _load():
     lib.fm4_overlap_wait_wptr_init.argtypes = []
     lib.fm4_overlap_wait_wptr_init.restype = None
 
+    lib.fm4_overlap_sync_comm_stream.argtypes = []
+    lib.fm4_overlap_sync_comm_stream.restype = None
+
     _LIB = lib
     return lib
 
@@ -187,6 +190,13 @@ def wait_wptr_init():
     _load().fm4_overlap_wait_wptr_init()
 
 
+def sync_comm_stream():
+    """Host-block until the internal comm_stream has fully drained. The bwd step-1
+    path has no in-kernel gate, so the grad kernel consuming the gathered SRBuffer
+    must be ordered after this sync (fwd hides the AG via the per-tile gate instead)."""
+    _load().fm4_overlap_sync_comm_stream()
+
+
 def _sparse_chunk_mask_cols(startend_row_indices):
     """Slice (lt_start, ut_end) columns into contiguous (B, H_mask, S_total) int32."""
     num_vecs = startend_row_indices.shape[-1]
@@ -257,3 +267,13 @@ def start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=True):
     del _mask_keepalive
     wait_reset_stream_coordinator(compute_stream)
     return sr_kv_view_args(), write_ptr
+
+def start_backward_ag(k, v, startend_row_indices, compute_stream):
+    """Step-1 bwd sparse all-gather: same SRBuffer fill as fwd but with fwd=False
+    (local chunk lands at the SR front, forward-traversal remote order) and NO
+    in-kernel gate. Host-syncs the comm_stream before returning, so the gathered
+    K/V are fully resident when the grad kernel launches. Returns the gathered
+    SrKvView; no write_ptr (nothing spins on it without a gate)."""
+    view, _write_ptr = start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=False)
+    sync_comm_stream()
+    return view

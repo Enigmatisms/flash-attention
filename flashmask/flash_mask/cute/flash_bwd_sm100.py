@@ -545,12 +545,35 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         blocksparse_tensors=None,
         flashmask_info: Optional[FlashMaskInfo] = None,
+        overlap_k_addr: Optional[cutlass.Int64] = None,
+        overlap_v_addr: Optional[cutlass.Int64] = None,
+        overlap_b: Optional[cutlass.Int32] = None,
+        overlap_s: Optional[cutlass.Int32] = None,
+        overlap_h: Optional[cutlass.Int32] = None,
+        overlap_d: Optional[cutlass.Int32] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
             "Variable sequence length is not supported yet in FlashAttentionBackwardSm100"
         )
+        # FM-4 overlap step-1: the gathered K/V live in the NVSHMEM SRBuffer (no
+        # Paddle tensor / dlpack capsule), so they arrive as a raw addr + the
+        # gathered (B, S_total, H, D) dims as RUNTIME Int32 scalars. Rebuild the
+        # views HERE in this jit body's MLIR Context (make_*_from_addr requires it),
+        # with Int32 dims giving the dynamic (?,?,?,?):(?,?,?,1) layout that the
+        # dlpack path produces -- static dims read the wrong bytes (utils.py:801).
+        # This mirrors the fwd kernel (flash_fwd_sm100.py:380-389). NO gate: step-1
+        # relies on the host comm_stream sync upstream, so K/V are fully resident.
+        if const_expr(overlap_k_addr is not None):
+            mK = utils.make_contiguous_bshd_from_addr(
+                overlap_k_addr, overlap_b, overlap_s, overlap_h, overlap_d,
+                mQ.element_type, align=16,
+            )
+            mV = utils.make_contiguous_bshd_from_addr(
+                overlap_v_addr, overlap_b, overlap_s, overlap_h, overlap_d,
+                mQ.element_type, align=16,
+            )
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type

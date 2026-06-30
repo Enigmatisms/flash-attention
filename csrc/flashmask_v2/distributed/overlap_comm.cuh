@@ -120,6 +120,12 @@ public:
 
     void wait_wptr_init();
 
+    // Block the host until the internal comm_stream has fully drained. The FM-4
+    // bwd step-1 path runs the sparse AG WITHOUT the in-kernel gate, so the caller
+    // must host-sync the comm_stream before launching the grad kernel that reads
+    // the gathered SRBuffer. (fwd hides this latency via the per-tile gate instead.)
+    void sync_comm_stream() { cudaStreamSynchronize(comm_stream); }
+
     void* k_data() const { return kv_buffer->k_data(); }
     void* v_data() const { return kv_buffer->v_data(); }
 

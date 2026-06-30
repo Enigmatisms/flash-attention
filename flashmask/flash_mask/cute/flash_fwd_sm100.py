@@ -343,7 +343,6 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
         flashmask_info: Optional[FlashMaskInfo] = None,
-        stream: cuda.CUstream = None,
         overlap_k_addr: Optional[cutlass.Int64] = None,
         overlap_v_addr: Optional[cutlass.Int64] = None,
         overlap_write_ptr_addr: Optional[cutlass.Int64] = None,
@@ -352,6 +351,8 @@ class FlashAttentionForwardSm100:
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
         overlap_kv_chunk_size: cutlass.Constexpr = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
