@@ -20,6 +20,21 @@ def ld_acquire(lock_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
     return cutlass.Int32(state)
 
 
+@cute.jit
+def wait_write_ptr_ge(wptr: cute.Pointer, elem_idx: int | Int32, target: Int32) -> None:
+    """Busy-spin until wptr[elem_idx] >= target. Caller elects a single thread.
+
+    write_ptr is a monotonically advanced (atomicMax) row index on the comm side;
+    once it reaches `target` the corresponding remote KV rows are all-gathered and
+    visible to this rank. The compare is on non-negative row counts (the INT_MAX
+    whole-AG sentinel is also positive), so a plain b32 acquire load suffices.
+    """
+    flag_ptr = wptr + elem_idx
+    read_val = ld_acquire(flag_ptr)
+    while read_val < target:
+        read_val = ld_acquire(flag_ptr)
+
+
 @dsl_user_op
 def red_relaxed(
     lock_ptr: cute.Pointer, val: cutlass.Constexpr[Int32], *, loc=None, ip=None

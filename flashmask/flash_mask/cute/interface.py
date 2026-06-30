@@ -43,6 +43,7 @@ from flash_mask.cute.flashmask_utils import (
     reduce_block_count,
     compute_flashmask_block_lists,
 )
+from flash_mask.overlap import overlap_runtime
 
 from flash_mask.cute.block_sparsity import (
     BlockSparseTensorsPaddle,
@@ -348,6 +349,8 @@ def _flash_attn_fwd(
     lse: Optional[paddle.Tensor] = None,
     aux_tensors: Optional[list[paddle.Tensor]] = None,
     startend_row_indices: Optional[paddle.Tensor] = None,
+    group=None,
+    _debug_overlap: bool = False,
 ) -> Tuple[paddle.Tensor, paddle.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -398,6 +401,61 @@ def _flash_attn_fwd(
     # once here so the flashmask valid_block_count and the block-sparse M-block
     # normalization below share the identical M granularity.
     q_stage = 1 if (head_dim > 192 and head_dim == v.shape[-1]) else 2
+    # FM-4 overlap: when a CP `group` is given, K/V come in LOCAL (B, S_local, H, D)
+    # and the gathered KV lives in the NVSHMEM SRBuffer. Bootstrap+init the comm
+    # singleton once, kick off the (sparse) all-gather on the internal comm_stream,
+    # and below swap the K/V cute tensors for SRBuffer-backed views with
+    # seqlen_k = S_local*nranks. The per-tile readiness wait (the gate spinning on
+    # write_ptr) lives inside the SM100 load warp, so this issues the AG WITHOUT a
+    # blocking wait_ag_done -- compute and communication truly overlap.
+    # startend_row_indices here is the FM-3-wrapper's POST-AG mask
+    # (B, H_mask, S_total, num_vecs); it both drives the real-sparse chunk mask AND
+    # feeds the kernel's flashmask bounds at full S_total. The LOCAL k/v paddle
+    # tensors are used only for the SRBuffer copy + shape/dtype derivation (dtype is
+    # identical, head/dim unchanged, only seqlen_k grows to the gathered length).
+    enable_overlap = group is not None or _debug_overlap
+    overlap_view_args = None
+    overlap_write_ptr = None
+    overlap_kv_chunk_size = None
+    if _debug_overlap:
+        # Single-GPU debug: drive the REAL ROUTE-2 path WITHOUT any NVSHMEM/comm.
+        # k/v here are already the FULL gathered (B, S_total, H, D) SR-order tensors,
+        # so the SrKvView points straight at their data_ptr and write_ptr is pinned to
+        # INT_MAX (the load-warp gate releases immediately, nothing to wait on). This
+        # exercises the overlap kernel's mK/mV-from-addr build in isolation from comm.
+        assert group is None, "_debug_overlap and a real group are mutually exclusive"
+        b_d, s_d, h_d, d_d = k.shape
+        overlap_kv_chunk_size = s_d
+        overlap_view_args = overlap_runtime.SrKvView(
+            k_addr=int(k.data_ptr()),
+            v_addr=int(v.data_ptr()),
+            shape=(b_d, s_d, h_d, d_d),
+        )
+        overlap_write_ptr = paddle.full([1], 2147483647, dtype=paddle.int32)
+    elif enable_overlap:
+        assert startend_row_indices is not None, (
+            "overlap mode requires startend_row_indices (the post-AG mask)"
+        )
+        assert page_table is None, "overlap mode does not support paged KV"
+        assert cu_seqlens_k is None, "overlap mode does not support varlen K"
+        assert k.dtype == paddle.bfloat16, "overlap SRBuffer is bf16"
+        # causal would make startend_row_indices col1 hold lt_end (not ut_end), but
+        # the comm-side compute_chunk_mask requires a non-null ut_end (overlap_comm.cu
+        # :453); FM-3 overlap forbids causal for the same reason (overlap_flashmask.py
+        # :335). Guarding here keeps the col mapping in _sparse_chunk_mask_cols exact.
+        assert not causal, "overlap mode does not support causal yet"
+        overlap_runtime.ensure_initialized(
+            k, v, group, mask_head=startend_row_indices.shape[1]
+        )
+        overlap_kv_chunk_size = k.shape[-3]  # S_local: rows never remote-fetched
+        overlap_stream = overlap_runtime.current_stream_handle()
+        # Kick off the sparse all-gather with no blocking wait -- the per-tile
+        # in-kernel gate is the only readiness sync, so compute/comm overlap.
+        # write_ptr is the counter that gate spins on; the gathered SRBuffer view
+        # carries the FULL S_total shape into the kernel.
+        overlap_view_args, overlap_write_ptr = overlap_runtime.start_forward_ag(
+            k, v, startend_row_indices, overlap_stream, fwd=True
+        )
 
     cute_flashmask_info = None
     if startend_row_indices is not None:
@@ -421,12 +479,24 @@ def _flash_attn_fwd(
         assert page_table.shape == [batch_size, max_num_pages_per_seq]
         num_pages, page_size = k.shape[:2]
         seqlen_k = num_pages * page_size
+    elif enable_overlap:
+        # K/V are still the LOCAL paddle tensors here (used only for update_kv +
+        # dtype); the kernel reads the gathered SRBuffer, so seqlen_k is the full
+        # gathered length S_total = S_local * nranks from the SRBuffer view.
+        num_pages, page_size = None, None
+        seqlen_k = overlap_view_args.shape[1]
     else:
         num_pages, page_size = None, None
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
-    if cu_seqlens_k is None:
+    if enable_overlap:
+        # Skip the [batch, seqlen_k, ...] shape assert: k/v are LOCAL (S_local),
+        # while seqlen_k is the gathered S_total. The SRBuffer view (built below
+        # from overlap_view_args) carries the gathered shape into the kernel.
+        assert num_head_kv == overlap_view_args.shape[2]
+        assert head_dim == overlap_view_args.shape[3]
+    elif cu_seqlens_k is None:
         if page_table is None:
             assert k.shape == [batch_size, seqlen_k, num_head_kv, head_dim], (
                 f"expect k with shape {[batch_size, seqlen_k, num_head_kv, head_dim]}, received {k.shape=}"
@@ -685,10 +755,20 @@ def _flash_attn_fwd(
         )
         lse_partial = paddle.empty(shape=[num_splits, *lse_shape], dtype=paddle.float32)
 
-    q_tensor, k_tensor, v_tensor, o_tensor = [
+    q_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, out if not is_split_kv else out_partial)
+        for t in (q, out if not is_split_kv else out_partial)
     ]
+    if enable_overlap:
+        # K/V live in the NVSHMEM SRBuffer (gathered device memory), so there is no
+        # dlpack capsule to wrap; the kernel builds the views from their addr instead.
+        k_tensor = None
+        v_tensor = None
+    else:
+        k_tensor, v_tensor = [
+            from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            for t in (k, v)
+        ]
     if is_split_kv:
         lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
             leading_dim=lse_partial.ndim - 1
@@ -748,6 +828,29 @@ def _flash_attn_fwd(
     if aux_tensors is not None:
         cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
 
+    # overlap: thread the SRBuffer K/V addresses + the write_ptr address (a 1-elem
+    # int32 the AG kernel advances by atomicMax in batch-global ROW units) as Int64,
+    # plus the gathered (B, S_total, H, D) dims as RUNTIME Int32 scalars (NOT
+    # Constexpr -- a static layout reads the wrong bytes, see make_contiguous_bshd_from_addr).
+    # The kernel builds the cute views + OverlapInfo inside its MLIR Context. All None when off.
+    if enable_overlap:
+        overlap_k_addr = cutlass.Int64(overlap_view_args.k_addr)
+        overlap_v_addr = cutlass.Int64(overlap_view_args.v_addr)
+        overlap_write_ptr_addr = cutlass.Int64(int(overlap_write_ptr.data_ptr()))
+        _ob, _os, _oh, _od = overlap_view_args.shape
+        overlap_b = cutlass.Int32(_ob)
+        overlap_s = cutlass.Int32(_os)
+        overlap_h = cutlass.Int32(_oh)
+        overlap_d = cutlass.Int32(_od)
+    else:
+        overlap_k_addr = None
+        overlap_v_addr = None
+        overlap_write_ptr_addr = None
+        overlap_b = None
+        overlap_s = None
+        overlap_h = None
+        overlap_d = None
+
     compile_key = (
         dtype,
         head_dim,
@@ -777,6 +880,10 @@ def _flash_attn_fwd(
         # flashmask
         startend_row_indices.shape[3] if startend_row_indices is not None else None,
         is_split_d if compute_capability == 10 else False,
+        # overlap: the gate is compiled into the kernel only when enabled, so it
+        # must key the compile cache (an overlap kernel and a plain kernel for the
+        # same shapes are different compiled artifacts).
+        enable_overlap,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -851,7 +958,18 @@ def _flash_attn_fwd(
             cute_aux_tensors,
             cute_flashmask_info,
             current_stream,
+            overlap_k_addr,
+            overlap_v_addr,
+            overlap_write_ptr_addr,
+            overlap_b,
+            overlap_s,
+            overlap_h,
+            overlap_d,
+            overlap_kv_chunk_size,
         )
+    # Below we pass only the runtime args: the addr Int64s AND 
+    # the four shape Int32s (overlap_b/s/h/d) are real runtime values that must
+    # be re-supplied at call time, matching the dlpack dense path's dynamic dims.
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
         k_tensor,
@@ -871,6 +989,13 @@ def _flash_attn_fwd(
         cute_aux_tensors,
         cute_flashmask_info,
         current_stream,
+        overlap_k_addr,
+        overlap_v_addr,
+        overlap_write_ptr_addr,
+        overlap_b,
+        overlap_s,
+        overlap_h,
+        overlap_d,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -2304,6 +2429,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
         learnable_sink: paddle.Tensor | None = None,
         startend_row_indices: paddle.Tensor | None = None,
         block_mask: paddle.Tensor | None = None,
+        group=None,
     ) -> paddle.Tensor | Tuple[paddle.Tensor, paddle.Tensor]:
         out, lse = _flash_attn_fwd(
             query,
@@ -2315,6 +2441,7 @@ class FlashMaskFunc(paddle.autograd.PyLayer):
             return_lse=True,
             startend_row_indices=startend_row_indices,
             pack_gqa=False,
+            group=group,
         )
         ctx.save_for_backward(query, key, value, startend_row_indices, out, lse, learnable_sink)
         ctx.softmax_scale = softmax_scale
@@ -2367,6 +2494,7 @@ def flashmask_attention(
     softmax_scale: float | None = None,
     block_mask: paddle.Tensor | None = None,
     learnable_sink: paddle.Tensor | None = None,
+    group=None,
 ):
     if _is_cutedsl_kernel_supported(query, key, value, startend_row_indices):
         assert dropout == 0.0, (
@@ -2444,6 +2572,7 @@ def flashmask_attention(
             softmax_scale=softmax_scale,
             learnable_sink=learnable_sink,
             startend_row_indices=startend_row_indices,
+            group=group,
         )
         if return_softmax_lse:
             return [out, lse]

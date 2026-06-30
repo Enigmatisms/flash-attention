@@ -704,6 +704,19 @@ def make_gmem_tensor_from_addr(
 
 
 @dsl_user_op
+def make_contiguous_bshd_from_addr(addr, b, s, h, d, dtype, *, align=16, loc=None, ip=None):
+    """Build a contiguous (B, S, H, D) gmem cute.Tensor from a raw device address.
+
+    b/s/h/d MUST be runtime Int32 (not Python ints) so the layout is dynamic
+    (?,?,?,?):(?,?,?,1), matching the from_dlpack(...).mark_layout_dynamic path. Python
+    ints bake a static layout the TMA descriptor builder specializes differently, which
+    reads the wrong bytes. Stride is row-major BSHD (last static 1, rest from the dims).
+    """
+    stride = (s * h * d, h * d, d, 1)
+    return make_gmem_tensor_from_addr(addr, (b, s, h, d), stride, dtype, align=align)
+
+
+@dsl_user_op
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
