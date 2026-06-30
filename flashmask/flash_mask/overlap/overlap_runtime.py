@@ -171,7 +171,7 @@ def wait_sr_buffer_empty(compute_stream):
 
 def wait_reset_stream_coordinator(compute_stream):
     """Hold compute_stream until the comm kernel has occupied its SMs (deadlock guard if
-    compute grabbed every SM first). Device-side spin, not the per-tile gate."""
+    compute grabbed every SM first)."""
     _load().fm4_overlap_wait_reset_stream_coordinator(int(compute_stream))
 
 
@@ -191,9 +191,8 @@ def wait_wptr_init():
 
 
 def sync_comm_stream():
-    """Host-block until the internal comm_stream has fully drained. The bwd step-1
-    path has no in-kernel gate, so the grad kernel consuming the gathered SRBuffer
-    must be ordered after this sync (fwd hides the AG via the per-tile gate instead)."""
+    """Host-block until the internal comm_stream has fully drained before the kernel
+    consumes the gathered SRBuffer."""
     _load().fm4_overlap_sync_comm_stream()
 
 
@@ -246,10 +245,7 @@ def sr_kv_view_args():
 
 
 def start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=True):
-    """Kick off the sparse all-gather with no blocking wait (the in-kernel gate is the
-    only readiness sync). k/v are local (B, S_local, H, D). Returns (view, write_ptr):
-    the gathered SrKvView and the int32 counter the gate spins on (the AG kernel
-    advances it)."""
+    """Fill the SRBuffer via sparse AG and host-sync before returning its K/V view."""
     import paddle
 
     wait_sr_buffer_empty(compute_stream)
@@ -266,14 +262,10 @@ def start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=True):
     run_ag(int(write_ptr.data_ptr()), fwd=fwd)
     del _mask_keepalive
     wait_reset_stream_coordinator(compute_stream)
-    return sr_kv_view_args(), write_ptr
+    sync_comm_stream()
+    return sr_kv_view_args()
+
 
 def start_backward_ag(k, v, startend_row_indices, compute_stream):
-    """Step-1 bwd sparse all-gather: same SRBuffer fill as fwd but with fwd=False
-    (local chunk lands at the SR front, forward-traversal remote order) and NO
-    in-kernel gate. Host-syncs the comm_stream before returning, so the gathered
-    K/V are fully resident when the grad kernel launches. Returns the gathered
-    SrKvView; no write_ptr (nothing spins on it without a gate)."""
-    view, _write_ptr = start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=False)
-    sync_comm_stream()
-    return view
+    """Bwd sparse AG with fwd=False; returns the host-synced gathered K/V view."""
+    return start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=False)
