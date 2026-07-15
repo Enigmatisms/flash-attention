@@ -404,8 +404,8 @@ def _flash_attn_fwd(
     # and the gathered KV lives in the NVSHMEM SRBuffer. Bootstrap+init the comm
     # singleton once, run the sparse all-gather on the internal comm_stream, then
     # below swap the K/V cute tensors for SRBuffer-backed views with
-    # seqlen_k = S_local*nranks. AG-only mode host-syncs the comm_stream before the
-    # kernel launch, so there is no per-tile write_ptr gate in the SM100 kernel.
+    # seqlen_k = S_local*nranks. The SM100 load warp gates each K/V tile on the
+    # non-splitted AG kernel's write_ptr row frontier.
     # startend_row_indices here is the FM-3-wrapper's POST-AG mask
     # (B, H_mask, S_total, num_vecs); it both drives the real-sparse chunk mask AND
     # feeds the kernel's flashmask bounds at full S_total. The LOCAL k/v paddle
@@ -431,11 +431,12 @@ def _flash_attn_fwd(
             k, v, group, mask_head=startend_row_indices.shape[1]
         )
         overlap_stream = overlap_runtime.current_stream_handle()
-        # Fill the SRBuffer and host-sync the comm stream; the gathered SRBuffer view
-        # carries the FULL S_total shape into the kernel.
-        overlap_view_args = overlap_runtime.start_forward_ag(
-            k, v, startend_row_indices, overlap_stream, fwd=True
+        # Launch AG and retain the gathered SRBuffer view; its FULL S_total shape
+        # drives host-side validation and the runtime-dimension kernel arguments.
+        overlap_ag_args = overlap_runtime.start_forward_ag(
+            k, v, startend_row_indices, overlap_stream
         )
+        overlap_view_args = overlap_ag_args.view
 
     cute_flashmask_info = None
     if startend_row_indices is not None:
@@ -808,25 +809,28 @@ def _flash_attn_fwd(
     if aux_tensors is not None:
         cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
 
-    # overlap: thread the SRBuffer K/V addresses plus the gathered (B, S_total, H, D)
-    # dims as RUNTIME Int32 scalars (NOT Constexpr -- a static layout reads the wrong
-    # bytes, see make_contiguous_bshd_from_addr). The kernel builds the cute views
-    # inside its MLIR Context. All None when off.
+    # Build SRBuffer views inside the MLIR context. Dimensions stay runtime Int32;
+    # making this layout static changes the TMA descriptor and reads wrong bytes.
     if enable_overlap:
-        overlap_k_addr = cutlass.Int64(overlap_view_args.k_addr)
-        overlap_v_addr = cutlass.Int64(overlap_view_args.v_addr)
-        _ob, _os, _oh, _od = overlap_view_args.shape
+        overlap_view = overlap_ag_args.view
+        overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
+        overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
+        overlap_write_ptr_addr = cutlass.Int64(overlap_ag_args.write_ptr.data_ptr())
+        _ob, _os, _oh, _od = overlap_view.shape
         overlap_b = cutlass.Int32(_ob)
         overlap_s = cutlass.Int32(_os)
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
+        overlap_kv_chunk_size = overlap_ag_args.kv_chunk_size
     else:
         overlap_k_addr = None
         overlap_v_addr = None
+        overlap_write_ptr_addr = None
         overlap_b = None
         overlap_s = None
         overlap_h = None
         overlap_d = None
+        overlap_kv_chunk_size = None
 
     compile_key = (
         dtype,
@@ -860,6 +864,7 @@ def _flash_attn_fwd(
         # overlap: K/V are rebuilt from SRBuffer addresses, so an overlap kernel and
         # a plain kernel for the same shapes are different compiled artifacts.
         enable_overlap,
+        overlap_kv_chunk_size,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
@@ -943,6 +948,7 @@ def _flash_attn_fwd(
                     "overlap_s": overlap_s,
                     "overlap_h": overlap_h,
                     "overlap_d": overlap_d,
+                    "overlap_kv_chunk_size": overlap_kv_chunk_size,
                 }
                 if compute_capability == 10
                 else {}
@@ -1103,15 +1109,8 @@ def _flash_attn_bwd(
     is_split_d_bwd = False
     is_split_dv_bwd = False
 
-    # FM-4 AG-only path: with a CP `group`, K/V arrive
-    # LOCAL (B, S_local, H, D) and the gathered KV lives in the NVSHMEM SRBuffer.
-    # Init the comm singleton once, run the (sparse) bwd all-gather, and HOST-SYNC
-    # the comm_stream (start_backward_ag) so the gathered K/V are fully resident
-    # before the grad kernel reads them. The kernel then consumes SRBuffer-backed
-    # K/V views at the gathered length; dK/dV are produced at S_total and the
-    # wrapper reduce-scatters them back to S_local. flashmask_info here is the
-    # FM-3-wrapper's POST-AG mask at full S_total. Readiness is the host sync,
-    # not a per-tile spin.
+    # FM-4 backward launches sparse AG asynchronously. The load warp waits on the
+    # non-splitted AG kernel's write_ptr row frontier before issuing each K/V TMA.
     enable_overlap = group is not None
     overlap_view_args = None
     if enable_overlap:
@@ -1126,9 +1125,10 @@ def _flash_attn_bwd(
             k, v, group, mask_head=startend_row_indices.shape[1]
         )
         overlap_stream = overlap_runtime.current_stream_handle()
-        overlap_view_args = overlap_runtime.start_backward_ag(
+        overlap_ag_args = overlap_runtime.start_backward_ag(
             k, v, startend_row_indices, overlap_stream
         )
+        overlap_view_args = overlap_ag_args.view
 
     if compute_capability == 9:
         sparse_q = None
@@ -1483,27 +1483,30 @@ def _flash_attn_bwd(
     ]
     current_stream = cuda.CUstream(paddle.device.current_stream().stream_base.cuda_stream)
 
-    # overlap: thread the gathered SRBuffer K/V addresses (Int64) + the gathered
-    # (B, S_total, H, D) dims as RUNTIME Int32 scalars (NOT Constexpr -- a static
-    # layout reads the wrong bytes, see make_contiguous_bshd_from_addr). The bwd
-    # kernel rebuilds the K/V cute views from these inside its MLIR Context. The
-    # host comm_stream sync (start_backward_ag) already made the gathered K/V
-    # resident. All None when overlap is off.
+    # Rebuild gathered K/V views inside the MLIR context and pass the comm-owned
+    # wptr row frontier the backward load warp gates on (same non-splitted AG
+    # kernel + wptr as forward; bwd just scans left-to-right, gated on the tile's
+    # right edge -- see _overlap_gate_bwd).
     if enable_overlap:
-        overlap_k_addr = cutlass.Int64(overlap_view_args.k_addr)
-        overlap_v_addr = cutlass.Int64(overlap_view_args.v_addr)
-        _ob, _os, _oh, _od = overlap_view_args.shape
+        overlap_view = overlap_ag_args.view
+        overlap_k_addr = cutlass.Int64(overlap_view.k_addr)
+        overlap_v_addr = cutlass.Int64(overlap_view.v_addr)
+        overlap_write_ptr_addr = cutlass.Int64(overlap_ag_args.write_ptr.data_ptr())
+        _ob, _os, _oh, _od = overlap_view.shape
         overlap_b = cutlass.Int32(_ob)
         overlap_s = cutlass.Int32(_os)
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
+        overlap_kv_chunk_size = overlap_ag_args.kv_chunk_size
     else:
         overlap_k_addr = None
         overlap_v_addr = None
+        overlap_write_ptr_addr = None
         overlap_b = None
         overlap_s = None
         overlap_h = None
         overlap_d = None
+        overlap_kv_chunk_size = None
 
     compile_key_pre = (compute_capability, dtype, head_dim, head_dim_v, head_dim_rounded, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
@@ -1595,6 +1598,7 @@ def _flash_attn_bwd(
             # overlap: an overlap grad kernel (K/V rebuilt from SRBuffer addr) and a
             # plain one for the same shapes are different compiled artifacts.
             enable_overlap,
+            overlap_kv_chunk_size,
         )
 
     # SM100/SM110 uses default from function signature (384).
@@ -1730,6 +1734,7 @@ def _flash_attn_bwd(
                 overlap_s=overlap_s,
                 overlap_h=overlap_h,
                 overlap_d=overlap_d,
+                overlap_kv_chunk_size=overlap_kv_chunk_size,
             )
     if compute_capability == 9:
         _flash_attn_bwd.compile_cache[compile_key](
@@ -1776,6 +1781,7 @@ def _flash_attn_bwd(
             stream=current_stream,
             overlap_k_addr=overlap_k_addr,
             overlap_v_addr=overlap_v_addr,
+            overlap_write_ptr_addr=overlap_write_ptr_addr,
             overlap_b=overlap_b,
             overlap_s=overlap_s,
             overlap_h=overlap_h,

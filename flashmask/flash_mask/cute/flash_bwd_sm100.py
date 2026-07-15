@@ -31,6 +31,7 @@ from flash_mask.cute import utils
 from flash_mask.cute import layout_utils
 from flash_mask.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_mask.cute import copy_utils
+from flash_mask.cute.barrier import wait_write_ptr_ge
 from flash_mask.cute import pipeline
 from flash_mask.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_mask.cute.mask import AttentionMask
@@ -46,6 +47,51 @@ from flash_mask.cute.tile_scheduler import (
 from flash_mask.cute import barrier
 from flash_mask.cute.named_barrier import NamedBarrierBwdSm100
 from flash_mask.cute.flashmask_utils import FlashMaskInfo
+
+
+@cute.jit
+def _overlap_gate_bwd(
+    n_block: Int32,
+    tidx: Int32,
+    s_total: Int32,
+    batch_idx: Int32,
+    write_ptr: cute.Pointer,
+    kv_chunk_size: Int32,
+    cta_group_size: cutlass.Constexpr[int],
+    tile_n: cutlass.Constexpr[int],
+):
+    """FM-4 backward overlap gate: spin the load warp's elected thread until the comm
+    side has all-gathered the remote KV rows this tile consumes.
+
+    Same wptr (atomicMax row-frontier) mechanism as the forward gate
+    (``flash_fwd_sm100._overlap_gate``), but mirrored for the backward traversal:
+      * FWD compute scans KV right-to-left; the local (never-fetched) chunk is the
+        LAST ``kv_chunk_size`` rows, so the fwd gate waits on the tile's LEFT edge.
+      * BWD compute scans KV left-to-right; the local chunk is the FIRST
+        ``kv_chunk_size`` rows and the (non-splitted, bwd) comm kernel fills the
+        remote region ``[kv_chunk_size, s_total)`` left-to-right, advancing
+        ``write_ptr`` as a row frontier measured from ``kv_chunk_size``. So we wait
+        on the tile's RIGHT edge -- the last remote row it needs.
+
+    bwd sm100 uses 2-CTA MMA: the loaded KV tile is a group tile
+    ``mK[.., n_block // cta_group_size]`` spanning ``cta_group_size * tile_n`` rows,
+    so the tile's right edge is ``(n_block // cta_group_size + 1) * cta_group_size *
+    tile_n`` (degenerates to ``(n_block + 1) * tile_n`` when cta_group_size == 1).
+    ``remote_row <= 0`` means the tile lies wholly in the local chunk -> no wait.
+
+    write_ptr is a per-batch frontier with stride ``s_total - kv_chunk_size`` (the
+    remote region size), matching the comm kernel's batch-major work order. Only
+    ``tidx == 0`` spins, the one-thread convention used by the dQ/dKV semaphores.
+
+    At module scope (empty ``__closure__``) so the DSL closure_check accepts it
+    inside the dynamic tile loop.
+    """
+    if tidx == 0:
+        right_edge = (n_block // cta_group_size + 1) * cta_group_size * tile_n
+        remote_row = right_edge - kv_chunk_size
+        if remote_row > 0:
+            target = batch_idx * (s_total - kv_chunk_size) + remote_row
+            wait_write_ptr_ge(write_ptr, 0, Int32(target))
 
 
 class FlashAttentionBackwardSm100:
@@ -547,10 +593,12 @@ class FlashAttentionBackwardSm100:
         flashmask_info: Optional[FlashMaskInfo] = None,
         overlap_k_addr: Optional[cutlass.Int64] = None,
         overlap_v_addr: Optional[cutlass.Int64] = None,
+        overlap_write_ptr_addr: Optional[cutlass.Int64] = None,
         overlap_b: Optional[cutlass.Int32] = None,
         overlap_s: Optional[cutlass.Int32] = None,
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
+        overlap_kv_chunk_size: cutlass.Constexpr = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -563,8 +611,8 @@ class FlashAttentionBackwardSm100:
         # views HERE in this jit body's MLIR Context (make_*_from_addr requires it),
         # with Int32 dims giving the dynamic (?,?,?,?):(?,?,?,1) layout that the
         # dlpack path produces -- static dims read the wrong bytes (utils.py:801).
-        # This mirrors the fwd kernel (flash_fwd_sm100.py:380-389). NO gate: step-1
-        # relies on the host comm_stream sync upstream, so K/V are fully resident.
+        # This mirrors the forward SRBuffer view construction. Readiness is gated
+        # per communication work item in the load warp below.
         if const_expr(overlap_k_addr is not None):
             mK = utils.make_contiguous_bshd_from_addr(
                 overlap_k_addr, overlap_b, overlap_s, overlap_h, overlap_d,
@@ -1052,6 +1100,8 @@ class FlashAttentionBackwardSm100:
             tma_atom_dV,
             tma_atom_dK,
             flashmask_info,
+            overlap_write_ptr_addr,
+            overlap_kv_chunk_size,
             self.sQ_layout,
             self.sQt_layout,
             self.sK_layout,
@@ -1118,6 +1168,8 @@ class FlashAttentionBackwardSm100:
         tma_atom_dV: Optional[cute.CopyAtom],
         tma_atom_dK: Optional[cute.CopyAtom],
         flashmask_info: Optional[FlashMaskInfo],
+        overlap_write_ptr_addr: Optional[cutlass.Int64],
+        overlap_kv_chunk_size: cutlass.Constexpr,
         sQ_layout: cute.ComposedLayout,
         sQt_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -1584,6 +1636,8 @@ class FlashAttentionBackwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 flashmask_info,
+                overlap_write_ptr_addr,
+                overlap_kv_chunk_size,
                 sStartEndRowIndices,
                 sFM_max_min,
                 flashmask_loaded_mbar_ptr,
@@ -1828,6 +1882,8 @@ class FlashAttentionBackwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         flashmask_info: FlashMaskInfo,
+        overlap_write_ptr_addr: Optional[cutlass.Int64],
+        overlap_kv_chunk_size: cutlass.Constexpr,
         sStartEndRowIndices: cute.Tensor,
         sFM_max_min: cute.Tensor,
         flashmask_loaded_mbar_ptr: cute.Pointer,
@@ -1836,6 +1892,13 @@ class FlashAttentionBackwardSm100:
     ):
         num_load_threads = cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
+        if const_expr(overlap_write_ptr_addr is not None):
+            write_ptr = cute.make_ptr(
+                cutlass.Int32,
+                overlap_write_ptr_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            )
 
         producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
@@ -1877,6 +1940,17 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            if const_expr(overlap_write_ptr_addr is not None):
+                _overlap_gate_bwd(
+                    n_block,
+                    tidx,
+                    seqlen.seqlen_k,
+                    batch_idx,
+                    write_ptr,
+                    Int32(overlap_kv_chunk_size),
+                    self.cta_group_size,
+                    self.tile_n,
+                )
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )

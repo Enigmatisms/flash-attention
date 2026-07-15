@@ -63,11 +63,12 @@ def _load():
     lib.fm4_overlap_compute_chunk_mask.argtypes = [ctypes.c_uint64] * 3 + [ctypes.c_int]
     lib.fm4_overlap_compute_chunk_mask.restype = None
 
-    for name in ("fm4_overlap_wait_sr_buffer_empty", "fm4_overlap_wait_reset_stream_coordinator",
-                 "fm4_overlap_reset_ag_counter"):
+    for name in ("fm4_overlap_wait_sr_buffer_empty", "fm4_overlap_wait_reset_stream_coordinator"):
         fn = getattr(lib, name)
         fn.argtypes = [ctypes.c_uint64]
         fn.restype = None
+    lib.fm4_overlap_reset_ag_counter.argtypes = [ctypes.c_uint64]
+    lib.fm4_overlap_reset_ag_counter.restype = None
 
     lib.fm4_overlap_wait_wptr_init.argtypes = []
     lib.fm4_overlap_wait_wptr_init.restype = None
@@ -176,11 +177,7 @@ def wait_reset_stream_coordinator(compute_stream):
 
 
 def reset_ag_counter(compute_stream):
-    """Reset the AG dynamic-scheduling counter (block_cnt_semaphore) to 1 on compute_stream
-    and record wptr_init, mirroring prepare_flashmask on the PHI path. The counter lives in
-    the long-lived singleton; without this per-step reset its first atomicAdd in step>=2
-    already exceeds total_chunks, so the remote-get loop copies nothing and the SRBuffer
-    remote region keeps stale KV. Must precede wait_wptr_init + run_ag."""
+    """Reset the persistent AG scheduler counter before each gather."""
     _load().fm4_overlap_reset_ag_counter(int(compute_stream))
 
 
@@ -224,11 +221,22 @@ def current_stream_handle():
 
 
 class SrKvView(NamedTuple):
-    """Cross-jit-safe handle to the gathered SRBuffer K/V: raw pointers + dims (plain
-    ints) cross jits where a cute.Tensor cannot. Each consumer rebuilds its own view."""
-    k_addr: int   # SRBuffer K device pointer (== fm4_overlap_k_data)
-    v_addr: int   # SRBuffer V device pointer (== fm4_overlap_v_data)
-    shape: tuple  # (B, S_total, H, D), S_total = s_local * nranks
+    """Cross-jit-safe handle to the gathered SRBuffer K/V."""
+    k_addr: int
+    v_addr: int
+    shape: tuple  # (B, S_total, H, D)
+
+
+class ForwardAgArgs(NamedTuple):
+    view: SrKvView
+    write_ptr: object
+    kv_chunk_size: int
+
+
+class BackwardAgArgs(NamedTuple):
+    view: SrKvView
+    write_ptr: object
+    kv_chunk_size: int
 
 
 def sr_kv_view_args():
@@ -244,28 +252,49 @@ def sr_kv_view_args():
     )
 
 
-def start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=True):
-    """Fill the SRBuffer via sparse AG and host-sync before returning its K/V view."""
-    import paddle
-
+def _start_ag(k, v, startend_row_indices, compute_stream, *, fwd, write_ptr=0):
     wait_sr_buffer_empty(compute_stream)
-    # keepalive: the async check reads these on comm_stream; must outlive run_ag's
-    # launch, after which the AG kernel owns the data.
-    _mask_keepalive = compute_chunk_mask_sparse(startend_row_indices, compute_stream, fwd=fwd)
+    mask_keepalive = compute_chunk_mask_sparse(
+        startend_row_indices, compute_stream, fwd=fwd
+    )
     update_kv(k, v, fwd=fwd)
-    write_ptr = paddle.zeros([1], dtype=paddle.int32)
-    # Reset the AG counter to 1 on the compute stream + record wptr_init, then make
-    # the comm stream wait for it -- the FM-4 stand-in for prepare_flashmask. Without
-    # this the counter stays at its post-iter value and step>=2 copies no remote KV.
     reset_ag_counter(compute_stream)
     wait_wptr_init()
-    run_ag(int(write_ptr.data_ptr()), fwd=fwd)
-    del _mask_keepalive
+    run_ag(write_ptr, fwd=fwd)
     wait_reset_stream_coordinator(compute_stream)
-    sync_comm_stream()
-    return sr_kv_view_args()
+    return sr_kv_view_args(), mask_keepalive
+
+
+def start_forward_ag(k, v, startend_row_indices, compute_stream):
+    """Launch forward sparse AG asynchronously for cumulative-frontier gating."""
+    import paddle
+
+    write_ptr = paddle.zeros([1], dtype=paddle.int32)
+    view, _ = _start_ag(
+        k,
+        v,
+        startend_row_indices,
+        compute_stream,
+        fwd=True,
+        write_ptr=int(write_ptr.data_ptr()),
+    )
+    return ForwardAgArgs(view, write_ptr, int(k.shape[1]))
 
 
 def start_backward_ag(k, v, startend_row_indices, compute_stream):
-    """Bwd sparse AG with fwd=False; returns the host-synced gathered K/V view."""
-    return start_forward_ag(k, v, startend_row_indices, compute_stream, fwd=False)
+    """Launch backward sparse AG asynchronously. The non-splitted comm kernel's bwd
+    traversal fills the remote KV region left-to-right, advancing the same wptr row
+    frontier (atomicMax) as forward, so the compute gate waits on it exactly like
+    forward -- only the edge differs (bwd gates the tile's right edge)."""
+    import paddle
+
+    write_ptr = paddle.zeros([1], dtype=paddle.int32)
+    view, _ = _start_ag(
+        k,
+        v,
+        startend_row_indices,
+        compute_stream,
+        fwd=False,
+        write_ptr=int(write_ptr.data_ptr()),
+    )
+    return BackwardAgArgs(view, write_ptr, int(k.shape[1]))

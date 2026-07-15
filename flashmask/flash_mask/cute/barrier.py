@@ -21,6 +21,15 @@ def ld_acquire(lock_ptr: cute.Pointer, *, loc=None, ip=None) -> cutlass.Int32:
 
 
 @cute.jit
+def wait_flag_eq(flag_ptr: cute.Pointer, elem_idx: int | Int32, target: Int32) -> None:
+    """Busy-spin with acquire loads until ``flag_ptr[elem_idx] == target``."""
+    ptr = flag_ptr + elem_idx
+    value = ld_acquire(ptr)
+    while value != target:
+        value = ld_acquire(ptr)
+
+
+@cute.jit
 def wait_write_ptr_ge(wptr: cute.Pointer, elem_idx: int | Int32, target: Int32) -> None:
     """Busy-spin until wptr[elem_idx] >= target. Caller elects a single thread.
 

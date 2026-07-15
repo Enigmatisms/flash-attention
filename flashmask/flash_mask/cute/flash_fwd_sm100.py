@@ -43,6 +43,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from flash_mask.cute.paged_kv import PagedKVManager
 import flash_mask.cute.utils as utils
 from flash_mask.cute import copy_utils
+from flash_mask.cute.barrier import wait_write_ptr_ge
 import flash_mask.cute.pipeline as pipeline
 from flash_mask.cute.mask import AttentionMask
 from flash_mask.cute.softmax import SoftmaxSm100, apply_score_mod_inner
@@ -67,7 +68,36 @@ from flash_mask.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     ParamsBase,
 )
-from flash_mask.cute.flashmask_utils import FlashMaskInfo
+from flash_mask.cute.flashmask_utils import FlashMaskInfo, OverlapInfo
+
+
+@cute.jit
+def _overlap_gate(
+    nblk: Int32,
+    tidx: Int32,
+    s_total: Int32,
+    batch_idx: Int32,
+    write_ptr: cute.Pointer,
+    n_block_size: cutlass.Constexpr[int],
+    kv_chunk_size: cutlass.Constexpr[int],
+):
+    """FM-4 overlap gate: spin the elected load-warp thread until the comm side has
+    gathered the remote KV rows for the tile at ``nblk``.
+
+    ``write_ptr`` is a per-batch ROW index advanced by atomicMax on the comm side; the
+    reverse-row math mirrors the comm kernel's reversed traversal (seqlen_offset =
+    s_total - s_local). A negative ``reverse_row`` means the tile is in the local chunk
+    (last ``kv_chunk_size`` rows of SRBuffer), which is never remote-fetched, so no wait.
+    Only ``tidx == 0`` spins, the same one-thread convention as the bwd dQ/dKV semaphores.
+
+    At module scope (not a nested closure) so its ``__closure__`` is empty and the DSL
+    ``closure_check`` accepts it inside dynamic control flow.
+    """
+    if tidx == 0:
+        reverse_row = s_total - nblk * n_block_size - kv_chunk_size
+        if reverse_row >= 0:
+            target = batch_idx * (s_total - kv_chunk_size) + reverse_row
+            wait_write_ptr_ge(write_ptr, 0, Int32(target))
 
 
 class NamedBarrierFwd(enum.IntEnum):
@@ -315,10 +345,12 @@ class FlashAttentionForwardSm100:
         flashmask_info: Optional[FlashMaskInfo] = None,
         overlap_k_addr: Optional[cutlass.Int64] = None,
         overlap_v_addr: Optional[cutlass.Int64] = None,
+        overlap_write_ptr_addr: Optional[cutlass.Int64] = None,
         overlap_b: Optional[cutlass.Int32] = None,
         overlap_s: Optional[cutlass.Int32] = None,
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
+        overlap_kv_chunk_size: cutlass.Constexpr = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -345,8 +377,8 @@ class FlashAttentionForwardSm100:
         # dims as RUNTIME Int32 scalars. Build the views HERE -- make_*_from_addr
         # needs this jit body's MLIR Context, and the Int32 dims give a dynamic
         # layout matching the dense from_dlpack path (its docstring explains why
-        # static dims read the wrong bytes). Comm readiness is handled before launch.
-        self.enable_overlap = const_expr(overlap_k_addr is not None)
+        # static dims read the wrong bytes). write_ptr is the gate's int32 counter.
+        self.enable_overlap = const_expr(overlap_write_ptr_addr is not None)
         if const_expr(self.enable_overlap):
             mK = utils.make_contiguous_bshd_from_addr(
                 overlap_k_addr, overlap_b, overlap_s, overlap_h, overlap_d,
@@ -356,6 +388,14 @@ class FlashAttentionForwardSm100:
                 overlap_v_addr, overlap_b, overlap_s, overlap_h, overlap_d,
                 mQ.element_type, align=16,
             )
+            overlap_info = OverlapInfo(
+                utils.make_gmem_tensor_from_addr(
+                    overlap_write_ptr_addr, (1,), (1,), cutlass.Int32, align=4
+                ),
+                overlap_kv_chunk_size,
+            )
+        else:
+            overlap_info = None
 
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
@@ -855,6 +895,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             flashmask_info,
+            overlap_info,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -901,6 +942,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         flashmask_info: Optional[FlashMaskInfo] = None,
+        overlap_info: Optional[OverlapInfo] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1190,6 +1232,7 @@ class FlashAttentionForwardSm100:
                 s_extra_flags,
                 s_startend_row_indices,
                 flashmask_info,
+                overlap_info,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1772,6 +1815,7 @@ class FlashAttentionForwardSm100:
         s_extra_flags: Optional[cute.Tensor],
         s_startend_row_indices: Optional[cute.Tensor],
         flashmask_info: Optional[FlashMaskInfo],
+        overlap_info: Optional[OverlapInfo],
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1891,6 +1935,22 @@ class FlashAttentionForwardSm100:
                 K_or_V="V",
             )
 
+            # FM-4 overlap gate: bound via partial (NOT a nested closure) so it has no
+            # __closure__ and passes the DSL closure_check inside the dynamic load loop.
+            # Off -> a no-op lambda, so the four call sites stay uniform at zero cost.
+            if const_expr(self.enable_overlap):
+                _gate = partial(
+                    _overlap_gate,
+                    tidx=tidx,
+                    s_total=seqlen.seqlen_k,
+                    batch_idx=batch_idx,
+                    write_ptr=overlap_info.write_ptr.iterator,
+                    n_block_size=self.n_block_size,
+                    kv_chunk_size=overlap_info.kv_chunk_size,
+                )
+            else:
+                _gate = lambda nblk: None
+
             if const_expr(self.enable_flashmask):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
@@ -1922,6 +1982,7 @@ class FlashAttentionForwardSm100:
                         )
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block_first)
+                        _gate(n_block_first)
                         load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                         kv_producer_state.advance()
                         if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):
@@ -1954,6 +2015,7 @@ class FlashAttentionForwardSm100:
                                 )
                                 if const_expr(not self.use_tma_KV):
                                     paged_kv_manager.load_page_table(n_block)
+                                _gate(n_block)
                                 load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
                                 kv_producer_state.advance()
                                 load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
@@ -2012,6 +2074,7 @@ class FlashAttentionForwardSm100:
                     )
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
+                    _gate(n_block_max - 1)
                     load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):
@@ -2029,6 +2092,7 @@ class FlashAttentionForwardSm100:
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
+                        _gate(n_block)
                         load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
                         kv_producer_state.advance()
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi

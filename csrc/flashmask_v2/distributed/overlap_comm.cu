@@ -1313,7 +1313,7 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     // num_chunks=1 (CP2 or S_local >= 32768) is now supported by the splitted kernels:
     // segment 0's local-only chunk triggers early return, and segment 1 processes the single remote chunk.
     int num_chunks_preview = get_num_chunk_per_segment(s_kv, nranks, h_kv);
-    bool new_overlap_rs = (h_kv >= rs_overlap_min_h_k && nranks > 1);
+    bool new_overlap_rs = false; // (h_kv >= rs_overlap_min_h_k && nranks > 1);
 
     // Validate S_local is in the supported dispatch set (applies to both first-time and reconfigure)
     if (s_kv != 4096 && s_kv != 8192 && s_kv != 16384

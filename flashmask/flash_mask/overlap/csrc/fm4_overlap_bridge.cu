@@ -22,13 +22,10 @@ inline cudaStream_t as_stream(uint64_t handle) {
     return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(handle));
 }
 
-// Reset the AG remote-get kernel's dynamic-scheduling counter to 1, mirroring
-// prepare_flashmask_kernel on the PHI path (flash_prepare_scheduler.cu:125). The
-// counter lives in the long-lived singleton (address stable), so without a
-// per-iter reset every CTA's first atomicAdd in iter>=2 already exceeds
-// total_chunks -> wid=INT_MAX -> the remote-get loop copies nothing.
+// FM-4 does not run prepare_flashmask_kernel, so reset the persistent AG
+// scheduler counter here before every forward or backward gather.
 __global__ void fm4_reset_ag_counter_kernel(int* const block_cnt_semaphore) {
-    if (threadIdx.x == 0 && block_cnt_semaphore) { *block_cnt_semaphore = 1; }
+    if (threadIdx.x == 0) { *block_cnt_semaphore = 1; }
 }
 
 }  // namespace
@@ -63,10 +60,15 @@ uint64_t fm4_overlap_k_data() {
 uint64_t fm4_overlap_v_data() {
     return reinterpret_cast<uint64_t>(flashmask::comm::singleton().v_data());
 }
+uint64_t fm4_overlap_work_done() {
+    return reinterpret_cast<uint64_t>(
+        flashmask::comm::singleton().get_work_done_ptr());
+}
 
 // Local seqlen chunk (S_local); after AG, S_total = s_local * nranks.
 int fm4_overlap_s_local() { return flashmask::comm::singleton().s_local(); }
 int fm4_overlap_nranks() { return flashmask::comm::singleton().nranks(); }
+int fm4_overlap_comm_rpb() { return flashmask::comm::singleton().get_comm_rpb(); }
 
 // Copy local K/V into the SRBuffer on the internal comm_stream (cudaMemcpyAsync).
 void fm4_overlap_update_kv(uint64_t k_ptr, uint64_t v_ptr, int fwd) {
@@ -105,9 +107,8 @@ void fm4_overlap_wait_sr_buffer_empty(uint64_t compute_stream) {
     flashmask::comm::singleton().wait_sr_buffer_empty(as_stream(compute_stream));
 }
 
-// Reset the AG counter to 1 on the compute stream + record wptr_init there. The
-// FM-4 stand-in for the reset half of prepare_flashmask (the cute path never
-// calls it); pairs with fm4_overlap_wait_wptr_init.
+// Reset the AG scheduler on the compute stream; pairs with
+// fm4_overlap_wait_wptr_init on the comm stream.
 void fm4_overlap_reset_ag_counter(uint64_t compute_stream) {
     auto& c = flashmask::comm::singleton();
     cudaStream_t s = as_stream(compute_stream);
