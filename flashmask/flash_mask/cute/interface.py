@@ -1014,24 +1014,6 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = {}
 
 
-def _slice_flashmask_k_segment(flashmask_info, start, end, nblock_start, nblock_end):
-    def slice_nblock(t):
-        return None if t is None else t[:, :, nblock_start:nblock_end].contiguous()
-
-    return FlashMaskInfoPaddle(
-        is_causal=flashmask_info.is_causal,
-        startend_row_indices=flashmask_info.startend_row_indices[:, :, start:end, :],
-        LTS_nblock_max=slice_nblock(flashmask_info.LTS_nblock_max),
-        LTS_nblock_min=slice_nblock(flashmask_info.LTS_nblock_min),
-        LTE_nblock_max=slice_nblock(flashmask_info.LTE_nblock_max),
-        LTE_nblock_min=slice_nblock(flashmask_info.LTE_nblock_min),
-        UTS_nblock_max=slice_nblock(flashmask_info.UTS_nblock_max),
-        UTS_nblock_min=slice_nblock(flashmask_info.UTS_nblock_min),
-        UTE_nblock_max=slice_nblock(flashmask_info.UTE_nblock_max),
-        UTE_nblock_min=slice_nblock(flashmask_info.UTE_nblock_min),
-    )
-
-
 def _flash_attn_bwd(
     q: paddle.Tensor,
     k: paddle.Tensor,
@@ -1140,8 +1122,7 @@ def _flash_attn_bwd(
     # on the producer's per-work completion bitmap.
     enable_overlap = group is not None and group.world_size > 1
     overlap_view_args = None
-    overlap_flashmask_segments = None
-    overlap_cute_flashmask_segments = None
+    overlap_segment_idx = None
     if enable_overlap:
         if compute_capability != 10:
             raise NotImplementedError("FM-4 overlap bwd is only supported on SM100")
@@ -1170,21 +1151,9 @@ def _flash_attn_bwd(
         assert segment_nblocks % 4 == 0, (
             "FM-3 segment mask metadata requires a 4-block-aligned segment"
         )
-        overlap_flashmask_segments = [
-            _slice_flashmask_k_segment(
-                flashmask_info,
-                segment_idx * segment_seqlen,
-                (segment_idx + 1) * segment_seqlen,
-                segment_idx * segment_nblocks,
-                (segment_idx + 1) * segment_nblocks,
-            )
-            for segment_idx in range(overlap_ag_args.num_segments)
-        ]
-        overlap_cute_flashmask_segments = [
-            to_cute_flashmask_info(segment_info)
-            for segment_info in overlap_flashmask_segments
-        ]
-        cute_flashmask_info = overlap_cute_flashmask_segments[0]
+        # Keep the full mask tensors. The SM100 loader applies the segment offset
+        # while indexing, preserving the original batch/head stride without copies.
+        cute_flashmask_info = to_cute_flashmask_info(flashmask_info)
         # All segment-local scheduler and semaphore shapes use this length. The
         # original local length is retained by k/v and by the final dK/dV outputs.
         seqlen_k = segment_seqlen
@@ -1266,10 +1235,8 @@ def _flash_attn_bwd(
         total_k = k.shape[0]
 
     if enable_overlap:
-        # k/v are LOCAL (S_local) but the grad kernel reads the gathered SRBuffer:
-        # seqlen_k is the gathered S_total = S_local * nranks, and dK/dV are produced
-        # at that length. Skip the LOCAL-shape assert (the SRBuffer view below carries
-        # the gathered shape into the kernel).
+        # k/v are local inputs, while the grad kernel consumes one gathered SRBuffer
+        # segment at a time. The segment view supplies the scheduler and dK/dV shape.
         seqlen_k = overlap_view_args.shape[1]
         total_k = batch_size * seqlen_k
         assert num_head_kv == overlap_view_args.shape[2]
@@ -1545,6 +1512,7 @@ def _flash_attn_bwd(
         overlap_s = cutlass.Int32(_os)
         overlap_h = cutlass.Int32(_oh)
         overlap_d = cutlass.Int32(_od)
+        overlap_segment_idx = cutlass.Int32(0)
         overlap_comm_rpb = overlap_ag_args.comm_rpb
         overlap_dk_send_addr, overlap_dv_send_addr = overlap_ag_args.dkv_send_addrs(0)
         overlap_dk_addr = (
@@ -1763,7 +1731,6 @@ def _flash_attn_bwd(
                 is_split_d=is_split_d_bwd,
                 is_split_dv=is_split_dv_bwd,
             )
-
             _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
                 fa_bwd_obj,
                 q_tensor,
@@ -1784,10 +1751,10 @@ def _flash_attn_bwd(
                 mdK_semaphore=dK_semaphore_tensor,
                 mdV_semaphore=dV_semaphore_tensor,
                 flashmask_info=cute_flashmask_info,
-                stream=current_stream,
                 overlap_k_addr=overlap_k_addr,
                 overlap_v_addr=overlap_v_addr,
                 overlap_work_done_addr=overlap_work_done_addr,
+                overlap_segment_idx=overlap_segment_idx,
                 overlap_dk_addr=overlap_dk_addr,
                 overlap_dv_addr=overlap_dv_addr,
                 overlap_b=overlap_b,
@@ -1795,6 +1762,7 @@ def _flash_attn_bwd(
                 overlap_h=overlap_h,
                 overlap_d=overlap_d,
                 overlap_comm_rpb=overlap_comm_rpb,
+                stream=current_stream,
             )
     if compute_capability == 9:
         _flash_attn_bwd.compile_cache[compile_key](
@@ -1825,6 +1793,7 @@ def _flash_attn_bwd(
             segment_v_addr,
             segment_dk_addr,
             segment_dv_addr,
+            segment_idx=None,
         ):
             _flash_attn_bwd.compile_cache[compile_key](
                 q_tensor,
@@ -1848,6 +1817,9 @@ def _flash_attn_bwd(
                 overlap_k_addr=segment_k_addr,
                 overlap_v_addr=segment_v_addr,
                 overlap_work_done_addr=overlap_work_done_addr,
+                overlap_segment_idx=(
+                    None if segment_idx is None else cutlass.Int32(segment_idx)
+                ),
                 overlap_dk_addr=segment_dk_addr,
                 overlap_dv_addr=segment_dv_addr,
                 overlap_b=overlap_b,
@@ -1970,7 +1942,6 @@ def _flash_attn_bwd(
         )
 
     if enable_overlap:
-        assert overlap_cute_flashmask_segments is not None
         raw_b = cutlass.Int32(batch_size)
         raw_s = cutlass.Int32(segment_seqlen)
         raw_h = cutlass.Int32(num_head_kv)
@@ -2075,11 +2046,12 @@ def _flash_attn_bwd(
             if not need_kv_accum:
                 overlap_runtime.wait_dkv_buffer(segment_idx, overlap_stream)
             _run_bwd_main(
-                overlap_cute_flashmask_segments[segment_idx],
+                cute_flashmask_info,
                 segment_k_addr,
                 segment_v_addr,
                 segment_dk_addr,
                 segment_dv_addr,
+                segment_idx=segment_idx,
             )
             if need_kv_accum:
                 overlap_runtime.wait_dkv_buffer(segment_idx, overlap_stream)
