@@ -69,6 +69,27 @@ uint64_t fm4_overlap_work_done() {
 int fm4_overlap_s_local() { return flashmask::comm::singleton().s_local(); }
 int fm4_overlap_nranks() { return flashmask::comm::singleton().nranks(); }
 int fm4_overlap_comm_rpb() { return flashmask::comm::singleton().get_comm_rpb(); }
+int fm4_overlap_num_segments() { return flashmask::comm::singleton().num_segments(); }
+int fm4_overlap_segment_seqlen() {
+    auto& c = flashmask::comm::singleton();
+    return c.s_local() * c.chunk_per_seg();
+}
+uint64_t fm4_overlap_segment_k_data(int segment_idx) {
+    return reinterpret_cast<uint64_t>(
+        flashmask::comm::singleton().segment_k_data(segment_idx));
+}
+uint64_t fm4_overlap_segment_v_data(int segment_idx) {
+    return reinterpret_cast<uint64_t>(
+        flashmask::comm::singleton().segment_v_data(segment_idx));
+}
+uint64_t fm4_overlap_dk_send(int segment_idx) {
+    return reinterpret_cast<uint64_t>(
+        flashmask::comm::singleton().dk_send(segment_idx));
+}
+uint64_t fm4_overlap_dv_send(int segment_idx) {
+    return reinterpret_cast<uint64_t>(
+        flashmask::comm::singleton().dv_send(segment_idx));
+}
 
 // Copy local K/V into the SRBuffer on the internal comm_stream (cudaMemcpyAsync).
 void fm4_overlap_update_kv(uint64_t k_ptr, uint64_t v_ptr, int fwd) {
@@ -107,11 +128,43 @@ void fm4_overlap_wait_sr_buffer_empty(uint64_t compute_stream) {
     flashmask::comm::singleton().wait_sr_buffer_empty(as_stream(compute_stream));
 }
 
+void fm4_overlap_prepare_dkv_buffer(uint64_t compute_stream) {
+    flashmask::comm::singleton().prepare_dkv_buffer(as_stream(compute_stream));
+}
+
+void fm4_overlap_start_bwd_segment(int segment_idx, uint64_t compute_stream) {
+    auto& c = flashmask::comm::singleton();
+    cudaStream_t stream = as_stream(compute_stream);
+    c.ensure_ag_done(stream);
+    fm4_reset_ag_counter_kernel<<<1, 32, 0, stream>>>(c.get_block_cnt_semaphore());
+    cudaEventRecord(c.wptr_init, stream);
+    c.wait_wptr_init();
+    c.run_overlap_splitted_ag_kernel(nullptr, segment_idx);
+    c.wait_reset_stream_coordinator(stream);
+}
+
+void fm4_overlap_wait_dkv_buffer(int segment_idx, uint64_t compute_stream) {
+    flashmask::comm::singleton().wait_dkv_buffer(segment_idx, as_stream(compute_stream));
+}
+
+void fm4_overlap_run_rs(uint64_t dk_ptr, uint64_t dv_ptr, int segment_idx,
+                        uint64_t compute_stream) {
+    flashmask::comm::singleton().run_overlap_rs_kernel(
+        reinterpret_cast<bf16*>(static_cast<uintptr_t>(dk_ptr)),
+        reinterpret_cast<bf16*>(static_cast<uintptr_t>(dv_ptr)),
+        segment_idx, as_stream(compute_stream));
+}
+
+void fm4_overlap_wait_reduce_done(uint64_t compute_stream) {
+    flashmask::comm::singleton().wait_reduce_done(as_stream(compute_stream));
+}
+
 // Reset the AG scheduler on the compute stream; pairs with
 // fm4_overlap_wait_wptr_init on the comm stream.
 void fm4_overlap_reset_ag_counter(uint64_t compute_stream) {
     auto& c = flashmask::comm::singleton();
     cudaStream_t s = as_stream(compute_stream);
+    c.ensure_ag_done(s);
     fm4_reset_ag_counter_kernel<<<1, 32, 0, s>>>(c.get_block_cnt_semaphore());
     cudaEventRecord(c.wptr_init, s);
 }
@@ -127,9 +180,8 @@ void fm4_overlap_wait_reset_stream_coordinator(uint64_t stream) {
     flashmask::comm::singleton().wait_reset_stream_coordinator(as_stream(stream));
 }
 
-// Host-block until the internal comm_stream drains. The FM-4 bwd step-1 path runs
-// the sparse AG without the in-kernel gate, so the caller must sync here before
-// launching the grad kernel that consumes the gathered SRBuffer.
+// Legacy host-sync entry point retained for ABI compatibility. Active FM-4
+// forward and split backward paths use asynchronous readiness handshakes instead.
 void fm4_overlap_sync_comm_stream() {
     flashmask::comm::singleton().sync_comm_stream();
 }

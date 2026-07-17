@@ -44,14 +44,33 @@ def _load():
     lib.fm4_overlap_init.argtypes = [ctypes.c_int] * 6 + [ctypes.c_char_p, ctypes.c_int]
     lib.fm4_overlap_init.restype = ctypes.c_int
 
-    for name in ("fm4_overlap_k_data", "fm4_overlap_v_data"):
+    for name in (
+        "fm4_overlap_k_data",
+        "fm4_overlap_v_data",
+        "fm4_overlap_work_done",
+    ):
         fn = getattr(lib, name)
         fn.argtypes = []
         fn.restype = ctypes.c_uint64
-    for name in ("fm4_overlap_s_local", "fm4_overlap_nranks"):
+    for name in (
+        "fm4_overlap_s_local",
+        "fm4_overlap_nranks",
+        "fm4_overlap_comm_rpb",
+        "fm4_overlap_num_segments",
+        "fm4_overlap_segment_seqlen",
+    ):
         fn = getattr(lib, name)
         fn.argtypes = []
         fn.restype = ctypes.c_int
+    for name in (
+        "fm4_overlap_segment_k_data",
+        "fm4_overlap_segment_v_data",
+        "fm4_overlap_dk_send",
+        "fm4_overlap_dv_send",
+    ):
+        fn = getattr(lib, name)
+        fn.argtypes = [ctypes.c_int]
+        fn.restype = ctypes.c_uint64
 
     lib.fm4_overlap_update_kv.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
     lib.fm4_overlap_update_kv.restype = None
@@ -63,12 +82,29 @@ def _load():
     lib.fm4_overlap_compute_chunk_mask.argtypes = [ctypes.c_uint64] * 3 + [ctypes.c_int]
     lib.fm4_overlap_compute_chunk_mask.restype = None
 
-    for name in ("fm4_overlap_wait_sr_buffer_empty", "fm4_overlap_wait_reset_stream_coordinator"):
+    for name in (
+        "fm4_overlap_wait_sr_buffer_empty",
+        "fm4_overlap_wait_reset_stream_coordinator",
+        "fm4_overlap_prepare_dkv_buffer",
+        "fm4_overlap_wait_reduce_done",
+    ):
         fn = getattr(lib, name)
         fn.argtypes = [ctypes.c_uint64]
         fn.restype = None
     lib.fm4_overlap_reset_ag_counter.argtypes = [ctypes.c_uint64]
     lib.fm4_overlap_reset_ag_counter.restype = None
+
+    lib.fm4_overlap_start_bwd_segment.argtypes = [ctypes.c_int, ctypes.c_uint64]
+    lib.fm4_overlap_start_bwd_segment.restype = None
+    lib.fm4_overlap_wait_dkv_buffer.argtypes = [ctypes.c_int, ctypes.c_uint64]
+    lib.fm4_overlap_wait_dkv_buffer.restype = None
+    lib.fm4_overlap_run_rs.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_uint64,
+        ctypes.c_int,
+        ctypes.c_uint64,
+    ]
+    lib.fm4_overlap_run_rs.restype = None
 
     lib.fm4_overlap_wait_wptr_init.argtypes = []
     lib.fm4_overlap_wait_wptr_init.restype = None
@@ -188,8 +224,7 @@ def wait_wptr_init():
 
 
 def sync_comm_stream():
-    """Host-block until the internal comm_stream has fully drained before the kernel
-    consumes the gathered SRBuffer."""
+    """Legacy host-sync entry point; active overlap paths use async readiness waits."""
     _load().fm4_overlap_sync_comm_stream()
 
 
@@ -234,9 +269,27 @@ class ForwardAgArgs(NamedTuple):
 
 
 class BackwardAgArgs(NamedTuple):
-    view: SrKvView
-    write_ptr: object
-    kv_chunk_size: int
+    num_segments: int
+    segment_seqlen: int
+    work_done_addr: int
+    comm_rpb: int
+    shape: tuple  # (B, S_segment, H, D)
+    mask_keepalive: object
+
+    def kv_view(self, segment_idx):
+        lib = _load()
+        return SrKvView(
+            k_addr=lib.fm4_overlap_segment_k_data(int(segment_idx)),
+            v_addr=lib.fm4_overlap_segment_v_data(int(segment_idx)),
+            shape=self.shape,
+        )
+
+    def dkv_send_addrs(self, segment_idx):
+        lib = _load()
+        return (
+            lib.fm4_overlap_dk_send(int(segment_idx)),
+            lib.fm4_overlap_dv_send(int(segment_idx)),
+        )
 
 
 def sr_kv_view_args():
@@ -282,19 +335,49 @@ def start_forward_ag(k, v, startend_row_indices, compute_stream):
 
 
 def start_backward_ag(k, v, startend_row_indices, compute_stream):
-    """Launch backward sparse AG asynchronously. The non-splitted comm kernel's bwd
-    traversal fills the remote KV region left-to-right, advancing the same wptr row
-    frontier (atomicMax) as forward, so the compute gate waits on it exactly like
-    forward -- only the edge differs (bwd gates the tile's right edge)."""
-    import paddle
-
-    write_ptr = paddle.zeros([1], dtype=paddle.int32)
-    view, _ = _start_ag(
-        k,
-        v,
-        startend_row_indices,
-        compute_stream,
-        fwd=False,
-        write_ptr=int(write_ptr.data_ptr()),
+    """Prepare multi-stage backward AG/RS and launch split AG segment 0."""
+    lib = _load()
+    lib.fm4_overlap_prepare_dkv_buffer(int(compute_stream))
+    mask_keepalive = compute_chunk_mask_sparse(
+        startend_row_indices, compute_stream, fwd=False
     )
-    return BackwardAgArgs(view, write_ptr, int(k.shape[1]))
+    wait_sr_buffer_empty(compute_stream)
+    update_kv(k, v, fwd=False)
+
+    num_segments = int(lib.fm4_overlap_num_segments())
+    if num_segments <= 1:
+        raise RuntimeError("FM-4 backward overlap requires multi-stage RS")
+    segment_seqlen = int(lib.fm4_overlap_segment_seqlen())
+    comm_rpb = int(lib.fm4_overlap_comm_rpb())
+    work_done_addr = int(lib.fm4_overlap_work_done())
+    if segment_seqlen <= 0 or comm_rpb <= 0 or work_done_addr == 0:
+        raise RuntimeError("invalid FM-4 backward overlap metadata")
+
+    b, h, d = _KV_SHAPE
+    lib.fm4_overlap_start_bwd_segment(0, int(compute_stream))
+    return BackwardAgArgs(
+        num_segments=num_segments,
+        segment_seqlen=segment_seqlen,
+        work_done_addr=work_done_addr,
+        comm_rpb=comm_rpb,
+        shape=(b, segment_seqlen, h, d),
+        mask_keepalive=mask_keepalive,
+    )
+
+
+def start_backward_segment(segment_idx, compute_stream):
+    _load().fm4_overlap_start_bwd_segment(int(segment_idx), int(compute_stream))
+
+
+def wait_dkv_buffer(segment_idx, compute_stream):
+    _load().fm4_overlap_wait_dkv_buffer(int(segment_idx), int(compute_stream))
+
+
+def run_backward_rs(dk, dv, segment_idx, compute_stream):
+    _load().fm4_overlap_run_rs(
+        _data_ptr(dk), _data_ptr(dv), int(segment_idx), int(compute_stream)
+    )
+
+
+def wait_backward_rs(compute_stream):
+    _load().fm4_overlap_wait_reduce_done(int(compute_stream))
