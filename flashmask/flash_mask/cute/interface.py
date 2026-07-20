@@ -423,6 +423,7 @@ def _flash_attn_fwd(
     if enable_overlap and compute_capability != 10:
         raise NotImplementedError("FM-4 overlap fwd is only supported on SM100")
     overlap_view_args = None
+    overlap_bhsd_layout = None
     if enable_overlap:
         overlap_runtime = _get_overlap_runtime()
         assert startend_row_indices is not None, (
@@ -439,6 +440,7 @@ def _flash_attn_fwd(
         overlap_runtime.ensure_initialized(
             k, v, group, mask_head=startend_row_indices.shape[1]
         )
+        overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle()
         # Launch AG and retain the gathered SRBuffer view; its FULL S_total shape
         # drives host-side validation and the runtime-dimension kernel arguments.
@@ -840,6 +842,7 @@ def _flash_attn_fwd(
         overlap_h = None
         overlap_d = None
         overlap_kv_chunk_size = None
+        overlap_bhsd_layout = None
 
     compile_key = (
         dtype,
@@ -873,6 +876,7 @@ def _flash_attn_fwd(
         # overlap: K/V are rebuilt from SRBuffer addresses, so an overlap kernel and
         # a plain kernel for the same shapes are different compiled artifacts.
         enable_overlap,
+        overlap_bhsd_layout,
         overlap_kv_chunk_size,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -947,7 +951,6 @@ def _flash_attn_fwd(
             blocksparse_tensors=sparse_tensors,
             aux_tensors=cute_aux_tensors,
             flashmask_info=cute_flashmask_info,
-            stream=current_stream,
             **(
                 {
                     "overlap_k_addr": overlap_k_addr,
@@ -958,10 +961,12 @@ def _flash_attn_fwd(
                     "overlap_h": overlap_h,
                     "overlap_d": overlap_d,
                     "overlap_kv_chunk_size": overlap_kv_chunk_size,
+                    "overlap_bhsd_layout": overlap_bhsd_layout,
                 }
                 if compute_capability == 10
                 else {}
             ),
+            stream=current_stream,
         )
     # Runtime address and shape scalars are re-supplied below; compile-time
     # overlap_kv_chunk_size is captured by the compiled callable.
@@ -984,7 +989,6 @@ def _flash_attn_fwd(
         blocksparse_tensors=sparse_tensors,
         aux_tensors=cute_aux_tensors,
         flashmask_info=cute_flashmask_info,
-        stream=current_stream,
         **(
             {
                 "overlap_k_addr": overlap_k_addr,
@@ -998,6 +1002,7 @@ def _flash_attn_fwd(
             if compute_capability == 10
             else {}
         ),
+        stream=current_stream,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1122,6 +1127,7 @@ def _flash_attn_bwd(
     # on the producer's per-work completion bitmap.
     enable_overlap = group is not None and group.world_size > 1
     overlap_view_args = None
+    overlap_bhsd_layout = None
     overlap_segment_idx = None
     if enable_overlap:
         if compute_capability != 10:
@@ -1138,6 +1144,7 @@ def _flash_attn_bwd(
         overlap_runtime.ensure_initialized(
             k, v, group, mask_head=startend_row_indices.shape[1]
         )
+        overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle()
         overlap_ag_args = overlap_runtime.start_backward_ag(
             k, v, startend_row_indices, overlap_stream
@@ -1532,6 +1539,7 @@ def _flash_attn_bwd(
         overlap_h = None
         overlap_d = None
         overlap_comm_rpb = None
+        overlap_bhsd_layout = None
 
     compile_key_pre = (compute_capability, dtype, head_dim, head_dim_v, head_dim_rounded, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
@@ -1623,6 +1631,7 @@ def _flash_attn_bwd(
             # overlap: an overlap grad kernel (K/V rebuilt from SRBuffer addr) and a
             # plain one for the same shapes are different compiled artifacts.
             enable_overlap,
+            overlap_bhsd_layout,
             overlap_comm_rpb,
         )
 
@@ -1762,6 +1771,7 @@ def _flash_attn_bwd(
                 overlap_h=overlap_h,
                 overlap_d=overlap_d,
                 overlap_comm_rpb=overlap_comm_rpb,
+                overlap_bhsd_layout=overlap_bhsd_layout,
                 stream=current_stream,
             )
     if compute_capability == 9:

@@ -576,6 +576,7 @@ class FlashAttentionBackwardSm100:
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
         overlap_comm_rpb: cutlass.Constexpr = None,
+        overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -591,14 +592,44 @@ class FlashAttentionBackwardSm100:
         # This mirrors the forward SRBuffer view construction. Readiness is gated
         # per communication work item in the load warp below.
         if const_expr(overlap_k_addr is not None):
-            mK = utils.make_contiguous_bshd_from_addr(
-                overlap_k_addr, overlap_b, overlap_s, overlap_h, overlap_d,
-                mQ.element_type, align=16,
-            )
-            mV = utils.make_contiguous_bshd_from_addr(
-                overlap_v_addr, overlap_b, overlap_s, overlap_h, overlap_d,
-                mQ.element_type, align=16,
-            )
+            if const_expr(overlap_bhsd_layout):
+                mK = utils.make_bhsd_storage_bshd_from_addr(
+                    overlap_k_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+                mV = utils.make_bhsd_storage_bshd_from_addr(
+                    overlap_v_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+            else:
+                mK = utils.make_contiguous_bshd_from_addr(
+                    overlap_k_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+                mV = utils.make_contiguous_bshd_from_addr(
+                    overlap_v_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
         if const_expr(overlap_dk_addr is not None):
             mdK = utils.make_contiguous_bshd_from_addr(
                 overlap_dk_addr, overlap_b, overlap_s, overlap_h, overlap_d,

@@ -68,6 +68,12 @@ uint64_t fm4_overlap_work_done() {
 // Local seqlen chunk (S_local); after AG, S_total = s_local * nranks.
 int fm4_overlap_s_local() { return flashmask::comm::singleton().s_local(); }
 int fm4_overlap_nranks() { return flashmask::comm::singleton().nranks(); }
+int fm4_overlap_use_bhsd_layout() {
+    return flashmask::comm::singleton().use_bhsd_layout() ? 1 : 0;
+}
+int fm4_overlap_use_hierarchical() {
+    return flashmask::comm::singleton().use_hierarchical() ? 1 : 0;
+}
 int fm4_overlap_comm_rpb() { return flashmask::comm::singleton().get_comm_rpb(); }
 int fm4_overlap_num_segments() { return flashmask::comm::singleton().num_segments(); }
 int fm4_overlap_segment_seqlen() {

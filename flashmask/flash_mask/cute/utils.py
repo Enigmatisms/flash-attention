@@ -717,6 +717,19 @@ def make_contiguous_bshd_from_addr(addr, b, s, h, d, dtype, *, align=16, loc=Non
 
 
 @dsl_user_op
+def make_bhsd_storage_bshd_from_addr(
+    addr, b, s, h, d, dtype, *, align=16, loc=None, ip=None
+):
+    """Build a logical (B, S, H, D) view over physical BHSD storage.
+
+    The dimensions must remain runtime Int32 so the resulting layout stays
+    dynamic for TMA descriptor construction. No data movement is performed.
+    """
+    stride = (h * s * d, d, s * d, 1)
+    return make_gmem_tensor_from_addr(addr, (b, s, h, d), stride, dtype, align=align)
+
+
+@dsl_user_op
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)

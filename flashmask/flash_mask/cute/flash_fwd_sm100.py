@@ -351,6 +351,7 @@ class FlashAttentionForwardSm100:
         overlap_h: Optional[cutlass.Int32] = None,
         overlap_d: Optional[cutlass.Int32] = None,
         overlap_kv_chunk_size: cutlass.Constexpr = None,
+        overlap_bhsd_layout: cutlass.Constexpr = False,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -380,14 +381,44 @@ class FlashAttentionForwardSm100:
         # static dims read the wrong bytes). write_ptr is the gate's int32 counter.
         self.enable_overlap = const_expr(overlap_write_ptr_addr is not None)
         if const_expr(self.enable_overlap):
-            mK = utils.make_contiguous_bshd_from_addr(
-                overlap_k_addr, overlap_b, overlap_s, overlap_h, overlap_d,
-                mQ.element_type, align=16,
-            )
-            mV = utils.make_contiguous_bshd_from_addr(
-                overlap_v_addr, overlap_b, overlap_s, overlap_h, overlap_d,
-                mQ.element_type, align=16,
-            )
+            if const_expr(overlap_bhsd_layout):
+                mK = utils.make_bhsd_storage_bshd_from_addr(
+                    overlap_k_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+                mV = utils.make_bhsd_storage_bshd_from_addr(
+                    overlap_v_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+            else:
+                mK = utils.make_contiguous_bshd_from_addr(
+                    overlap_k_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
+                mV = utils.make_contiguous_bshd_from_addr(
+                    overlap_v_addr,
+                    overlap_b,
+                    overlap_s,
+                    overlap_h,
+                    overlap_d,
+                    mQ.element_type,
+                    align=16,
+                )
             overlap_info = OverlapInfo(
                 utils.make_gmem_tensor_from_addr(
                     overlap_write_ptr_addr, (1,), (1,), cutlass.Int32, align=4

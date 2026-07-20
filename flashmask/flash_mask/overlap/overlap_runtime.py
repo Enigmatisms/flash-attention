@@ -55,6 +55,8 @@ def _load():
     for name in (
         "fm4_overlap_s_local",
         "fm4_overlap_nranks",
+        "fm4_overlap_use_bhsd_layout",
+        "fm4_overlap_use_hierarchical",
         "fm4_overlap_comm_rpb",
         "fm4_overlap_num_segments",
         "fm4_overlap_segment_seqlen",
@@ -174,6 +176,16 @@ def ensure_initialized(k, v, group, mask_head=1):
     when they actually change, so unconditional forwarding is cheap and correct."""
     uid = bootstrap_unique_id(group.rank, group=group)
     init_overlap(k, v, group.rank, group.world_size, uid, mask_head=mask_head)
+
+
+def use_bhsd_layout():
+    """Return the communicator's effective SRBuffer layout after initialization."""
+    return bool(_load().fm4_overlap_use_bhsd_layout())
+
+
+def use_hierarchical():
+    """Return whether the communicator's effective topology is hierarchical."""
+    return bool(_load().fm4_overlap_use_hierarchical())
 
 
 def _data_ptr(t):
