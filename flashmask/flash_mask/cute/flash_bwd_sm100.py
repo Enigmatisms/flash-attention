@@ -591,6 +591,7 @@ class FlashAttentionBackwardSm100:
         # dlpack path produces -- static dims read the wrong bytes (utils.py:801).
         # This mirrors the forward SRBuffer view construction. Readiness is gated
         # per communication work item in the load warp below.
+        self.overlap_bhsd_layout = const_expr(overlap_bhsd_layout)
         if const_expr(overlap_k_addr is not None):
             if const_expr(overlap_bhsd_layout):
                 mK = utils.make_bhsd_storage_bshd_from_addr(
@@ -1961,12 +1962,18 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            head_idx_kv = head_idx // self.qhead_per_kvhead
             if const_expr(overlap_work_done_addr is not None):
+                gate_batch_idx = batch_idx
+                if const_expr(self.overlap_bhsd_layout):
+                    gate_batch_idx = (
+                        batch_idx * cute.size(mK.shape[2]) + head_idx_kv
+                    )
                 _overlap_gate_bwd(
                     n_block,
                     tidx,
                     seqlen.seqlen_k,
-                    batch_idx,
+                    gate_batch_idx,
                     work_done,
                     overlap_comm_rpb,
                     self.cta_group_size,
@@ -1975,7 +1982,6 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
             n_block_cta_group = n_block // self.cta_group_size
 
             mQ_cur = mQ[None, None, head_idx, batch_idx]

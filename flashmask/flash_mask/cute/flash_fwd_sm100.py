@@ -380,6 +380,7 @@ class FlashAttentionForwardSm100:
         # layout matching the dense from_dlpack path (its docstring explains why
         # static dims read the wrong bytes). write_ptr is the gate's int32 counter.
         self.enable_overlap = const_expr(overlap_write_ptr_addr is not None)
+        self.overlap_bhsd_layout = const_expr(overlap_bhsd_layout)
         if const_expr(self.enable_overlap):
             if const_expr(overlap_bhsd_layout):
                 mK = utils.make_bhsd_storage_bshd_from_addr(
@@ -1970,11 +1971,16 @@ class FlashAttentionForwardSm100:
             # __closure__ and passes the DSL closure_check inside the dynamic load loop.
             # Off -> a no-op lambda, so the four call sites stay uniform at zero cost.
             if const_expr(self.enable_overlap):
+                gate_batch_idx = batch_idx
+                if const_expr(self.overlap_bhsd_layout):
+                    gate_batch_idx = (
+                        batch_idx * cute.size(mK.shape[2]) + head_idx_kv
+                    )
                 _gate = partial(
                     _overlap_gate,
                     tidx=tidx,
                     s_total=seqlen.seqlen_k,
-                    batch_idx=batch_idx,
+                    batch_idx=gate_batch_idx,
                     write_ptr=overlap_info.write_ptr.iterator,
                     n_block_size=self.n_block_size,
                     kv_chunk_size=overlap_info.kv_chunk_size,
