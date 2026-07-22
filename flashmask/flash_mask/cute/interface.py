@@ -1932,23 +1932,25 @@ def _flash_attn_bwd(
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
                 fa_bwd_post,
                 d_accum_t, d_out_t, scale,
-                cu_seqlens_t, seqused_t, current_stream,
+                cu_seqlens_t, seqused_t,
                 raw_output_addr=raw_output_addr,
                 raw_b=raw_b,
                 raw_s=raw_s,
                 raw_h=raw_h,
                 raw_d=raw_d,
                 raw_storage_d=raw_storage_d,
+                stream=current_stream,
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
             d_accum_t, d_out_t, scale,
-            cu_seqlens_t, seqused_t, current_stream,
+            cu_seqlens_t, seqused_t,
             raw_output_addr=raw_output_addr,
             raw_b=raw_b,
             raw_s=raw_s,
             raw_h=raw_h,
             raw_d=raw_d,
             raw_storage_d=raw_storage_d,
+            stream=current_stream,
         )
 
     if enable_overlap:
