@@ -10,20 +10,25 @@
 #include "tile_size.h"
 #include "heuristics.h"
 #include "cuda_check.h"
+#include <cstddef>
 #include <cstring>
 
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
 
-#include <nvshmem.h>
-#include <nvshmemx.h>
+#include <nccl.h>
 #include "distributed/cp_heuristic.cuh"
 
-// Generate unique ID (call with rank 0 and broadcast this object)
-std::vector<uint8_t> get_nvshmem_unique_id() {
-    nvshmemx_uniqueid_t unique_id;
-    nvshmemx_get_uniqueid(&unique_id);
-    std::vector<uint8_t> result(sizeof(nvshmemx_uniqueid_t));
-    std::memcpy(result.data(), &unique_id, sizeof(nvshmemx_uniqueid_t));
+static_assert(sizeof(ncclUniqueId) == 128,
+              "FM-3 requires the 128-byte NCCL UID ABI");
+
+// Generate a NCCL unique ID (call on rank 0 and broadcast this object).
+std::vector<uint8_t> get_nccl_unique_id() {
+    ncclUniqueId unique_id;
+    if (ncclGetUniqueId(&unique_id) != ncclSuccess) {
+        return {};
+    }
+    std::vector<uint8_t> result(sizeof(unique_id));
+    std::memcpy(result.data(), &unique_id, sizeof(unique_id));
     return result;
 }
 
@@ -32,8 +37,8 @@ inline int get_num_chunks_per_stage(int local_seqlen_k, int nranks, int kv_head)
     return flashmask::get_num_chunk_per_segment(local_seqlen_k, nranks, kv_head);
 }
 #else
-// Does nothing when we are not compiling with `WITH_DISTRIBUTED_OVERLAP`
-std::vector<uint8_t> get_nvshmem_unique_id() {
+// Does nothing when we are not compiling with `WITH_DISTRIBUTED_OVERLAP`.
+std::vector<uint8_t> get_nccl_unique_id() {
     return {};
 }
 
@@ -375,13 +380,17 @@ int flashmaskv2_get_num_chunks_per_stage(int local_seqlen_k, int nranks, int kv_
     return get_num_chunks_per_stage(local_seqlen_k, nranks, kv_head);
 }
 
-bool flashmaskv2_get_nvshmem_unique_id(uint8_t * unique_id_ptr) {
-    std::vector<uint8_t> result = get_nvshmem_unique_id();
-    if (!result.empty()) {
-        std::memcpy(unique_id_ptr, result.data(), result.size());
-        return true;
+// Compatibility ABI for existing FM-3 callers. The returned ID is a NCCL ID.
+bool flashmaskv2_get_nvshmem_unique_id(uint8_t* unique_id_ptr) {
+    if (unique_id_ptr == nullptr) {
+        return false;
     }
-    return false;
+    std::vector<uint8_t> result = get_nccl_unique_id();
+    if (result.empty()) {
+        return false;
+    }
+    std::memcpy(unique_id_ptr, result.data(), result.size());
+    return true;
 }
 
 void flashmaskv2_run_mha_bwd(Flash_bwd_params* params_handle, cudaStream_t stream) {

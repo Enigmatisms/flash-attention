@@ -12,9 +12,7 @@
 
 namespace flashmask {
 
-// whether should we manually manage nvshmem related environment setups
-// deprecation warning: will be removed in the future
-static constexpr bool SHOULD_MANAGE_NVSHMEM = true;
+// The NCCL communicator is owned by this process-wide overlap runtime.
 // no team_bar but fine-grained signaling, good for single node CUDA IPC
 static constexpr bool USE_SEMAPHORES = true;
 // whether to use stream coordinator to make sure the scheduling order of comm & comp kernels
@@ -95,61 +93,6 @@ void dump_sr_buffer(const Ty* const src, int num_elem, int rank, std::string buf
     }
 }
 
-void get_nvshmem_info(int& my_pe, int& n_pes) {
-    my_pe = nvshmem_my_pe();
-    n_pes = nvshmem_n_pes();
-}
-
-void init_with_unique_id(
-    std::vector<uint8_t>&& root_unique_id_val,
-    int rank,
-    int num_ranks
-) {       // adopted from DeepEP
-    nvshmemx_uniqueid_t root_unique_id;
-    nvshmemx_init_attr_t attr;
-    std::memcpy(
-        &root_unique_id, root_unique_id_val.data(), sizeof(nvshmemx_uniqueid_t));
-    WARN_PRINT("Start to set unique ID args...\n");
-    nvshmemx_set_attr_uniqueid_args(rank, num_ranks, &root_unique_id, &attr);
-    WARN_PRINT("Start to set init attr...\n");
-    nvshmemx_init_attr(NVSHMEMX_INIT_WITH_UNIQUEID, &attr);
-    // TODO(heqianyue): Do we need to bar here?
-    WARN_PRINT("%d / %d bars before completing the init.\n", rank, num_ranks);
-    nvshmem_barrier_all();
-}
-
-void init_distributed_environment(
-    int rank,
-    int nranks,
-    int& my_pe, 
-    int& n_pes,
-    const uint8_t* unique_id_ptr
-) {
-    if (unique_id_ptr == nullptr) {
-        throw std::runtime_error("unique_id_ptr is null: NVSHMEM initialization requires a valid unique ID.");
-    }
-
-    bool all_zeros = std::all_of(unique_id_ptr, unique_id_ptr + 128, [](uint8_t x) { return x == 0; });
-    if (all_zeros) {
-        throw std::runtime_error("invalid unique_id: The provided NVSHMEM unique ID consists entirely of zeros.");
-    }
-
-    WARN_PRINT("[FlashMask Overlap] Initializing NVSHMEM... Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
-    std::vector<uint8_t> unique_id_val;
-    WARN_PRINT("Extracting unique ID...");
-    unique_id_val.resize(sizeof(nvshmemx_uniqueid_t));
-    std::memcpy(unique_id_val.data(), unique_id_ptr, sizeof(nvshmemx_uniqueid_t));
-    init_with_unique_id(std::move(unique_id_val), rank, nranks);
-    get_nvshmem_info(my_pe, n_pes);
-    WARN_PRINT("[FlashMask Overlap] NVSHMEM initialized. Rank: %d / %d, PE ID: %d / %d\n", rank, nranks, my_pe, n_pes);
-}
-
-void finalize_distributed_environment() {
-    WARN_PRINT("[FlashMask Overlap] Finalizing...\n");
-    nvshmem_finalize();
-    WARN_PRINT("[FlashMask Overlap] NVSHMEM env finalized.\n");
-}
-
 template <typename KVType>
 OverlapCommunicator<KVType>::OverlapCommunicator(
     const KVType* const k_data,
@@ -164,8 +107,9 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     int mask_head,
     bool overlap_rs
     // Maybe we should manage the following by ourselves? Do not pass as parameters
-): kv_buffer(nullptr),
+): gin_context_(nullptr),
    dkv_buffer(nullptr),
+   kv_buffer(nullptr),
    B(b_kv),
    S_local(s_kv),
    H(h_kv),
@@ -180,18 +124,25 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    rs_block_cnt(nullptr),
    _num_put_streams(0)
 {
-    if constexpr (SHOULD_MANAGE_NVSHMEM) {
-        init_distributed_environment(rank, nranks, _my_pe, _total_n_pes, unique_id_ptr);
-    } else {
-        get_nvshmem_info(_my_pe, _total_n_pes);     // get info if nvshmem is already avaliable
+    if (unique_id_ptr == nullptr) {
+        throw std::invalid_argument(
+            "unique_id_ptr is null: NCCL initialization requires a valid unique ID.");
     }
-
-    // Hierarchical overlap topology discovery
-    _gpus_per_node = nvshmem_team_n_pes(NVSHMEMX_TEAM_NODE); 
-    _my_pe_node = nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE);
-    _num_nodes = _total_n_pes / _gpus_per_node;
+    fprintf(stderr, "[FM-OVL rank %d] OverlapComm ctor BEGIN (member-init done, pre create_context)\n", rank);
+    fflush(stderr);
 
     _flags = OverlapFeatureFlags::from_env();
+    gin_context_ = gin::create_context(
+        unique_id_ptr, rank, nranks, _flags.use_hierarchical);
+    printf("Overlap Comm GIN context created.\n");
+    _my_pe = gin::rank(*gin_context_);
+    _total_n_pes = gin::nranks(*gin_context_);
+    WARN_PRINT("[FlashMask Overlap] NCCL GIN initialized. Rank: %d / %d\n", rank, nranks);
+
+    // Hierarchical overlap topology discovery comes from the NCCL LSA team.
+    _gpus_per_node = gin::num_lsa_ranks(*gin_context_);
+    _my_pe_node = gin::lsa_rank(*gin_context_);
+    _num_nodes = _total_n_pes / _gpus_per_node;
 
     // Fallback 1: hierarchical mode is a no-op on a single node — fall back to circular shift.
     if (_flags.use_hierarchical && !hier::hier_is_effective(_total_n_pes, _gpus_per_node)) {
@@ -225,10 +176,13 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     _total_numel = _local_batch_stride * b_kv * nranks;             // won't overflow, but should be careful
 
     // This variable is simply a int32_t, so can be passed by value
-    nvshmem_team_t cp_team = NVSHMEM_TEAM_WORLD;
+    const int cp_team = 0;
     const int sema_count = USE_SEMAPHORES ? (_flags.use_hierarchical ? _num_nodes + _total_n_pes : _total_n_pes) : 0;
     _sema_inter_size = _flags.use_hierarchical ? _num_nodes : 0;
-    kv_buffer = std::make_unique<SRBuffer<KVType>>(_total_numel, cp_team, sema_count);
+
+    printf("Overlap Comm creating SR buffer...\n");
+    kv_buffer = std::make_unique<SRBuffer<KVType>>(
+        *gin_context_, _total_numel, sema_count);
     if constexpr (USE_SEMAPHORES) {
         cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * sema_count);
     }
@@ -258,6 +212,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaMemsetAsync(stream_coordinator, 0, sizeof(int), comm_stream);
     }
     if (overlap_rs) {
+        printf("Overlap Comm RS preparations started...\n");
         // auxilary stream for RS-overlap (for used in reduce)
         cudaStreamCreateWithPriority(&aux_p_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
         cudaStreamCreateWithPriority(&aux_c_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
@@ -266,7 +221,9 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaEventCreateWithFlags(&local_moved, cudaEventDisableTiming);
         const int num_stages = _total_n_pes / num_chunks;
         const int rs_capacity = _flags.per_stage_buffer ? num_stages : RS_BUFFER_CAPACITY;
+        printf("Overlap Comm dKV SR buffer creating...\n");
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
+            *gin_context_,
             _local_batch_stride * b_kv,      // single chunk K numel (B * S_local * H * D)
             _total_n_pes,
             num_chunks,
@@ -318,7 +275,6 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
     CUDA_DEBUG_CHECK(cudaEventDestroy(sr_usable));
     CUDA_DEBUG_CHECK(cudaEventDestroy(ag_done));
     CUDA_DEBUG_CHECK(cudaStreamDestroy(comm_stream));
-    kv_buffer->release();           // do not depend on auto-release
     if (dkv_buffer) {
         CUDA_DEBUG_CHECK(cudaEventDestroy(bwd_done));
         CUDA_DEBUG_CHECK(cudaEventDestroy(reduce_done));
@@ -338,11 +294,11 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
             rs_block_cnt = nullptr;
             _num_put_streams = 0;
         }
-        dkv_buffer->release();
+        dkv_buffer.reset();
     }
-    if constexpr (SHOULD_MANAGE_NVSHMEM && MANUAL_CLEANUP) {
-        finalize_distributed_environment();
-    }
+    kv_buffer.reset();
+    WARN_PRINT("[FlashMask Overlap] Finalizing NCCL GIN...\n");
+    gin_context_.reset();
 }
 
 template <typename KVType>
@@ -411,7 +367,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
 ) {
     // remember to pair `update_kv_buffer` with `wait_sr_buffer_empty` (except from the constructor call)
     // this `cudaMemcpyAsync` itself won't introduce too much overhead
-    // yet, `team_bar` (nvshmem_sync_team) is the culprit
+    // yet, `team_bar` (the communicator barrier) is the culprit
     WARN_PRINT("Before cudaMemcpyAsync... is fwd: %d\n", int(fwd));
     // bwd copies the data to the start chunk of the SR, while fwd copies to the last chunk
     const int local_offset = fwd ? (_local_batch_stride * (_total_n_pes - 1)) : 0;
@@ -490,7 +446,7 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
             sema::ag::notify_full(
                 kv_buffer->semaphores(),
                 _my_pe, _total_n_pes,
-                kv_buffer->team(), comm_stream
+                comm_stream
             );
         }
     } else {
@@ -1038,7 +994,7 @@ void OverlapCommunicator<KVType>::reallocate_block_work_ids() {
 }
 
 template <typename KVType>
-void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t cp_team) {
+void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, int cp_team) {
     size_t new_single_k_numel = _local_batch_stride * B;
 
     // Apply 1.5x headroom + 32-alignment (consistent with SRBuffer strategy)
@@ -1061,6 +1017,7 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
 
         size_t alloc_numel = alloc_with_headroom(new_single_k_numel);
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
+            *gin_context_,
             alloc_numel, _total_n_pes, num_chunks, _flags.per_stage_buffer ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
         );
         dkv_buffer->initialize_buffer(_my_pe, _flags.per_stage_buffer);
@@ -1094,6 +1051,7 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, nvshmem_team_t 
             size_t alloc_numel = alloc_with_headroom(new_single_k_numel);
             dkv_buffer->release_for_realloc();
             dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
+                *gin_context_,
                 alloc_numel, _total_n_pes, num_chunks, _flags.per_stage_buffer ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
             );
             dkv_buffer->initialize_buffer(_my_pe, _flags.per_stage_buffer);
@@ -1188,15 +1146,9 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
 
     if (new_config == _config) return false;  // No change needed
 
-    // NVSHMEM bootstrap persists after finalize — re-init with different nranks is silently ignored.
-    if (nranks != _total_n_pes && unique_id_ptr == nullptr) {
-        std::cerr << "[FlashMask Overlap] FATAL: nranks changed from " + std::to_string(_total_n_pes) +
-            " to " + std::to_string(nranks) +
-            ". For this case, we need to finalize the NVSHMEM env and re-init" +
-            ". So unique_id_ptr is required but currently not given.\n";
-        throw std::invalid_argument(
-            "[FlashMask Overlap] CP size change but unable to reinit correctly."
-        );
+    if (nranks != _total_n_pes) {
+        throw std::logic_error(
+            "[FlashMask Overlap] World-size changes require rebuilding the NCCL communicator.");
     }
 
     // S_local change: validate the new value is in the supported dispatch set
@@ -1215,14 +1167,7 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
 
     // Synchronize all work before reconfiguring — no kernel should be using old buffers
     CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
-    nvshmem_barrier_all();
-
-    if (nranks != _total_n_pes) {
-        // NVSHMEM finalize and re-init
-        nvshmem_finalize();
-        WARN_PRINT("[FlashMask Overlap] Finalizing and re-init: old-CP: %d, new-CP: %d\n", _total_n_pes, nranks);
-        init_distributed_environment(rank, nranks, _my_pe, _total_n_pes, unique_id_ptr);
-    }
+    gin::barrier(*gin_context_);
 
     // BHSD fallback check: if new B*H exceeds bitmask limit, disable BHSD
     if (_flags.use_bhsd_layout && _flags.use_hierarchical && new_b * new_h > 64) {
@@ -1243,7 +1188,7 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
     _total_numel = new_config.sr_buffer_numel();
 
     // SRBuffer: check if reallocation needed
-    nvshmem_team_t cp_team = NVSHMEM_TEAM_WORLD;
+    const int cp_team = 0;
     if (_total_numel > _sr_buffer_capacity) {
         // Allocate with headroom to reduce reallocation frequency
         size_t new_capacity = static_cast<size_t>(_total_numel * 1.5);
@@ -1253,7 +1198,8 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
                 _sr_buffer_capacity, new_capacity, B, H, S_local);
         kv_buffer->release_for_realloc();
         const int reconf_sema_count = USE_SEMAPHORES ? (_flags.use_hierarchical ? _num_nodes + _total_n_pes : _total_n_pes) : 0;
-        kv_buffer = std::make_unique<SRBuffer<KVType>>(new_capacity, cp_team, reconf_sema_count);
+        kv_buffer = std::make_unique<SRBuffer<KVType>>(
+            *gin_context_, new_capacity, reconf_sema_count);
         if constexpr (USE_SEMAPHORES) {
             cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * reconf_sema_count);
         }
@@ -1331,10 +1277,24 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
             unique_id_ptr, mask_head, new_overlap_rs
         );
     } else {
-        // Check if reconfiguration is needed (handles param change detection internally)
-        overlap_comm->reconfigure_if_needed(
-            b_kv, s_kv, h_kv, d_kv, rank, nranks, mask_head, new_overlap_rs, unique_id_ptr
-        );
+        if (overlap_comm->nranks() != nranks) {
+            if (unique_id_ptr == nullptr) {
+                throw std::invalid_argument(
+                    "[FlashMask Overlap] World-size change requires a new NCCL unique ID.");
+            }
+            CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
+            overlap_comm->barrier();
+            overlap_comm.reset();
+            overlap_comm = std::make_unique<OverlapCommunicator<cutlass::bfloat16_t>>(
+                k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks,
+                unique_id_ptr, mask_head, new_overlap_rs
+            );
+        } else {
+            // Shape changes reuse the existing communicator and rebuild only regions.
+            overlap_comm->reconfigure_if_needed(
+                b_kv, s_kv, h_kv, d_kv, rank, nranks, mask_head, new_overlap_rs, unique_id_ptr
+            );
+        }
     }
     return *overlap_comm;
 }
@@ -1351,8 +1311,8 @@ void destroy_singleton() {
     if (overlap_comm) {
         // Ensure all async work is complete before destroying
         CUDA_DEBUG_CHECK(cudaDeviceSynchronize());
-        nvshmem_barrier_all();
-        overlap_comm.reset();   // triggers destructor (which handles nvshmem_finalize if SHOULD_MANAGE_NVSHMEM)
+        overlap_comm->barrier();
+        overlap_comm.reset();   // triggers the communicator and window cleanup
         WARN_PRINT("[FlashMask Overlap] Singleton destroyed for topology refresh.\n");
     }
 }

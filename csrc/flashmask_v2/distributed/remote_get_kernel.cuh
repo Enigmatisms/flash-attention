@@ -1,7 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include "sr_buffer.cuh"
-#include "nvshmem_copy_utils.cuh"
+#include "gin_copy_utils.cuh"
 #include "ag_semaphore_ops.cuh"
 #include "hierarchical_rank_map.cuh"
 #include "debug_logger.cuh"
@@ -244,7 +244,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                     for (int slot = 1; slot < gpus_per_node; slot++) {
                         int base = (my_pe_node + slot) % gpus_per_node;
                         int sn_rank = base + my_node_id * gpus_per_node;
-                        nvshmem_int64_atomic_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
+                        gin::remote_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
                     }
                 }
             }
@@ -503,7 +503,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                     for (int slot = 1; slot < gpus_per_node; slot++) {
                         int base = (my_pe_node + slot) % gpus_per_node;
                         int sn_rank = base + my_node_id * gpus_per_node;
-                        nvshmem_int64_atomic_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
+                        gin::remote_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
                     }
                 }
             }

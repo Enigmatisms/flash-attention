@@ -17,7 +17,7 @@ struct OverlapConfig {
     int H = 0;
     int H_mask = 0;
     int D = 0;
-    int nranks = 0;        // NVSHMEM-unsafe to change; kept for validation
+    int nranks = 0;        // communicator size; changes require a rebuild
     bool overlap_rs = false;
     bool use_bhsd = false;     // SR buffer uses (B,H,S,D) layout instead of (B,S,H,D)
 
@@ -63,6 +63,10 @@ struct OverlapConfig {
 */
 template <typename KVType>
 class OverlapCommunicator {
+private:
+    // Declared first so it outlives every registered buffer.
+    gin::ContextPtr gin_context_;
+
 public:
     OverlapCommunicator(
         const KVType* const k_data,
@@ -119,6 +123,7 @@ public:
     );
 
     void wait_wptr_init();
+    void barrier() { gin::barrier(*gin_context_); }
 
     // Legacy diagnostic helper. The active FM-4 forward and split backward paths
     // use per-tile/per-work readiness and do not call this host synchronization.
@@ -292,7 +297,7 @@ private:
     // Helper to (re)allocate block_work_ids and derived pointers
     void reallocate_block_work_ids();
     // Helper to create or recreate the dkv_buffer for RS-overlap
-    void setup_dkv_buffer(bool need_rs, nvshmem_team_t cp_team);
+    void setup_dkv_buffer(bool need_rs, int cp_team);
     // Prime per-stage RS semaphores so the first BWD's producer_wait_empty can proceed
     void prime_rs_semaphores();
 
@@ -316,8 +321,8 @@ private:
     size_t _total_numel;
 
     // Hierarchical overlap topology
-    int _gpus_per_node;     // Number of GPUs per node (from nvshmem_n_pes_node)
-    int _my_pe_node;        // This PE's index within its node (from nvshmem_team_my_pe)
+    int _gpus_per_node;     // Number of ranks in the NCCL LSA team
+    int _my_pe_node;        // This rank's index within the NCCL LSA team
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
     OverlapFeatureFlags _flags;  // runtime feature switches (effective values after fallbacks)
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
@@ -384,7 +389,7 @@ bool is_singleton_null();
 
 // Destroy the singleton for topology refresh.
 // After calling this, the next init_singleton_instance() will re-create from scratch.
-// IMPORTANT: per NVSHMEM bootstrap persistence, finalize + re-init is only safe when
+// IMPORTANT: communicator generation changes require a full destroy/rebuild when
 // rank/nranks remain the same. This function is intended for refreshing
 // transport-level resources (e.g., after node migration), not for changing topology.
 void destroy_singleton();

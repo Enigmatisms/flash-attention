@@ -22,7 +22,7 @@
 #include "flash_bwd_kernel_sm80.h"
 #include "utils.h"
 
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
 #include "distributed/overlap_comm.cuh"
 #endif
 
@@ -130,7 +130,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     // Each segment reads a different sub-tensor of the SR buffer; k_ptr/v_ptr are advanced per iteration.
     void* bwd_sr_k_base = nullptr;
     void* bwd_sr_v_base = nullptr;
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
     use_overlap = params.nranks > 1 && (!flashmask::comm::is_singleton_null());
     std::unique_ptr<flash::flashmask::MaskPtrUpdater<kBlockN>> mask_ptr_updater = nullptr;
 
@@ -230,7 +230,7 @@ SEGMENT_LOOP_START:
     if constexpr (Arch >= 90) {
         prepare_flashmask(params, stream, params.num_sm);
     }
-#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
+#endif  // NCCL_DISTRIBUTED_OVERLAP
 
     if (segment_idx == 0) {
         // scanMinMax is called only once, using full seqlen_k to calculate 
@@ -325,7 +325,7 @@ SEGMENT_LOOP_START:
     void* dv_epilogue_out = params.dv_ptr;
     int dk_epilogue_batch_stride = params.dk_batch_stride;
     int dv_epilogue_batch_stride = params.dv_batch_stride;
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
     if constexpr (!GQA) {
         if (overlap_rs) {
             auto& comm = flashmask::comm::singleton();
@@ -471,14 +471,14 @@ SEGMENT_LOOP_START:
         Element* dk_buffer = static_cast<Element*>(params.dk_ptr);
         Element* dv_buffer = static_cast<Element*>(params.dv_ptr);
         const int batch_stride_dkv = params.d_rounded * params.seqlen_k_rounded * params.h_k;
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
         if (overlap_rs) {
             auto& comm_singleton = flashmask::comm::singleton();
             // post-process outputs to send buffer so that we can directly send it.
             dk_buffer = static_cast<Element*>(comm_singleton.dk_send(segment_idx));
             dv_buffer = static_cast<Element*>(comm_singleton.dv_send(segment_idx));
         }
-#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
+#endif  // NCCL_DISTRIBUTED_OVERLAP
         // Note(heqianyue): when RS-overlap is switched ON, the shape of dk_ptr (and dv_ptr) is (B, S_local, H, D)
         // while the dk_accum & dv_accum & dk_send, dv_send (NVSHMEM buffer) have shape (B, S_local * chunks_per_seg, H, D)
         // we therefore need to re-route the output of post-process kernels to dk_send, dv_send. The final reduced output
@@ -513,7 +513,7 @@ SEGMENT_LOOP_START:
         if (smem_size_postprocess >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(flash::cutlass_flashmask_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
         if (overlap_rs) {
             // post-process kernel must wait for the RS-reduce finishing. Since we redirect the output buffer of post-process to dk/v_send
             // these two buffers are also used in RS-overlap (remote put and reduce), so we cannot overwrite these before they are released. 
@@ -522,13 +522,13 @@ SEGMENT_LOOP_START:
                 comm_singleton.dkv_buffer->wait_buffer(segment_idx, stream);
             }
         }
-#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
+#endif  // NCCL_DISTRIBUTED_OVERLAP
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
     if (overlap_rs) {
         auto& comm_singleton = flashmask::comm::singleton();
         // dk_ptr and dv_ptr is the output
@@ -556,7 +556,7 @@ SEGMENT_LOOP_START:
         // consumer (dKdV reduce) stream will record event for compute stream to wait for
         comm_singleton.wait_reduce_done(stream);
     }
-#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
+#endif  // NCCL_DISTRIBUTED_OVERLAP
 }
 
 template<int Arch, typename T, int kBlockM, int kBlockN, int kHeadDim, bool Is_causal, bool Is_local, bool Has_softcap,

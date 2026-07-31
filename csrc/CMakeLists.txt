@@ -626,37 +626,28 @@ if(NOT SKIP_BUILD_FA)
     message(STATUS "Auto generated CUDA source files for flashmask_v2: ${FLASHMASKV2_SOURCES_CU_SOURCES}")
 
     if(WITH_DISTRIBUTED_OVERLAP)
-        message(STATUS "Enabling NVSHMEM for distributed overlap support. NVSHMEM: ${NVSHMEM_INSTALL_DIR}")
-        
-        if(NVSHMEM_INSTALL_DIR)
-            message(STATUS "Reusing external NVSHMEM from: ${NVSHMEM_INSTALL_DIR}")
-            set(NVSHMEM_INCLUDE_DIR "${NVSHMEM_INSTALL_DIR}/include" CACHE PATH "" FORCE)
-            set(NVSHMEM_LIB "${NVSHMEM_INSTALL_DIR}/lib/libnvshmem.a")
-            set(NVSHMEM_BOOTSTRAP_MPI_LIB
-                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_mpi.so.3)
-            set(NVSHMEM_BOOTSTRAP_UID_LIB
-                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_uid.so.3)
-            set(NVSHMEM_BOOTSTRAP_PMI_LIB
-                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_pmi.so.3)
-            set(NVSHMEM_BOOTSTRAP_PMI2_LIB
-                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_pmi2.so.3)
-            set(NVSHMEM_TRANSPORT_IBRC_LIB
-                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_transport_ibrc.so.3)
-            set(NVSHMEM_TRANSPORT_IBGDA_LIB
-                ${NVSHMEM_INSTALL_DIR}/lib/nvshmem_transport_ibgda.so.3)
-            
-            add_library(nvshmem STATIC IMPORTED GLOBAL)
-            set_property(TARGET nvshmem PROPERTY IMPORTED_LOCATION ${NVSHMEM_LIB})
-            # No need for add_dependencies(nvshmem extern_nvshmem), since paddle end made sure of this
-        else()
-            # We still support standalone compilation with self downloaded NVSHMEM package
-            # This is used when the FA repo is built independently
-            message(STATUS "Standalone FlashMask builting with NVSHMEM support (distributed overlap)")
-            include(${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/distributed/cmake/nvshmem.cmake)
+        set(NCCL_INSTALL_DIR "" CACHE PATH "NCCL install dir (include/ + lib/)")
+        if(NOT NCCL_INSTALL_DIR)
+            message(FATAL_ERROR
+                "NCCL_INSTALL_DIR is required for distributed overlap support")
         endif()
-        
+        find_path(NCCL_INCLUDE_DIR
+            NAMES nccl.h nccl_device.h
+            PATHS "${NCCL_INSTALL_DIR}/include"
+            NO_DEFAULT_PATH
+        )
+        find_library(NCCL_LIBRARY
+            NAMES nccl
+            PATHS "${NCCL_INSTALL_DIR}/lib" "${NCCL_INSTALL_DIR}/lib64"
+            NO_DEFAULT_PATH
+        )
+        if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+            message(FATAL_ERROR
+                "NCCL headers and libnccl.so are required under ${NCCL_INSTALL_DIR}")
+        endif()
+        message(STATUS "Enabling NCCL GIN distributed overlap: ${NCCL_INSTALL_DIR}")
         add_subdirectory(flashmask_v2/distributed)
-        add_compile_definitions(NVSHMEM_DISTRIBUTED_OVERLAP)
+        add_compile_definitions(NCCL_DISTRIBUTED_OVERLAP)
     endif()
 
     # 3. 添加动态库
@@ -686,19 +677,20 @@ if(NOT SKIP_BUILD_FA)
       >)
 
     if(WITH_DISTRIBUTED_OVERLAP)
-        target_include_directories(flashmaskv2 PRIVATE ${NVSHMEM_INCLUDE_DIR})
-        target_link_libraries(flashmaskv2 PRIVATE flashmaskv2_distributed)
+        target_include_directories(flashmaskv2 PRIVATE ${NCCL_INCLUDE_DIR})
+        target_link_libraries(flashmaskv2 PRIVATE
+            flashmaskv2_distributed
+            ${NCCL_LIBRARY}
+        )
         add_dependencies(flashmaskv2 flashmaskv2_distributed)
-        # Symbol isolation: hide statically-linked nvshmem internals to prevent
-        # interposition with libpaddle.so (DeepEP) causing hang/crash.
         target_link_options(flashmaskv2 PRIVATE
             -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/flashmask_v2/flashmaskv2.map
             -Wl,-Bsymbolic
             -Wl,--exclude-libs,ALL
         )
         set_target_properties(flashmaskv2 PROPERTIES
-            BUILD_RPATH "$ORIGIN"
-            INSTALL_RPATH "$ORIGIN"
+            BUILD_RPATH "${NCCL_INSTALL_DIR}/lib;${NCCL_INSTALL_DIR}/lib64;$ORIGIN"
+            INSTALL_RPATH "${NCCL_INSTALL_DIR}/lib;${NCCL_INSTALL_DIR}/lib64;$ORIGIN"
             BUILD_WITH_INSTALL_RPATH ON
         )
     endif()

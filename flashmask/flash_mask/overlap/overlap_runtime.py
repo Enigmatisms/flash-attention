@@ -1,5 +1,4 @@
-"""FM-4 Overlap Python runtime: ctypes front-end over ``libfm4_overlap.so`` (the
-``extern "C"`` wrapper around the FM-3 ``flashmask::comm`` NVSHMEM singleton).
+"""FM-4 Overlap Python runtime: ctypes front-end over ``libfm4_overlap.so``.
 Importing never loads the .so; ``_load()`` raises only on first use if missing.
 """
 
@@ -7,7 +6,7 @@ import ctypes
 import os
 from typing import NamedTuple
 
-_UID_NBYTES = 128  # sizeof(nvshmemx_uniqueid_t)
+_UID_NBYTES = None
 _LIB = None
 
 
@@ -20,7 +19,7 @@ def _find_so(here):
 
 def _load():
     """Load the bridge .so and bind argtypes/restype. Cached after first call."""
-    global _LIB
+    global _LIB, _UID_NBYTES
     if _LIB is not None:
         return _LIB
 
@@ -30,12 +29,16 @@ def _load():
         raise RuntimeError(
             "FM4 overlap extension (libfm4_overlap.so) not found next to "
             f"{__file__}. Built only when the 'ovl' component is selected and "
-            "NVSHMEM is available."
+            "NCCL with GIN support is available."
         )
 
-    # RTLD_GLOBAL so the bridge's NVSHMEM symbols are visible to the dlopen'd
-    # bootstrap/transport plugins at runtime.
-    lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+    lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_LOCAL)
+
+    lib.fm4_overlap_unique_id_size.argtypes = []
+    lib.fm4_overlap_unique_id_size.restype = ctypes.c_size_t
+    _UID_NBYTES = int(lib.fm4_overlap_unique_id_size())
+    if _UID_NBYTES <= 0:
+        raise RuntimeError("FM4 overlap bridge returned an invalid NCCL unique ID size")
 
     lib.fm4_overlap_get_unique_id.argtypes = [ctypes.c_char_p]
     lib.fm4_overlap_get_unique_id.restype = ctypes.c_int
@@ -121,13 +124,13 @@ def _load():
 # B/H/D are Python-side (from the K/V shape); stashed to rebuild the gathered view.
 _KV_SHAPE = None   # (B, H, D); S_total = s_local() * nranks()
 
-# NVSHMEM unique id is a process-level constant: bootstrap once (one broadcast),
-# then reuse on every reconfigure.
+# Cache one NCCL UID per Python process/group generation.
 _UID = None
+_UID_KEY = None
 
 
 def is_available():
-    """True if the bridge .so can be loaded (built + NVSHMEM present)."""
+    """True if the bridge .so can be loaded with NCCL GIN support."""
     try:
         _load()
         return True
@@ -136,25 +139,28 @@ def is_available():
 
 
 def bootstrap_unique_id(rank, group=None):
-    """group-local rank 0 generates the NVSHMEM unique id and broadcasts it; every
-    rank returns the same 128-byte id. Cached process-wide (the id never changes)."""
-    global _UID
-    if _UID is not None:
-        return _UID
+    """Generate and broadcast one NCCL UID for the current group generation."""
+    global _UID, _UID_KEY
     import numpy as np
     import paddle
     import paddle.distributed as dist
 
+    world_size = int(group.world_size) if group is not None else int(dist.get_world_size())
+    uid_key = (id(group), world_size) if group is not None else (None, world_size)
+    if _UID is not None and _UID_KEY == uid_key:
+        return _UID
+
     lib = _load()
     buf = (ctypes.c_uint8 * _UID_NBYTES)()
-    if rank == 0:
-        lib.fm4_overlap_get_unique_id(ctypes.cast(buf, ctypes.c_char_p))
+    if rank == 0 and lib.fm4_overlap_get_unique_id(ctypes.cast(buf, ctypes.c_char_p)) != 1:
+        raise RuntimeError("fm4_overlap_get_unique_id failed")
 
     src_global = group.ranks[0] if group is not None else 0
     arr = np.frombuffer(bytes(buf), dtype=np.uint8).copy()
     t = paddle.to_tensor(arr, dtype="uint8")
     dist.broadcast(t, src=src_global, group=group)
     _UID = bytes(t.numpy().tobytes())
+    _UID_KEY = uid_key
     return _UID
 
 

@@ -3,8 +3,7 @@
 */
 #pragma once
 
-#include <nvshmem.h>
-#include <nvshmemx.h>
+#include "nccl_gin_backend.cuh"
 #include <stdexcept>
 #include <cstring>
 #include <vector>
@@ -19,11 +18,12 @@ class SepSRBuffer {
 using SemaphoreType = int64_t;
 
 private:
+    gin::Context& _context;
     KVType* _dk_data;
     KVType* _dv_data;
     SemaphoreType* _semaphores;
     bool _allocated;
-    nvshmem_team_t _team;
+    int _team;
 
     // offset to the recv buffer (2 * chunks_per_seg * k_numel)
     size_t _buf_offset;
@@ -41,29 +41,26 @@ private:
     SepSRBuffer& operator=(SepSRBuffer&&) = delete;
 public:
     explicit SepSRBuffer(
-        size_t single_k_numel, 
+        gin::Context& context,
+        size_t single_k_numel,
         int semaphore_size,
         int chunks_per_seg,
         int buffer_capacity = 1,
-        nvshmem_team_t team = NVSHMEM_TEAM_WORLD
+        int team = 0
     );
 
     void team_bar() const {
-        nvshmem_team_sync(_team);
+        gin::barrier(_context);
     }
 
     void team_bar_on_stream(cudaStream_t stream) const {
-        nvshmemx_team_sync_on_stream(_team, stream);
+        gin::barrier_on_stream(_context, stream);
     }
 
     void release();
+    void release_for_realloc() { release(); }
 
-    // Unconditionally free NVSHMEM memory for runtime reallocation.
-    // Unlike release() which is gated by MANUAL_CLEANUP, this always calls nvshmem_free.
-    // Must be called with all PEs synchronized.
-    void release_for_realloc();
-
-    ~SepSRBuffer();
+    ~SepSRBuffer() noexcept;
 
     // [K_send, V_send] --> buf_offset size, therefore 2 * buf_offset is the double buffer offset
     inline KVType* k_send(int seg_idx) const { return _dk_data + CLAMP_IDX(seg_idx) * 2 * _buf_offset; }
@@ -88,7 +85,7 @@ public:
     void zero_recv_buf(int seg_idx, cudaStream_t comm_stream);
 
     inline bool is_valid() const noexcept {
-        return _allocated && _dk_data && _dv_data && _semaphores && _team != NVSHMEM_TEAM_INVALID;
+        return _allocated && _dk_data && _dv_data && _semaphores && _team != -1;
     }
 
     size_t capacity() const noexcept {
@@ -99,11 +96,9 @@ public:
         return _chunks_per_seg;
     }
 
-    nvshmem_team_t team() const noexcept {
+    int team() const noexcept {
         return _team;
     }
-
-    void swap(SepSRBuffer& other);
 };
 
 #undef CLAMP_IDX

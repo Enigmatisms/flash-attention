@@ -1,8 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
-#include <nvshmem.h>
-#include <nvshmemx.h>
 #include "hierarchical_rank_map.cuh"
+#include "nccl_gin_backend.cuh"
 
 namespace flashmask {
 namespace sema {
@@ -24,7 +23,7 @@ __device__ __forceinline__ void wait_full(
     const int64_t* const __restrict__ semaphores,
     const int target_pe
 ) {
-    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_GT, 0);
+    gin::wait_until(const_cast<int64_t*>(semaphores) + target_pe, gin::Compare::GreaterThan, 0);
 }
 
 
@@ -62,7 +61,7 @@ __device__ __forceinline__ void wait_full_all_batch(
 }
 
 // Note(heqianyue): single node AMO can use int (4B) as semaphore types, but when in multi-node
-// env, IBRC does not allow 4B AMO. Check NVSHMEM 3.2.5 src/modules/transport/ibrc/ibrc.cpp:1265
+// Semaphore updates use 64-bit operations to match the registered window layout.
 // So we need to use int64_t semaphores. If we know for sure that our CP distributed overlap
 // utilizes only 1 node, change the dtype of SR buffer, remote_get kernels and current file.
 
@@ -78,7 +77,8 @@ __global__ void NotifySemaphoreEmptyKernel(
         // Note(heqianyue): bitwise op is generally safer than add, if we are using only 1 node
         // we can opt for the following atomic_and approach
         // clear bit representing the current PE on the all other target PE
-        nvshmem_long_atomic_add(semaphores + threadIdx.x, -(1LL << my_pe), threadIdx.x);
+        const int64_t clear_mask = -(static_cast<int64_t>(1) << my_pe);
+        gin::remote_add(semaphores + threadIdx.x, clear_mask, threadIdx.x);
     }
 }
 
@@ -95,7 +95,8 @@ __global__ void NotifySegmentSemaphoreEmptyKernel(
         // the other PE will not notify us before we reset
         wait_full(semaphores, target_rank);
         semaphores[target_rank] = 0;
-        nvshmem_long_atomic_add(semaphores + target_rank, -(1LL << my_pe), target_rank);
+        const int64_t clear_mask = -(static_cast<int64_t>(1) << my_pe);
+        gin::remote_add(semaphores + target_rank, clear_mask, target_rank);
     }
 }
 
@@ -138,12 +139,12 @@ __global__ void SetFullKernel(
     __syncthreads();
     if (threadIdx.x == self_rank) return;
     // set the semaphores[self_rank] = 1 for all remote ranks
-    nvshmem_int64_p(semaphores + self_rank, 1, threadIdx.x);
+    gin::remote_store(semaphores + self_rank, int64_t(1), threadIdx.x);
 }
 
 /**
  * @brief CPU wait until the semaphores[my_pe] reached 0
- * @param semaphores int semaphores allocated by nvshmem: size is total_n_pes
+ * @param semaphores int64 semaphores in the registered NCCL window: size is total_n_pes
  * @param my_pe the id of semaphore to wait for
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
@@ -159,9 +160,9 @@ void wait_self_empty(
             0
         );
     } else {
-        nvshmemx_int64_wait_until_on_stream(
+        gin::wait_until_on_stream(
             semaphores + my_pe,
-            NVSHMEM_CMP_EQ,
+            gin::Compare::Equal,
             0,
             stream
         );
@@ -178,7 +179,7 @@ void wait_self_empty(
     (i != my_pe) by 1, so other PEs will know that their local data has one few
     dependent PE. If 0 is reached, they can start clean up. 
 
- * @param semaphores int semaphores allocated by nvshmem: size is total_n_pes
+ * @param semaphores int64 semaphores in the registered NCCL window: size is total_n_pes
  * @param my_pe except for semaphores[my_pe], for all other local semaphores: set zero
     , and for remote semaphores: decrease (data ref_cnt) by 1
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
@@ -251,7 +252,7 @@ __global__ void HierSetFullKernel(
         int node_offset = tid;  // 1..num_nodes-1
         int target_rank = my_pe_node + ((my_node_id + node_offset) % num_nodes) * gpus_per_node;
         // Write sema_inter[my_node_id] = 1 on target (tells them "node my_node_id's data is ready")
-        nvshmem_int64_p(sema_inter + my_node_id, 1, target_rank);
+        gin::remote_store(sema_inter + my_node_id, int64_t(1), target_rank);
     } else if (tid <= congruence_count + gpus_per_node - 1) {
         // Same-node rank: different node-local index, same node
         int slot = tid - congruence_count;  // 1..gpus_per_node-1
@@ -259,7 +260,7 @@ __global__ void HierSetFullKernel(
         int target_rank = base + my_node_id * gpus_per_node;
         const int64_t all_batch_bits = make_all_batch_bits(num_batch);
         // Write all-batch-bits on target (all batches ready for my local KV)
-        nvshmem_int64_p(sema_intra + self_rank, all_batch_bits, target_rank);
+        gin::remote_store(sema_intra + self_rank, all_batch_bits, target_rank);
     }
 }
 
@@ -267,7 +268,6 @@ void notify_full(
     int64_t* const __restrict__ semaphores,
     int my_pe,
     int total_pes,
-    nvshmem_team_t team,
     cudaStream_t stream
 ) {
     int64_t bit_val = (1LL << total_pes) - (1LL << my_pe) - 1;
@@ -343,14 +343,14 @@ __global__ void HierNotifyEmptyKernel(
     if (target_slot == my_slot) {
         // Case 1: Congruent (Phase 1 target, cross-node).
         sema_inter[target_node] = 0;
-        nvshmem_long_atomic_add(sema_intra + target, -1, target);
+        gin::remote_add(sema_intra + target, int64_t(-1), target);
     } else {
         const int64_t all_batch_bits = make_all_batch_bits(num_batch);
         wait_full_all_batch(sema_intra, all_batch_bits, target);
         sema_intra[target] = 0;
         // same node: no remote_pe relay. Othewise we should calculate the relay rank
         int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
-        nvshmem_long_atomic_add(sema_intra + target, -1, remote_rank);
+        gin::remote_add(sema_intra + target, int64_t(-1), remote_rank);
     }
 }
 
@@ -389,14 +389,14 @@ __global__ void HierNotifySegmentEmptyKernel(
         // Case 1: Congruent (Phase 1 target, cross-node).
         sema_inter[target_node] = 0;
         // Do NOT zero sema_intra[target] — relay refcount managed by Phase 2 consumers.
-        nvshmem_long_atomic_add(sema_intra + target, -1, target);
+        gin::remote_add(sema_intra + target, int64_t(-1), target);
     } else {
         const int64_t all_batch_bits = make_all_batch_bits(num_batch);
         wait_full_all_batch(sema_intra, all_batch_bits, target);
         sema_intra[target] = 0;
         // same node: no remote_pe relay. Othewise we should calculate the relay rank
         int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
-        nvshmem_long_atomic_add(sema_intra + target, -1, remote_rank);
+        gin::remote_add(sema_intra + target, int64_t(-1), remote_rank);
     }
 }
 

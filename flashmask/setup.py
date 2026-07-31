@@ -74,7 +74,7 @@ print(f"[flashmask] FLASHMASK_BUILD={FLASHMASK_BUILD}  "
       f"BUILD_FLA={BUILD_FLA}  BUILD_CPB={BUILD_CPB}  "
       f"BUILD_UTILS={BUILD_UTILS}")
 
-# Overlap bridge is opt-in only: it needs NVSHMEM + H100/B200, so it is NOT
+# Overlap bridge is opt-in only: it needs NCCL GIN + H100/B200, so it is NOT
 # pulled in by 'all'. Request it explicitly with FLASHMASK_BUILD=...,ovl.
 BUILD_OVL = 'ovl' in requested_components
 
@@ -514,8 +514,7 @@ def _build_cmake_submodule(name, csrc_dir, pkg_dir, lib_prefix, cmake_defs):
     """Build a submodule via a standalone sub-CMake (configure + build).
 
     Unlike _build_cuda_submodule (Paddle CUDAExtension), this drives plain CMake.
-    Used by the overlap bridge, which reuses the proven distributed/CMakeLists.txt
-    NVSHMEM link recipe. Steps:
+    Used by the standalone NCCL GIN overlap bridge. Steps:
       1. cmake -S csrc_dir -B csrc_dir/build  <-D defs...>
       2. cmake --build csrc_dir/build -j
       3. copy the produced lib{lib_prefix}*.so into pkg_dir
@@ -551,16 +550,17 @@ def _build_cmake_submodule(name, csrc_dir, pkg_dir, lib_prefix, cmake_defs):
             f"Run manually: {' '.join(configure)}"
         )
 
+    # Stream output live (no capture) + --verbose so every nvcc command line
+    # and per-TU progress is visible; bound -j to avoid oversubscribing nvcc
+    # on the heavy sm_103a compiles.
     result = subprocess.run(
-        ['cmake', '--build', build_dir, '-j'],
-        capture_output=True, text=True,
+        ['cmake', '--build', build_dir, '-j', '8', '--verbose'],
+        text=True,
     )
     if result.returncode != 0:
-        print(f"[flashmask] {name} cmake build STDOUT:\n{result.stdout}")
-        print(f"[flashmask] {name} cmake build STDERR:\n{result.stderr}")
         raise RuntimeError(
-            f"Failed to build {name}.\n"
-            f"Run manually: cmake --build {build_dir} -j"
+            f"Failed to build {name} (see streamed build output above).\n"
+            f"Run manually: cmake --build {build_dir} -j 8 --verbose"
         )
 
     so_files = glob.glob(os.path.join(build_dir, '**', f'lib{lib_prefix}*.so'),
@@ -676,30 +676,26 @@ if BUILD_UTILS:
 #   if _pkg:
 #       _submodule_package_data[_pkg] = ['*.so']
 
-# --- overlap bridge: NVSHMEM + sm_90a/sm_100, built via standalone sub-CMake ---
-# Opt-in only (BUILD_OVL). Requires NVSHMEM; the location + target arch are env-
-# configurable so the same tree builds on H100 (reuse prebuilt sm_90 NVSHMEM) and
-# B200 (point at a sm_100 NVSHMEM). Missing NVSHMEM or cutlass -> warn + skip,
-# never fail the whole install (FA4 keeps working).
+# --- overlap bridge: NCCL GIN + sm_90a/sm_100, built via standalone sub-CMake ---
+# Opt-in only (BUILD_OVL). NCCL_HOME (or NCCL_ROOT) selects the exact NCCL
+# headers/library used for both compilation and runtime. Missing NCCL or cutlass
+# warns and skips the optional bridge without affecting FA4.
 if BUILD_OVL:
     _ovl_csrc = os.path.join(FLASH_MASK_DIR, 'overlap', 'csrc')
     _ovl_pkg_dir = os.path.join(FLASH_MASK_DIR, 'overlap')
-    _nvshmem_home = os.environ.get(
-        'NVSHMEM_HOME',
-        '/root/work/Paddle/build/third_party/install/nvshmem',
-    )
+    _nccl_home = os.environ.get('NCCL_HOME', os.environ.get('NCCL_ROOT', ''))
     _ovl_arch = os.environ.get('FM4_OVERLAP_CUDA_ARCH', '90a')
     _cutlass_inc = _detect_cutlass_inc()
 
-    if not os.path.isdir(_nvshmem_home):
-        print(f"[flashmask] overlap: NVSHMEM_HOME not found ({_nvshmem_home}); "
-              f"skipping overlap bridge. Set NVSHMEM_HOME to a valid install.")
+    if not _nccl_home or not os.path.isdir(_nccl_home):
+        print(f"[flashmask] overlap: NCCL_HOME not found ({_nccl_home}); "
+              "skipping overlap bridge. Set NCCL_HOME to a valid install.")
     elif _cutlass_inc is None:
         print("[flashmask] overlap: cutlass/bfloat16.h not found "
               "(set FM4_OVERLAP_CUTLASS_INC or init the FA4 submodule); "
               "skipping overlap bridge.")
     else:
-        print(f"[flashmask] overlap: NVSHMEM_HOME={_nvshmem_home}  "
+        print(f"[flashmask] overlap: NCCL_HOME={_nccl_home}  "
               f"arch={_ovl_arch}  cutlass_inc={_cutlass_inc}")
         _pkg = _build_cmake_submodule(
             'FM4 Overlap',
@@ -707,7 +703,7 @@ if BUILD_OVL:
             pkg_dir=_ovl_pkg_dir,
             lib_prefix='fm4_overlap',
             cmake_defs={
-                'NVSHMEM_INSTALL_DIR': _nvshmem_home,
+                'NCCL_INSTALL_DIR': _nccl_home,
                 'FM4_OVERLAP_CUDA_ARCH': _ovl_arch,
                 'FM4_OVERLAP_CUTLASS_INC': _cutlass_inc,
             },

@@ -9,7 +9,7 @@
 
 #define DEBUG_LOGGING LOG_LV_NONE
 
-// #define NVSHMEM_DEBUG
+// #define FLASHMASK_DEBUG
 
 inline void CheckCudaErrorAux(const char *file, unsigned line,
                                        const char *statement, cudaError_t err) {
@@ -20,7 +20,7 @@ inline void CheckCudaErrorAux(const char *file, unsigned line,
     exit(1);
 }
 
-#if defined(NVSHMEM_DEBUG)
+#if defined(FLASHMASK_DEBUG)
 #define CUDA_DEBUG_CHECK(value) CheckCudaErrorAux(__FILE__, __LINE__, #value, value)
 #else
 #define CUDA_DEBUG_CHECK(value) (value)

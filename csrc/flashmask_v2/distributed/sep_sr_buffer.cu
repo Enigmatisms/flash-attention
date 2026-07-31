@@ -13,17 +13,16 @@
 
 namespace flashmask {
 
-static constexpr bool MANUAL_CLEANUP = false;
-
 template <typename KVType>
 SepSRBuffer<KVType>::SepSRBuffer(
-    size_t single_k_numel, 
+    gin::Context& context,
+    size_t single_k_numel,
     int semaphore_size,
     int chunks_per_seg,
     int buffer_capacity,
-    nvshmem_team_t team
+    int team
 ) :
-    _dk_data(nullptr), _dv_data(nullptr), _semaphores(nullptr),
+    _context(context), _dk_data(nullptr), _dv_data(nullptr), _semaphores(nullptr),
     _allocated(false), _capacity(buffer_capacity), _team(team),
     _buf_offset(2 * chunks_per_seg * single_k_numel),
     _semaphore_size(semaphore_size),
@@ -43,63 +42,48 @@ SepSRBuffer<KVType>::SepSRBuffer(
 
     total_elements *= buffer_capacity;
     _empty_states.resize(buffer_capacity);
-    for (int i = 0; i < buffer_capacity; i++)
-        cudaEventCreateWithFlags(&_empty_states[i], cudaEventDisableTiming);
 
-    size_t total_bytes = total_elements * sizeof(KVType);
-    
-    _dk_data = static_cast<KVType*>(nvshmem_malloc(total_bytes));
-    if (!_dk_data) {
-        throw std::bad_alloc();
-    }
+    const size_t total_bytes = total_elements * sizeof(KVType);
+    _dk_data = static_cast<KVType*>(gin::alloc(_context, total_bytes));
     _dv_data = _dk_data + chunks_per_seg * single_k_numel;
+    for (int i = 0; i < buffer_capacity; i++) {
+        cudaEventCreateWithFlags(&_empty_states[i], cudaEventDisableTiming);
+    }
     _semaphores = reinterpret_cast<SemaphoreType*>(_dk_data + 2 * buffer_capacity * _buf_offset);
     _allocated = true;
 }
 
 template <typename KVType>
 void SepSRBuffer<KVType>::release() {
-    if (_allocated && _dk_data) {
-        if constexpr (MANUAL_CLEANUP) {
-            nvshmem_free(_dk_data);
-        }
-        for (int i = 0; i < _capacity; i++) {
-            CUDA_DEBUG_CHECK(cudaEventDestroy(_empty_states[i]));
-        }
-        _dk_data = nullptr;
-        _dv_data = nullptr;
-        _semaphores = nullptr;
-        _allocated = false;
-        _team = NVSHMEM_TEAM_INVALID;
-        _buf_offset = 0;
-        _semaphore_size = 0;
-        _single_k_numel = 0;
-        _chunks_per_seg = 0;
+    if (!_allocated || _dk_data == nullptr) {
+        return;
     }
+
+    gin::free(_context, _dk_data);
+    for (cudaEvent_t event : _empty_states) {
+        CUDA_DEBUG_CHECK(cudaEventDestroy(event));
+    }
+    _empty_states.clear();
+    _dk_data = nullptr;
+    _dv_data = nullptr;
+    _semaphores = nullptr;
+    _allocated = false;
+    _team = -1;
+    _buf_offset = 0;
+    _semaphore_size = 0;
+    _single_k_numel = 0;
+    _chunks_per_seg = 0;
 }
 
 template <typename KVType>
-void SepSRBuffer<KVType>::release_for_realloc() {
-    if (_allocated && _dk_data) {
-        nvshmem_free(_dk_data);
-        for (int i = 0; i < _capacity; i++) {
-            CUDA_DEBUG_CHECK(cudaEventDestroy(_empty_states[i]));
-        }
-        _dk_data = nullptr;
-        _dv_data = nullptr;
-        _semaphores = nullptr;
-        _allocated = false;
-        _team = NVSHMEM_TEAM_INVALID;
-        _buf_offset = 0;
-        _semaphore_size = 0;
-        _single_k_numel = 0;
-        _chunks_per_seg = 0;
+SepSRBuffer<KVType>::~SepSRBuffer() noexcept {
+    if (!_allocated || _dk_data == nullptr) {
+        return;
     }
-}
-
-template <typename KVType>
-SepSRBuffer<KVType>::~SepSRBuffer() {
-    release();
+    gin::free_noexcept(_context, _dk_data);
+    for (cudaEvent_t event : _empty_states) {
+        cudaEventDestroy(event);
+    }
 }
 
 template <typename KVType>
