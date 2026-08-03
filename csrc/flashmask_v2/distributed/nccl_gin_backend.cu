@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -100,13 +101,16 @@ public:
             requirements.ginExclusiveContexts = true;
             requirements.ginQueueDepth = 256;
             requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-            num_qps_ = kDefaultNumQPs;
-        } else {
-            num_qps_ = 0;
         }
 
         FM_NCCL_CHECK(ncclDevCommCreate(comm_, &requirements, &dev_comm_));
         dev_comm_created_ = true;
+        // ginContextCount is only a hint: NCCL may grant fewer contexts than
+        // requested (older GIN backends clamp it to the connection count).
+        // qp_index() indexes contexts modulo num_qps, so it must reflect what
+        // was actually granted, otherwise we address contexts out of range.
+        num_qps_ = needs_network ? static_cast<int>(dev_comm_.ginContextCount) : 0;
+        log_topology(props);
         FM_CUDA_CHECK(cudaMalloc(&barrier_value_, sizeof(int)));
         FM_CUDA_CHECK(cudaMemset(barrier_value_, 0, sizeof(int)));
         publish_device_state();
@@ -122,7 +126,7 @@ public:
         FM_NCCL_CHECK(ncclMemAlloc(&region.raw_ptr, bytes));
 
         const ncclResult_t register_result = ncclCommWindowRegister(
-            comm_, region.raw_ptr, bytes, &region.window, NCCL_WIN_STRICT_ORDERING);
+            comm_, region.raw_ptr, bytes, &region.window, NCCL_WIN_DEFAULT);
         if (register_result != ncclSuccess) {
             ncclMemFree(region.raw_ptr);
             throw std::runtime_error(
@@ -206,6 +210,22 @@ public:
     }
 
 private:
+    // One line per rank at init. This is the only place that knows the real
+    // transport shape, and every "why is the network path slow" question starts
+    // with num_lsa_ranks (a degenerate LSA domain of 1 silently routes every
+    // chunk over the NIC while staying bit-exact) and the granted context count.
+    void log_topology(const ncclCommProperties& props) const {
+        std::fprintf(stderr,
+            "[FlashMask GIN] rank %d/%d lsa_rank %d/%d rail_rank %d use_rail %d "
+            "ginType %d railedGinType %d ginContexts %u ginConnections %u\n",
+            rank_, nranks_, lsa_rank_, num_lsa_ranks_, rail_rank_,
+            static_cast<int>(use_rail_),
+            static_cast<int>(props.ginType), static_cast<int>(props.railedGinType),
+            static_cast<unsigned>(dev_comm_.ginContextCount),
+            static_cast<unsigned>(dev_comm_.ginConnectionCount));
+        std::fflush(stderr);
+    }
+
     void publish_device_state() {
         DeviceState state{};
         state.dev_comm = dev_comm_;

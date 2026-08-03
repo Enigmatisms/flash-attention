@@ -129,8 +129,13 @@ __device__ __forceinline__ ncclTeam network_team() {
     return ncclTeamWorld(g_device_state.dev_comm);
 }
 
+// One GIN context is shared by several CTAs (launch geometry uses more CTAs
+// than we allocate contexts), so the resource-sharing mode must be
+// device-scope: NCCL_GIN_RESOURCE_SHARING_CTA lowers to block-scope locks and
+// atomics on the shared QP submission queue, which provides no mutual
+// exclusion between CTAs.
 __device__ __forceinline__ ncclGin make_gin() {
-    return ncclGin(g_device_state.dev_comm, qp_index(), NCCL_GIN_RESOURCE_SHARING_CTA);
+    return ncclGin(g_device_state.dev_comm, qp_index(), NCCL_GIN_RESOURCE_SHARING_GPU);
 }
 
 // Dedicated context for the *ordered* remote-put path.
@@ -147,7 +152,8 @@ __device__ __forceinline__ ncclGin make_gin_ordered() {
 
 // Drain THIS thread's outstanding puts on the ordered context (context 0) to
 // LOCAL completion -- i.e. the put source buffers become safe to reuse.
-__device__ __forceinline__ void flush_ordered() {
+// Out of line: see network_get_two_buffers in gin_copy_utils.cuh.
+static __device__ __noinline__ void flush_ordered() {
     make_gin_ordered().flush(ncclCoopThread());
 }
 
@@ -187,6 +193,22 @@ __device__ __forceinline__ void remote_add(T* ptr, T value, int world_peer) {
 }
 
 
+// Out of line: see network_get_two_buffers in gin_copy_utils.cuh. Called from
+// the RS put kernel's commit path, which is register-starved for the same reason.
+template <typename T>
+static __device__ __noinline__ void network_strong_signal_add(T* ptr, T value, int world_peer) {
+    static_assert(sizeof(T) == sizeof(uint64_t), "GIN VA signal add requires a 64-bit value");
+    const auto& region = find_region(ptr);
+    auto transport = make_gin_ordered();
+    transport.signal(
+        network_team(), team_peer(world_peer),
+        ncclGin_StrongVASignalAdd{
+            region.window, region_offset(region, ptr), static_cast<uint64_t>(value)},
+        ncclCoopThread(), ncclGin_None(),
+        cuda::thread_scope_thread, cuda::thread_scope_device,
+        ncclGinOptFlagsDefault);
+}
+
 // Ordered variant of remote_add: routes the aggregate signal through the shared
 // kOrderedPutContext (one QP per peer, GPU-wide sharing) and uses a *strong* VA
 // signal. Because every per-CTA put also travels the ordered context (see
@@ -203,17 +225,7 @@ __device__ __forceinline__ void remote_strong_add(T* ptr, T value, int world_pee
             return;
         }
     }
-
-    static_assert(sizeof(T) == sizeof(uint64_t), "GIN VA signal add requires a 64-bit value");
-    const auto& region = find_region(ptr);
-    auto transport = make_gin_ordered();
-    transport.signal(
-        network_team(), team_peer(world_peer),
-        ncclGin_StrongVASignalAdd{
-            region.window, region_offset(region, ptr), static_cast<uint64_t>(value)},
-        ncclCoopThread(), ncclGin_None(),
-        cuda::thread_scope_thread, cuda::thread_scope_device,
-        ncclGinOptFlagsDefault);
+    network_strong_signal_add(ptr, value, world_peer);
 }
 
 template <typename T>
