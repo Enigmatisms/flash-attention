@@ -234,18 +234,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 const int counter_offset = target_rank_val + total_n_pes * batch_id;
                 // Fence BEFORE publishing counter increment: ensures this CTA's SR buffer
                 // stores are at L2 before other CTAs can observe the count and trigger Phase 2 notification.
+                __threadfence();
                 int prev = atomicAdd(&rank_empty_counters[counter_offset], 1);
                 if (prev + 1 == work_per_chunk) {
                     // All works for this (batch, Phase 1 target) are done.
                     // Notify same-node ranks: relay data for this batch is ready.
-                    const int my_pe_node = my_pe % gpus_per_node;
-                    const int my_node_id = my_pe / gpus_per_node;
-                    __threadfence();
-                    for (int slot = 1; slot < gpus_per_node; slot++) {
-                        int base = (my_pe_node + slot) % gpus_per_node;
-                        int sn_rank = base + my_node_id * gpus_per_node;
-                        gin::remote_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
-                    }
+                    sema::ag::notify_batch_ready_to_same_node(
+                        sema_intra, target_rank_val, batch_id, num_batch, my_pe, gpus_per_node);
                 }
             }
         }
@@ -344,7 +339,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                     // Phase 2 (intra-node only): per-batch bit-check on sema_intra
                     // Waits until the specific batch_id bit is set by congruence_notify
                     if (threadIdx.x == 0) {
-                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank);
+                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch);
                     }
                 }
             } else {
@@ -495,16 +490,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 const int counter_idx = (chunk_id - chunk_offset) + num_chunks * batch_id;
                 // Fence BEFORE publishing counter increment: ensures this CTA's SR buffer
                 // stores are at L2 before other CTAs can observe the count and trigger Phase 2 notification.
+                __threadfence();
                 int prev = atomicAdd(&rank_empty_counters[counter_idx], 1);
                 if (prev + 1 == work_per_chunk) {
-                    const int my_pe_node = my_pe % gpus_per_node;
-                    const int my_node_id = my_pe / gpus_per_node;
-                    __threadfence();
-                    for (int slot = 1; slot < gpus_per_node; slot++) {
-                        int base = (my_pe_node + slot) % gpus_per_node;
-                        int sn_rank = base + my_node_id * gpus_per_node;
-                        gin::remote_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
-                    }
+                    sema::ag::notify_batch_ready_to_same_node(
+                        sema_intra, target_rank_val, batch_id, num_batch, my_pe, gpus_per_node);
                 }
             }
         }
@@ -588,7 +578,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 } else {
                     // Phase 2 (intra-node only): per-batch bit-check on sema_intra
                     if (threadIdx.x == 0) {
-                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank);
+                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch);
                     }
                 }
             } else {

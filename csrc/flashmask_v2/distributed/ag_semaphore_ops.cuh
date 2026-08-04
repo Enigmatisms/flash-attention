@@ -7,13 +7,30 @@ namespace flashmask {
 namespace sema {
 namespace ag {
 
+// sema_intra holds `batch_ready_words(num_batch)` int64 words per rank; word w carries the
+// per-batch readiness bits of batches [64w, 64w+64). This lifts the old single-word cap of
+// 64 effective batches (BHSD: B*H). Word 0 doubles as the refcount slot on the rank that
+// owns or relays the data, exactly as before -- a slot is never both at once.
+__host__ __device__ __forceinline__ int batch_ready_words(int num_batch) {
+    return num_batch <= 0 ? 1 : ((num_batch + 63) >> 6);
+}
+
 /**
- * @brief Compute bitmask with bits [0, num_batch) set, safe for num_batch in [0, 64].
+ * @brief Bits set in word `word_idx` once all num_batch batches are ready.
  */
-__host__ __device__ __forceinline__ int64_t make_all_batch_bits(int num_batch) {
-    // Avoid UB: shift by 64 on a 64-bit type is undefined.
-    return num_batch >= 64 ? static_cast<int64_t>(~0ULL)
-                           : static_cast<int64_t>((1ULL << num_batch) - 1);
+__host__ __device__ __forceinline__ int64_t batch_ready_bits(int num_batch, int word_idx) {
+    const int bits = num_batch - (word_idx << 6);
+    if (bits >= 64) return static_cast<int64_t>(~0ULL);      // avoid UB: shift by 64
+    return bits <= 0 ? 0 : static_cast<int64_t>((1ULL << bits) - 1);
+}
+
+/**
+ * @brief int64 semaphore slots to allocate. Non-hierarchical indexes by rank, so one word each.
+ */
+__host__ __forceinline__ int semaphore_count(
+    bool use_hierarchical, int num_nodes, int total_n_pes, int num_batch) {
+    return use_hierarchical ? num_nodes + total_n_pes * batch_ready_words(num_batch)
+                            : total_n_pes;
 }
 
 /**
@@ -28,36 +45,70 @@ __device__ __forceinline__ void wait_full(
 
 
 /**
- * @brief (Device Function) Wait until semaphores[target_pe] has batch_idx bit set.
+ * @brief (Device Function) Wait until semaphores' batch_idx readiness bit is set for target_pe.
  *   Used in hierarchical Phase 2 to wait for per-batch relay data readiness.
  */
 __device__ __forceinline__ void wait_full_one_batch(
     const int64_t* const __restrict__ semaphores,
     const int batch_idx,
-    const int target_pe
+    const int target_pe,
+    const int num_batch
 ) {
-    const int64_t batch_bit = static_cast<int64_t>(1ULL << batch_idx);
+    const int64_t batch_bit = static_cast<int64_t>(1ULL << (batch_idx & 63));
+    const int64_t* const word =
+        semaphores + target_pe * batch_ready_words(num_batch) + (batch_idx >> 6);
     int64_t current_val;
     do {
         asm volatile("ld.volatile.global.s64 %0, [%1];"
-            : "=l"(current_val) : "l"(semaphores + target_pe) : "memory");
+            : "=l"(current_val) : "l"(word) : "memory");
     } while (!(current_val & batch_bit));
 }
 
 /**
- * @brief (Device Function) Wait until all batch bits are set in semaphores[target_pe].
+ * @brief (Device Function) Publish "batch_idx of target_pe's data is readable" to the other
+ *   ranks of this node. The leading fence pairs with the release fence the producing CTAs
+ *   issue before their relaxed counter increment, so their SR buffer stores are ordered
+ *   before this announcement.
+ */
+__device__ __forceinline__ void notify_batch_ready_to_same_node(
+    int64_t* const __restrict__ semaphores,
+    const int target_pe,
+    const int batch_idx,
+    const int num_batch,
+    const int my_pe,
+    const int gpus_per_node
+) {
+    int64_t* const word =
+        semaphores + target_pe * batch_ready_words(num_batch) + (batch_idx >> 6);
+    const int64_t ready_bit = static_cast<int64_t>(1ULL << (batch_idx & 63));
+    const int my_pe_node = my_pe % gpus_per_node;
+    const int my_node_id = my_pe / gpus_per_node;
+    __threadfence();
+    for (int slot = 1; slot < gpus_per_node; slot++) {
+        const int base = (my_pe_node + slot) % gpus_per_node;
+        gin::remote_or(word, ready_bit, base + my_node_id * gpus_per_node);
+    }
+}
+
+/**
+ * @brief (Device Function) Wait until all batch bits are set for target_pe.
  *   Used in HierNotifyEmpty to drain per-batch relay signals before clearing.
  */
 __device__ __forceinline__ void wait_full_all_batch(
     const int64_t* const __restrict__ semaphores,
-    const int64_t all_batch_bits,
+    const int num_batch,
     const int target_pe
 ) {
-    int64_t current_val;
-    do {
-        asm volatile("ld.volatile.global.s64 %0, [%1];"
-            : "=l"(current_val) : "l"(semaphores + target_pe) : "memory");
-    } while (current_val != all_batch_bits);
+    const int words = batch_ready_words(num_batch);
+    const int64_t* const base = semaphores + target_pe * words;
+    for (int w = 0; w < words; w++) {
+        const int64_t expected = batch_ready_bits(num_batch, w);
+        int64_t current_val;
+        do {
+            asm volatile("ld.volatile.global.s64 %0, [%1];"
+                : "=l"(current_val) : "l"(base + w) : "memory");
+        } while (current_val != expected);
+    }
 }
 
 // Note(heqianyue): single node AMO can use int (4B) as semaphore types, but when in multi-node
@@ -207,14 +258,14 @@ void notify_segment_empty(
 /**
  * Hierarchical notify_full: sets refcounts and broadcasts to congruence partners + same-node ranks.
  *
- * Dual-refcount protocol (local writes by thread 0):
+ * Dual-refcount protocol (local writes by thread 0, refcount lives in word 0 of the slot):
  *   sema_intra[my_pe] = producer refcount = (num_nodes-1) + (gpus_per_node-1)
  *   sema_intra[partner] = relay refcount = (gpus_per_node-1), for each congruence partner
  *     (partner's data will be relayed through us; same-node ranks will read and decrement)
  *
  * Remote signals (threads 1..N):
  *   sema_inter[my_node_id] = 1 on each congruence partner  (cross-node data ready)
- *   sema_intra[my_pe] = all_batch_bits on each same-node rank  (local chunk ready)
+ *   sema_intra[my_pe] = every batch bit set, on each same-node rank  (local chunk ready)
  *
  * Precondition: wait_self_empty_hier has ensured all local sema_intra entries being
  *   written here are already 0 (previous round fully consumed).
@@ -230,14 +281,15 @@ __global__ void HierSetFullKernel(
     int gpus_per_node,
     int num_batch
 ) {
+    const int ready_words = batch_ready_words(num_batch);
     if (threadIdx.x == 0) {
         // Producer refcount: decremented by congruence partners + same-node ranks
-        sema_intra[self_rank] = refcount;
+        sema_intra[self_rank * ready_words] = refcount;
         // Relay refcounts: each congruence partner's data will be relayed through us,
         // and (gpus_per_node-1) same-node ranks will read the relay then decrement.
         for (int i = 1; i < num_nodes; i++) {
             int partner = my_pe_node + ((my_node_id + i) % num_nodes) * gpus_per_node;
-            sema_intra[partner] = static_cast<int64_t>(gpus_per_node - 1);
+            sema_intra[partner * ready_words] = static_cast<int64_t>(gpus_per_node - 1);
         }
     }
     __threadfence();
@@ -258,9 +310,11 @@ __global__ void HierSetFullKernel(
         int slot = tid - congruence_count;  // 1..gpus_per_node-1
         int base = (my_pe_node + slot) % gpus_per_node;
         int target_rank = base + my_node_id * gpus_per_node;
-        const int64_t all_batch_bits = make_all_batch_bits(num_batch);
         // Write all-batch-bits on target (all batches ready for my local KV)
-        gin::remote_store(sema_intra + self_rank, all_batch_bits, target_rank);
+        for (int w = 0; w < ready_words; w++) {
+            gin::remote_store(
+                sema_intra + self_rank * ready_words + w, batch_ready_bits(num_batch, w), target_rank);
+        }
     }
 }
 
@@ -339,18 +393,20 @@ __global__ void HierNotifyEmptyKernel(
 
     const int target_slot = target % gpus_per_node;
     const int target_node = target / gpus_per_node;
+    const int ready_words = batch_ready_words(num_batch);
 
     if (target_slot == my_slot) {
         // Case 1: Congruent (Phase 1 target, cross-node).
         sema_inter[target_node] = 0;
-        gin::remote_add(sema_intra + target, int64_t(-1), target);
+        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), target);
     } else {
-        const int64_t all_batch_bits = make_all_batch_bits(num_batch);
-        wait_full_all_batch(sema_intra, all_batch_bits, target);
-        sema_intra[target] = 0;
+        wait_full_all_batch(sema_intra, num_batch, target);
+        for (int w = 0; w < ready_words; w++) {
+            sema_intra[target * ready_words + w] = 0;
+        }
         // same node: no remote_pe relay. Othewise we should calculate the relay rank
         int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
-        gin::remote_add(sema_intra + target, int64_t(-1), remote_rank);
+        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), remote_rank);
     }
 }
 
@@ -384,19 +440,21 @@ __global__ void HierNotifySegmentEmptyKernel(
     const int target_node = target / gpus_per_node;
 
     const int my_node = my_pe / gpus_per_node;
+    const int ready_words = batch_ready_words(num_batch);
 
     if (target_slot == my_slot) {
         // Case 1: Congruent (Phase 1 target, cross-node).
         sema_inter[target_node] = 0;
         // Do NOT zero sema_intra[target] — relay refcount managed by Phase 2 consumers.
-        gin::remote_add(sema_intra + target, int64_t(-1), target);
+        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), target);
     } else {
-        const int64_t all_batch_bits = make_all_batch_bits(num_batch);
-        wait_full_all_batch(sema_intra, all_batch_bits, target);
-        sema_intra[target] = 0;
+        wait_full_all_batch(sema_intra, num_batch, target);
+        for (int w = 0; w < ready_words; w++) {
+            sema_intra[target * ready_words + w] = 0;
+        }
         // same node: no remote_pe relay. Othewise we should calculate the relay rank
         int remote_rank = target_node == my_node ? target : target_slot + my_node * gpus_per_node;
-        gin::remote_add(sema_intra + target, int64_t(-1), remote_rank);
+        gin::remote_add(sema_intra + target * ready_words, int64_t(-1), remote_rank);
     }
 }
 
@@ -433,13 +491,16 @@ __global__ void WaitSelfEmptyHierarchicalKernel(
     int64_t* const __restrict__ sema_intra,
     int my_pe_node,
     int my_node_id,
-    int gpus_per_node
+    int gpus_per_node,
+    int num_batch
 ) {
     int partner = my_pe_node + ((my_node_id + threadIdx.x) % blockDim.x) * gpus_per_node;
+    // Refcounts live in word 0 of each rank's slot.
+    const int64_t* const refcount = sema_intra + partner * batch_ready_words(num_batch);
     int64_t current_val;
     do {
         asm volatile("ld.volatile.global.s64 %0, [%1];"
-            : "=l"(current_val) : "l"(sema_intra + partner) : "memory");
+            : "=l"(current_val) : "l"(refcount) : "memory");
     } while (current_val);
 }
 
@@ -454,12 +515,13 @@ void wait_self_empty_hier(
     int my_pe,
     int gpus_per_node,
     int num_nodes,
+    int num_batch,
     cudaStream_t stream
 ) {
     const int my_pe_node = my_pe % gpus_per_node;
     const int my_node_id = my_pe / gpus_per_node;
     WaitSelfEmptyHierarchicalKernel<<<1, num_nodes, 0, stream>>>(
-        sema_intra, my_pe_node, my_node_id, gpus_per_node
+        sema_intra, my_pe_node, my_node_id, gpus_per_node, num_batch
     );
 }
 

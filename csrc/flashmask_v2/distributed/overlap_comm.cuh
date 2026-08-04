@@ -289,10 +289,14 @@ private:
 
     // Semaphore accessors for hierarchical dual-array protocol:
     //   sema_inter [0..num_nodes-1]: cross-node data-ready flags (0/1)
-    //   sema_intra [0..total_n_pes-1]: refcount + intra-node consumption signals
+    //   sema_intra [total_n_pes ranks x batch_ready_words(B*H) words]: word 0 is the refcount,
+    //     all words carry the per-batch intra-node consumption signals
     // Non-hierarchical: sema_inter_size=0, sema_intra() == semaphores()
     inline int64_t* sema_inter() const { return kv_buffer->semaphores(); }
     inline int64_t* sema_intra() const { return kv_buffer->semaphores() + _sema_inter_size; }
+
+    // BHSD folds heads into the batch dimension: every (b,h) pair is an independent batch.
+    inline int num_effective_batch() const { return _flags.use_bhsd_layout ? B * H : B; }
 
     // Helper to (re)allocate block_work_ids and derived pointers
     void reallocate_block_work_ids();
@@ -326,6 +330,7 @@ private:
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
     OverlapFeatureFlags _flags;  // runtime feature switches (effective values after fallbacks)
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
+    int _sema_count;        // allocated int64 semaphore slots
 
     // Configuration tracking for dynamic reconfiguration
     OverlapConfig _config;
