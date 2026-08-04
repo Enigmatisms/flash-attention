@@ -34,12 +34,16 @@ static __device__ __noinline__ void network_get_two_buffers(
     const auto& dst_region = gin::find_region(dst1);
     const int peer = gin::team_peer(world_peer);
     auto transport = gin::make_gin();
+    // The doorbell carries a producer index, so the second get's ring publishes
+    // this WQE too. Skipping the first ring saves a lock + release fence + two
+    // BAR writes; DOCA's in-order sq_ready_index gate guarantees a later ring
+    // never exposes a half-written WQE.
     transport.get(
         gin::network_team(), peer,
         src_region.window, gin::region_offset(src_region, src1),
         dst_region.window, gin::region_offset(dst_region, dst1),
         bytes, ncclCoopThread(), ncclGin_None(),
-        ncclGinOptFlagsDefault, ncclGin_SegmentDevice());
+        ncclGinOptFlagsAggregateRequests, ncclGin_SegmentDevice());
     transport.get(
         gin::network_team(), peer,
         src_region.window, gin::region_offset(src_region, src2),
@@ -88,7 +92,8 @@ static __device__ __noinline__ void network_put_two_buffers(
         src_region.window, gin::region_offset(src_region, src1),
         bytes, ncclGin_None(), ncclGin_None(), ncclCoopThread(),
         ncclGin_None(), cuda::thread_scope_thread, cuda::thread_scope_device,
-        ncclGinOptFlagsDefault);
+        // Second put's doorbell publishes this WQE too -- see network_get_two_buffers.
+        ncclGinOptFlagsAggregateRequests);
     transport.put(
         gin::network_team(), gin::team_peer(world_peer),
         dst_region.window, gin::region_offset(dst_region, dst2),
