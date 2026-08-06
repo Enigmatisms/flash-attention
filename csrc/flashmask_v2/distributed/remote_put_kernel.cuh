@@ -179,8 +179,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         try_commit_rank(seg_chunk_id, target_rank);
         work_id = update_work_id_sync();
     }
-    // PUT is nbi
-    if (threadIdx.x == 0) {
+    // PUT is nbi: drain before the kernel ends so the send buffer isn't reused
+    // while the NIC still reads it. Single-node meshes have no GIN context at all
+    // (host requests them only when world_size > num_lsa_ranks) and every put took
+    // the LSA store path, so there is nothing to drain and nothing valid to drain on.
+    if (threadIdx.x == 0 && gin::mesh_is_cross_node()) {
         gin::flush_ordered();
     }
 #ifdef FLASHMASK_DEBUG
