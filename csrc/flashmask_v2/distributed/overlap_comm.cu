@@ -166,8 +166,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     cudaEventCreateWithFlags(&ag_done, cudaEventDisableTiming);
     cudaEventRecord(sr_usable, comm_stream);                    // set initial status for SR buffer
     cudaEventRecord(ag_done, comm_stream);                      // initial state: no AG pending
-    _local_batch_stride = s_kv * h_kv * d_kv;
-    _total_numel = _local_batch_stride * b_kv * nranks;             // won't overflow, but should be careful
+    _local_batch_stride = static_cast<size_t>(s_kv) * h_kv * d_kv;
+    _total_numel = _local_batch_stride * b_kv * nranks;
 
     // This variable is simply a int32_t, so can be passed by value
     const int cp_team = 0;
@@ -367,9 +367,9 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
     // yet, `team_bar` (the communicator barrier) is the culprit
     WARN_PRINT("Before cudaMemcpyAsync... is fwd: %d\n", int(fwd));
     // bwd copies the data to the start chunk of the SR, while fwd copies to the last chunk
-    const int local_offset = fwd ? (_local_batch_stride * (_total_n_pes - 1)) : 0;
+    const size_t local_offset = fwd ? (_local_batch_stride * (_total_n_pes - 1)) : 0;
     // for bwd RS-overlap splitted AG, the batch stride is num_chunks * S_local * S_stride
-    int batch_stride = _local_batch_stride * _total_n_pes;
+    size_t batch_stride = _local_batch_stride * _total_n_pes;
     if (fwd == false && dkv_buffer) {
         batch_stride = _local_batch_stride * num_chunks;
         // Non-hierarchical BWD: save local KV at the SR tail so remote ranks can Phase-1 fetch it.
@@ -851,10 +851,11 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
             }                                                                                           \
         } else {                                                                                        \
             const int S_stride = H * D;                                                                 \
-            const int batch_stride = num_chunks * S_chunk * S_stride;                                   \
+            const size_t batch_stride = static_cast<size_t>(num_chunks) * S_chunk * S_stride;           \
             KVType* const dk_dst = dkv_buffer->k_recv(0), *const dv_dst = dkv_buffer->v_recv(0);        \
             const KVType* const dk_src = dkv_buffer->k_send(0), *const dv_src = dkv_buffer->v_send(0);  \
-            for (int batch_offset = 0, bid = 0; bid < B; bid ++, batch_offset += batch_stride) {        \
+            for (int bid = 0; bid < B; bid ++) {                                                        \
+                const size_t batch_offset = bid * batch_stride;                                         \
                 cudaMemcpyAsync(dk_dst + batch_offset, dk_src + batch_offset,                           \
                     sizeof(KVType) * S_chunk * S_stride, cudaMemcpyDeviceToDevice, p_stream);           \
                 cudaMemcpyAsync(dv_dst + batch_offset, dv_src + batch_offset,                           \

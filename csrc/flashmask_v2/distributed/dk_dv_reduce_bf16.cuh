@@ -46,15 +46,16 @@ void ReducedKdVKernel(
 ) {
     static constexpr int elem_per_block = 512;
     const int b = blockIdx.y;           // batch
-    
-    const int elem_per_chunk = num_tasks_per_batch * elem_per_block;    // chunk stride
-    const int b_offset_accum = b * elem_per_chunk;
-    const int b_offset_sr = b_offset_accum * num_chunks;
+
+    // widened: (B, S_chunk * num_chunks, H, D) exceeds INT_MAX elements for large shapes
+    const int64_t elem_per_chunk = int64_t(num_tasks_per_batch) * elem_per_block;    // chunk stride
+    const int64_t b_offset_accum = b * elem_per_chunk;
+    const int64_t b_offset_sr = b_offset_accum * num_chunks;
 
     // task offset is small_chunk offset + thread offset
     auto reduce_op = [&](
         const bf16* const __restrict__ src_recv,
-        bf16* const __restrict__ dst_accum, int task_offset
+        bf16* const __restrict__ dst_accum, int64_t task_offset
     ) {
         // step 1. load values to SMEM
         float4 acc = make_float4(0, 0, 0, 0);
@@ -62,7 +63,7 @@ void ReducedKdVKernel(
             acc = to_float4(*reinterpret_cast<const bf16x4*>(dst_accum + b_offset_accum + task_offset));
         }
         // step 2. use higher precision to do the reduce
-        const int base_offset = b_offset_sr + task_offset;
+        const int64_t base_offset = b_offset_sr + task_offset;
         #pragma unroll
         for (int c = 0; c < num_chunks; ++c) {
             float4 temp_v = to_float4(
@@ -80,7 +81,7 @@ void ReducedKdVKernel(
     };
 
     for (int task_idx = blockIdx.x; task_idx < num_tasks_per_batch; task_idx += gridDim.x) {
-        const int task_offset = task_idx * elem_per_block + 4 * threadIdx.x;
+        const int64_t task_offset = int64_t(task_idx) * elem_per_block + 4 * threadIdx.x;
 
         reduce_op(dk_recv, dk_accum, task_offset);
         reduce_op(dv_recv, dv_accum, task_offset);
@@ -119,7 +120,7 @@ void launch_dk_dv_reduce(
 ) {
     // 128 threads, each reduces 4 bf16
     static constexpr int elem_per_block = 512;
-    int elem_per_chunk = S_chunk * H * D;
+    size_t elem_per_chunk = static_cast<size_t>(S_chunk) * H * D;
     // a typical value: 8192 * 8 * 128 / 512 = 16384
     int num_tasks_per_chunk = elem_per_chunk / elem_per_block;
 

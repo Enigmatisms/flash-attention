@@ -61,7 +61,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
     const int total_works = num_batch * work_per_seg;
     const int works_per_rank = num_batch * work_per_chunk;  // total put operations per target rank
-    const int batch_stride = S_chunk * num_chunk * S_stride;         // num_chunk is the real total
+    // widened: the segment (num_chunk * S_chunk * S_stride) exceeds INT_MAX for large shapes
+    const int64_t row_stride = S_stride;
+    const int64_t batch_stride = S_chunk * num_chunk * row_stride;   // num_chunk is the real total
 
     extern __shared__ int smem_chunk_mask[];
     __shared__ int cached_empty[num_chunk];
@@ -164,7 +166,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         }
 
         // batch_offset + chunk_offset + work_offset, the src and dst in the buffer is the same
-        const int addr = batch_id * batch_stride + (seg_chunk_id * S_chunk + seq_work_id * row_per_block) * S_stride;
+        const int64_t addr = batch_id * batch_stride + (seg_chunk_id * S_chunk + seq_work_id * row_per_block) * row_stride;
 
         shmem::two_buffers_putmem_block(
             k_recv + addr,
