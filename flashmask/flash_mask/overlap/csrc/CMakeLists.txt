@@ -35,13 +35,15 @@ find_path(NCCL_INCLUDE_DIR
     PATHS "${NCCL_INSTALL_DIR}/include"
     NO_DEFAULT_PATH
 )
+# [NCCL-WHEEL] the pip wheel (nvidia-nccl-cu13) ships only the versioned
+# libnccl.so.2 with no libnccl.so dev symlink, so match that name too.
 find_library(NCCL_LIBRARY
-    NAMES nccl
+    NAMES nccl libnccl.so.2
     PATHS "${NCCL_INSTALL_DIR}/lib" "${NCCL_INSTALL_DIR}/lib64"
     NO_DEFAULT_PATH
 )
 if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
-    message(FATAL_ERROR "NCCL headers (nccl.h, nccl_device.h) and libnccl.so are required under ${NCCL_INSTALL_DIR}")
+    message(FATAL_ERROR "NCCL headers (nccl.h, nccl_device.h) and libnccl.so[.2] are required under ${NCCL_INSTALL_DIR}")
 endif()
 if(NOT FM4_OVERLAP_CUTLASS_INC)
     message(FATAL_ERROR "FM4_OVERLAP_CUTLASS_INC is required (dir containing cutlass/bfloat16.h).")
