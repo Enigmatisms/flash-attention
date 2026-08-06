@@ -381,11 +381,11 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                 layout::transpose_copy_to_sr(
                     reinterpret_cast<const __nv_bfloat16*>(new_k_data),
                     reinterpret_cast<__nv_bfloat16*>(local_k_data()),
-                    B, S_local, H, S_local, 0, comm_stream);
+                    B, S_local, H, D, S_local, 0, comm_stream);
                 layout::transpose_copy_to_sr(
                     reinterpret_cast<const __nv_bfloat16*>(new_v_data),
                     reinterpret_cast<__nv_bfloat16*>(local_v_data()),
-                    B, S_local, H, S_local, 0, comm_stream);
+                    B, S_local, H, D, S_local, 0, comm_stream);
             } else {
                 const size_t copy_bytes = B * _local_batch_stride * sizeof(KVType);
                 CUDA_DEBUG_CHECK(cudaMemcpyAsync(local_k_data(), new_k_data, copy_bytes,
@@ -402,11 +402,11 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
         layout::transpose_copy_to_sr(
             reinterpret_cast<const __nv_bfloat16*>(new_k_data),
             reinterpret_cast<__nv_bfloat16*>(kv_buffer->k_data()),
-            B, S_local, H, S_dst, s_offset, comm_stream);
+            B, S_local, H, D, S_dst, s_offset, comm_stream);
         layout::transpose_copy_to_sr(
             reinterpret_cast<const __nv_bfloat16*>(new_v_data),
             reinterpret_cast<__nv_bfloat16*>(kv_buffer->v_data()),
-            B, S_local, H, S_dst, s_offset, comm_stream);
+            B, S_local, H, D, S_dst, s_offset, comm_stream);
         cudaError_t transpose_err = cudaGetLastError();
         if (transpose_err != cudaSuccess) {
             fprintf(stderr, "[BHSD DEBUG] CUDA error AFTER transpose_copy_to_sr: %s\n",
