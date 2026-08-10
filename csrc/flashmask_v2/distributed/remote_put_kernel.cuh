@@ -61,7 +61,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
     const int total_works = num_batch * work_per_seg;
     const int works_per_rank = num_batch * work_per_chunk;  // total put operations per target rank
-    // widened: the segment (num_chunk * S_chunk * S_stride) exceeds INT_MAX for large shapes
+    // the segment (num_chunk * S_chunk * S_stride) exceeds INT_MAX for large shapes
     const int64_t row_stride = S_stride;
     const int64_t batch_stride = S_chunk * num_chunk * row_stride;   // num_chunk is the real total
 

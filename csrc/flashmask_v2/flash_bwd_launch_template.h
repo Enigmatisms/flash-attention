@@ -329,9 +329,7 @@ SEGMENT_LOOP_START:
     if constexpr (!GQA) {
         if (overlap_rs) {
             auto& comm = flashmask::comm::singleton();
-            if (segment_idx >= comm.dkv_buffer_stage()) {
-                comm.dkv_buffer->wait_buffer(segment_idx, stream);
-            }
+            comm.wait_dkv_buffer(segment_idx, stream);
             dk_epilogue_out = comm.dk_send(segment_idx);
             dv_epilogue_out = comm.dv_send(segment_idx);
             // send buffer batch stride: (B, S_scaled, H, D) contiguous
@@ -516,11 +514,8 @@ SEGMENT_LOOP_START:
 #ifdef NCCL_DISTRIBUTED_OVERLAP
         if (overlap_rs) {
             // post-process kernel must wait for the RS-reduce finishing. Since we redirect the output buffer of post-process to dk/v_send
-            // these two buffers are also used in RS-overlap (remote put and reduce), so we cannot overwrite these before they are released. 
-            auto& comm_singleton = flashmask::comm::singleton();
-            if (segment_idx >= comm_singleton.dkv_buffer_stage()) {
-                comm_singleton.dkv_buffer->wait_buffer(segment_idx, stream);
-            }
+            // these two buffers are also used in RS-overlap (remote put and reduce), so we cannot overwrite these before they are released.
+            flashmask::comm::singleton().wait_dkv_buffer(segment_idx, stream);
         }
 #endif  // NCCL_DISTRIBUTED_OVERLAP
         flash::flashmask_kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);

@@ -161,10 +161,12 @@ public:
 
     int dkv_buffer_stage() const;
 
+    // A send slot is read by its put kernel on p_stream, and reused both within a pass
+    // (capacity < num_segments) and across passes (per-stage). comp_stream must not run
+    // the dK/dV epilogue into it before release_buffer's event. On the first pass the
+    // events are unrecorded, which makes cudaStreamWaitEvent a no-op.
     void wait_dkv_buffer(int segment_idx, cudaStream_t stream) const {
-        if (segment_idx >= dkv_buffer_stage()) {
-            dkv_buffer->wait_buffer(segment_idx, stream);
-        }
+        dkv_buffer->wait_buffer(segment_idx, stream);
     }
 
     void wait_reduce_done(cudaStream_t stream) const {
@@ -337,6 +339,13 @@ private:
     size_t _sr_buffer_capacity;             // allocated SRBuffer numel capacity
     size_t _dkv_single_k_numel_capacity;    // allocated SepSRBuffer single_k_numel capacity
     int _dkv_num_chunks;                    // SepSRBuffer's chunks_per_seg (layout-defining)
+
+    // RS-overlap: fp32 scratch holding the cross-segment dK/dV sum (dK half | dV half),
+    // so the only bf16 rounding is the last segment's store into dk_ptr / dv_ptr.
+    // Allocated lazily (grow-only) in prepare_dkv_buffer, and only when num_segments > 1.
+    float* dkv_f32_accum;
+    size_t _dkv_f32_numel;                  // per-tensor numel of dkv_f32_accum (0 when unallocated)
+
     int _num_copy_chunks;                   // block_work_ids array size tracking
     int _bitmap_region_size;                // bitmap region size (work_done + frontier)
 

@@ -32,22 +32,28 @@ __device__ __forceinline__ bf16x4 to_bf16x4(float4 in) {
  * Note that the input buffer and output buffer has shape mismatch:
  * @param dx_send_recv the shape is (B, S_local * num_chunks, H, D)
  * @param dx_accum the shape is (B, S_local, H, D)
- * 
+ *
  * So we need to calculate different batch stride for input and output
+ *
+ * Cross-segment accumulation stays in the fp32 scratch (dx_f32); only the last
+ * segment rounds to bf16, into dx_out. This matches the single rounding of the
+ * non-overlap reduce. For a single segment (is_first && is_last) the scratch is
+ * never touched and needs no allocation.
 */
-template <int S_chunk = 8192, int num_chunks = 4, bool is_first = true>
-__global__ __launch_bounds__(128, 8) 
+template <int S_chunk = 8192, int num_chunks = 4, bool is_first = true, bool is_last = true>
+__global__ __launch_bounds__(128, 8)
 void ReducedKdVKernel(
     const bf16* __restrict__ dk_recv,
     const bf16* __restrict__ dv_recv,
-    bf16* __restrict__ dk_accum,
-    bf16* __restrict__ dv_accum,
+    float* __restrict__ dk_f32,
+    float* __restrict__ dv_f32,
+    bf16* __restrict__ dk_out,
+    bf16* __restrict__ dv_out,
     const int num_tasks_per_batch       // S_chunk * H * D / 512
 ) {
     static constexpr int elem_per_block = 512;
     const int b = blockIdx.y;           // batch
 
-    // widened: (B, S_chunk * num_chunks, H, D) exceeds INT_MAX elements for large shapes
     const int64_t elem_per_chunk = int64_t(num_tasks_per_batch) * elem_per_block;    // chunk stride
     const int64_t b_offset_accum = b * elem_per_chunk;
     const int64_t b_offset_sr = b_offset_accum * num_chunks;
@@ -55,14 +61,15 @@ void ReducedKdVKernel(
     // task offset is small_chunk offset + thread offset
     auto reduce_op = [&](
         const bf16* const __restrict__ src_recv,
-        bf16* const __restrict__ dst_accum, int64_t task_offset
+        float* const __restrict__ dst_f32,
+        bf16* const __restrict__ dst_out, int64_t task_offset
     ) {
-        // step 1. load values to SMEM
+        const int64_t accum_offset = b_offset_accum + task_offset;
         float4 acc = make_float4(0, 0, 0, 0);
         if constexpr (!is_first) {
-            acc = to_float4(*reinterpret_cast<const bf16x4*>(dst_accum + b_offset_accum + task_offset));
+            acc = *reinterpret_cast<const float4*>(dst_f32 + accum_offset);
         }
-        // step 2. use higher precision to do the reduce
+        // use higher precision to do the reduce
         const int64_t base_offset = b_offset_sr + task_offset;
         #pragma unroll
         for (int c = 0; c < num_chunks; ++c) {
@@ -74,30 +81,32 @@ void ReducedKdVKernel(
             acc.z += temp_v.z;
             acc.w += temp_v.w;
         }
-        
-        auto result = to_bf16x4(acc);
-        // step 3. store the accumulated results
-        *reinterpret_cast<bf16x4*>(dst_accum + b_offset_accum + task_offset) = result;
+
+        if constexpr (is_last) {
+            *reinterpret_cast<bf16x4*>(dst_out + accum_offset) = to_bf16x4(acc);
+        } else {
+            *reinterpret_cast<float4*>(dst_f32 + accum_offset) = acc;
+        }
     };
 
     for (int task_idx = blockIdx.x; task_idx < num_tasks_per_batch; task_idx += gridDim.x) {
         const int64_t task_offset = int64_t(task_idx) * elem_per_block + 4 * threadIdx.x;
 
-        reduce_op(dk_recv, dk_accum, task_offset);
-        reduce_op(dv_recv, dv_accum, task_offset);
+        reduce_op(dk_recv, dk_f32, dk_out, task_offset);
+        reduce_op(dv_recv, dv_f32, dv_out, task_offset);
     }
 }
 
-#define ChunkDipatchKernelLaunch(num_chunk, is_first)                                   \
+#define ReduceKernelLaunch(_num_chunk, _is_first, _is_last)                              \
+    ReducedKdVKernel<S_chunk_exp, _num_chunk, _is_first, _is_last><<<grid, 128, 0, stream>>>( \
+        dk_recv, dv_recv, dk_f32, dv_f32, dk_out, dv_out, num_tasks_per_chunk)
+
+#define ChunkDipatchKernelLaunch(num_chunk, is_first, is_last)                           \
     switch (num_chunk) {                                                                \
-        case 4: { ReducedKdVKernel<S_chunk_exp, 4, is_first><<<grid, 128, 0, stream>>>( \
-            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
-        case 2: { ReducedKdVKernel<S_chunk_exp, 2, is_first><<<grid, 128, 0, stream>>>( \
-            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
-        case 8: { ReducedKdVKernel<S_chunk_exp, 8, is_first><<<grid, 128, 0, stream>>>( \
-            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
-        case 1: { ReducedKdVKernel<S_chunk_exp, 1, is_first><<<grid, 128, 0, stream>>>( \
-            dk_recv, dv_recv, dk_accum, dv_accum, num_tasks_per_chunk); break; }        \
+        case 4: { ReduceKernelLaunch(4, is_first, is_last); break; }                    \
+        case 2: { ReduceKernelLaunch(2, is_first, is_last); break; }                    \
+        case 8: { ReduceKernelLaunch(8, is_first, is_last); break; }                    \
+        case 1: { ReduceKernelLaunch(1, is_first, is_last); break; }                    \
     default:                                                                            \
         throw std::invalid_argument(                                                    \
             "[FlashMask Overlap] num_chunks must be one of {1, 2, 4, 8}, got: "         \
@@ -106,17 +115,19 @@ void ReducedKdVKernel(
 
 /**
  * This function calls the dK, dV reduce kernel.
- * @param is_first The first segment to call this function has special
- *  behavior: load from the first chunk of dk/dv_send, then the rest of
- *  the chunks are loaded from dk/dv_recv. If false, we will load from
- *  dk_accum and dv_accum.
+ * @param is_first The first segment overwrites the fp32 scratch instead of
+ *  accumulating into it, so the scratch never needs to be zeroed.
+ * @param is_last The last segment rounds the fp32 sum into the bf16 output
+ *  (dk_out, dv_out); the others keep it in the scratch (dk_f32, dv_f32).
+ *  With a single segment both are true and the scratch is unused.
 */
 void launch_dk_dv_reduce(
     const bf16* dk_recv,
     const bf16* dv_recv,
-    bf16* dk_accum, bf16* dv_accum,
+    float* dk_f32, float* dv_f32,
+    bf16* dk_out, bf16* dv_out,
     int B, int S_chunk, int H, int D,
-    int num_chunks, bool is_first, cudaStream_t stream
+    int num_chunks, bool is_first, bool is_last, cudaStream_t stream
 ) {
     // 128 threads, each reduces 4 bf16
     static constexpr int elem_per_block = 512;
@@ -132,9 +143,11 @@ void launch_dk_dv_reduce(
     do {                                                                             \
         static constexpr int S_chunk_exp = _S_chunk_val;                            \
         if (is_first) {                                                              \
-            ChunkDipatchKernelLaunch(num_chunks, true);                              \
+            if (is_last) { ChunkDipatchKernelLaunch(num_chunks, true, true); }       \
+            else { ChunkDipatchKernelLaunch(num_chunks, true, false); }              \
         } else {                                                                     \
-            ChunkDipatchKernelLaunch(num_chunks, false);                              \
+            if (is_last) { ChunkDipatchKernelLaunch(num_chunks, false, true); }      \
+            else { ChunkDipatchKernelLaunch(num_chunks, false, false); }             \
         }                                                                            \
     } while(0)
 
@@ -154,5 +167,6 @@ void launch_dk_dv_reduce(
 }
 
 #undef ChunkDipatchKernelLaunch
+#undef ReduceKernelLaunch
 
 }   // namespace flashmask

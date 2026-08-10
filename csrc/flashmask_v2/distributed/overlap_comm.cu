@@ -41,8 +41,6 @@ static constexpr int rs_overlap_min_h_k = 1;
 // Supported values: {4096, 8192, 16384, 32768, 65536, 131072}.
 // NOTE: For S_local >= 32768, RS-overlap is automatically disabled (num_chunks=1 from heuristic,
 //       which makes the splitted AG/RS code paths degenerate). AG-only overlap still works.
-// WARNING: For very large S_local (131072) with high nranks (16), S_full * H * D may approach
-//          INT_MAX in kernel address calculations. Known limitation of the existing kernel code.
 
 #define SChunkCase(MACRO_FUNC, _S_chunk, ...) \
     case _S_chunk: { MACRO_FUNC(_S_chunk, ##__VA_ARGS__); break; }
@@ -117,6 +115,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    D(d_kv),
    num_chunks(get_num_chunk_per_segment(s_kv, nranks, h_kv)),
    _sema_count(0),
+   dkv_f32_accum(nullptr),
+   _dkv_f32_numel(0),
    block_work_ids(nullptr),
    block_cnt_semaphore(nullptr),
    copy_chunk_mask(nullptr),
@@ -289,6 +289,11 @@ OverlapCommunicator<KVType>::~OverlapCommunicator() {
             bwd_done_events = nullptr;
             rs_block_cnt = nullptr;
             _num_put_streams = 0;
+        }
+        if (dkv_f32_accum) {
+            CUDA_DEBUG_CHECK(cudaFree(dkv_f32_accum));
+            dkv_f32_accum = nullptr;
+            _dkv_f32_numel = 0;
         }
         dkv_buffer.reset();
     }
@@ -879,9 +884,10 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         launch_dk_dv_reduce(                                                                            \
             dkv_buffer->k_recv(segment_idx),                                                            \
             dkv_buffer->v_recv(segment_idx),                                                            \
+            dkv_f32_accum, dkv_f32_accum + _dkv_f32_numel,                                              \
             dk_accum, dv_accum,                                                                         \
             B, S_chunk, H, D, num_chunks,                                                               \
-            segment_idx == 0,                                                                           \
+            segment_idx == 0, segment_idx == num_segments() - 1,                                        \
             aux_c_stream                                                                                \
         );                                                                                              \
         /* post-reduce notify: only when each segment has its own slot (capacity >= num_segments). */   \
@@ -951,6 +957,14 @@ int OverlapCommunicator<KVType>::get_comm_rpb() const {
 template <typename KVType>
 void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
     if (!dkv_buffer) return;
+
+    // fp32 reduce scratch (grow-only). Segment 0 overwrites it, so it needs no zeroing.
+    const size_t needed = _local_batch_stride * B;
+    if (num_segments() > 1 && needed > _dkv_f32_numel) {
+        if (dkv_f32_accum) CUDA_DEBUG_CHECK(cudaFree(dkv_f32_accum));
+        CUDA_DEBUG_CHECK(cudaMalloc(&dkv_f32_accum, 2 * needed * sizeof(float)));
+        _dkv_f32_numel = needed;
+    }
 
     const bool pre_reduce_notify = dkv_buffer_stage() < num_segments();
     if (pre_reduce_notify) {
@@ -1110,6 +1124,11 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, int cp_team) {
         CUDA_DEBUG_CHECK(cudaStreamDestroy(aux_c_stream));
         dkv_buffer->release_for_realloc();
         dkv_buffer.reset();
+        if (dkv_f32_accum) {
+            CUDA_DEBUG_CHECK(cudaFree(dkv_f32_accum));
+            dkv_f32_accum = nullptr;
+            _dkv_f32_numel = 0;
+        }
         _dkv_single_k_numel_capacity = 0;
         _dkv_num_chunks = 0;
         WARN_PRINT("[FlashMask Overlap] Reconfigure: destroyed dkv_buffer (RS-overlap disabled)\n");

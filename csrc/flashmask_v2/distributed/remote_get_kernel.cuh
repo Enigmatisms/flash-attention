@@ -189,8 +189,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     constexpr int chunk_per_batch = (S - S_chunk) / row_per_block;
     constexpr int work_per_chunk = S_chunk / row_per_block;
     const int total_chunks = num_batch * chunk_per_batch;
-    // widened: the gathered KV (num_batch * S * S_stride) exceeds INT_MAX for large shapes,
-    // so every offset built from it must be 64-bit. Only loop counters stay int.
+    // the gathered KV (num_batch * S * S_stride) exceeds INT_MAX for large shapes,
+    // so every offset built from it is 64-bit. Loop counters stay int.
     const int64_t row_stride = S_stride;
     const int64_t batch_stride = S * row_stride;
     __shared__ int cached_semaphores[64];
