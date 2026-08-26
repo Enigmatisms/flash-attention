@@ -65,6 +65,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from flash_mask.cute import blackwell_helpers as sm100_utils
 from flash_mask.cute.blackwell_helpers import SM100_SMEM_CAPACITY_BYTES
 from flash_mask.cute import barrier, copy_utils, layout_utils, utils
+from flash_mask.cute.flash_bwd_sm100 import _overlap_gate_bwd
 from flash_mask.cute.tile_scheduler import SingleTileScheduler, TileSchedulerArguments
 
 
@@ -1381,9 +1382,39 @@ class FlashAttentionBackwardSm100BigD:
             assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None, (
                 "semaphores were passed but the kernel was not built with deterministic=True"
             )
-        assert overlap_k_addr is None and overlap_dk_addr is None, (
-            "the FM-4 overlap path is not supported by the big-headdim bwd"
+        assert overlap_dk_addr is None and overlap_dv_addr is None, (
+            "dK / dV always leave this kernel through the fp32 accumulators, so the "
+            "overlap send buffers are filled by the postprocess, not here"
         )
+        # FM-4 overlap: K and V live in the split-AG SRBuffer, which has no dlpack
+        # capsule, so rebuild the views from the raw segment addresses. The dims must
+        # stay runtime Int32 -- a static layout specializes the TMA descriptor
+        # differently and reads the wrong bytes.
+        self.overlap_bhsd_layout = cutlass.const_expr(overlap_bhsd_layout)
+        if cutlass.const_expr(overlap_k_addr is not None):
+            from_addr = (
+                utils.make_bhsd_storage_bshd_from_addr
+                if cutlass.const_expr(overlap_bhsd_layout)
+                else utils.make_contiguous_bshd_from_addr
+            )
+            mK = from_addr(
+                overlap_k_addr,
+                overlap_b,
+                overlap_s,
+                overlap_h,
+                overlap_d,
+                mQ.element_type,
+                align=16,
+            )
+            mV = from_addr(
+                overlap_v_addr,
+                overlap_b,
+                overlap_s,
+                overlap_h,
+                overlap_d,
+                mQ.element_type,
+                align=16,
+            )
         # mdK / mdV are the fp32 accumulators here (need_kv_accum is forced on for
         # this kernel: dK and dV always leave TMEM through gmem).
         self._launch(
@@ -1406,6 +1437,9 @@ class FlashAttentionBackwardSm100BigD:
             mdQ_semaphore=mdQ_semaphore,
             mdK_semaphore=mdK_semaphore,
             mdV_semaphore=mdV_semaphore,
+            overlap_work_done_addr=overlap_work_done_addr,
+            overlap_segment_idx=overlap_segment_idx,
+            overlap_comm_rpb=overlap_comm_rpb,
         )
 
     def _launch(
@@ -1425,6 +1459,9 @@ class FlashAttentionBackwardSm100BigD:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
+        overlap_work_done_addr: Optional[cutlass.Int64] = None,
+        overlap_segment_idx: Optional[Int32] = None,
+        overlap_comm_rpb: cutlass.Constexpr = None,
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -1553,6 +1590,9 @@ class FlashAttentionBackwardSm100BigD:
             self.sdSt_layout,
             self.sKt_layout,
             softmax_scale_log2,
+            overlap_work_done_addr,
+            overlap_segment_idx,
+            overlap_comm_rpb,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1597,6 +1637,9 @@ class FlashAttentionBackwardSm100BigD:
         sdSt_layout: cute.ComposedLayout,
         sKt_layout: cute.ComposedLayout,
         softmax_scale_log2: Float32,
+        overlap_work_done_addr: Optional[cutlass.Int64],
+        overlap_segment_idx: Optional[Int32],
+        overlap_comm_rpb: cutlass.Constexpr,
     ):
         """Run the tiled BigD backward dataflow for one scheduled KV block.
 
@@ -1915,6 +1958,14 @@ class FlashAttentionBackwardSm100BigD:
             # deterministic; it means turning this drain's segment walk into a
             # walk-all-plus-predicate loop, so it is left as a follow-up.
             #
+            # mFM keeps its full seqlen_k rows while overlap makes seqlen_k a segment
+            # length, so every absolute key row read below is offset by the segment.
+            # The bounds themselves are QUERY rows and are never segmented.
+            fm_row_offset = (
+                overlap_segment_idx * seqlen_k
+                if cutlass.const_expr(overlap_segment_idx is not None)
+                else Int32(0)
+            )
             # fm_bound_num == 4 (non-causal, both tails bounded) deliberately gets NO
             # skip: it would need four reduced scalars (max/min of both tails' starts and
             # ends) and the resulting iteration space is two bands rather than one, which
@@ -1941,7 +1992,7 @@ class FlashAttentionBackwardSm100BigD:
                     # elements of max(ds) and min(end). The same clamp covers a pair
                     # whose second key block falls entirely past seqlen_k.
                     in_range = col < seqlen_k
-                    safe_col = cutlass.min(col, seqlen_k - 1)
+                    safe_col = fm_row_offset + cutlass.min(col, seqlen_k - 1)
                     acc_ds = cutlass.max(
                         acc_ds, mFM[fm_b, fm_h, safe_col, 0] if in_range else Int32(0)
                     )
@@ -1999,6 +2050,28 @@ class FlashAttentionBackwardSm100BigD:
             # The register budget is per-warp state, not per-iteration work: setting it
             # inside the m loop re-issues setmaxnreg on every iteration.
             cute.arch.setmaxregister_decrease(self.num_regs_load)
+            # Every gmem read of the gathered KV happens in this warp, so one gate
+            # ahead of the K prologue covers the whole CTA. There is no tile scheduler
+            # here: a CTA owns one n block for its lifetime.
+            if cutlass.const_expr(overlap_work_done_addr is not None):
+                gate_batch_idx = batch_idx
+                if cutlass.const_expr(self.overlap_bhsd_layout):
+                    gate_batch_idx = batch_idx * cute.size(mK.shape[2]) + head_idx_kv
+                _overlap_gate_bwd(
+                    n_block,
+                    tidx % cute.arch.WARP_SIZE,
+                    seqlen_k,
+                    gate_batch_idx,
+                    cute.make_ptr(
+                        Int32,
+                        overlap_work_done_addr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    ),
+                    overlap_comm_rpb,
+                    self.cta_group_size,
+                    self.tile_n,
+                )
             # K only depends on the n block, so one copy fn serves the whole kernel --
             # including the prologue, which puts the chunks the steady-state schedule
             # expects to be resident into place before the m loop.
@@ -2841,7 +2914,7 @@ class FlashAttentionBackwardSm100BigD:
                     # Threads whose key is past seqlen_k are masked by n_oob anyway, but
                     # the read itself still has to stay in bounds.
                     fm_row = mFM[
-                        fm_b, fm_h, cutlass.min(n_global, seqlen_k - 1), None
+                        fm_b, fm_h, fm_row_offset + cutlass.min(n_global, seqlen_k - 1), None
                     ]
                     has_end = cutlass.const_expr(
                         (self.is_causal and self.fm_bound_num == 2)
