@@ -43,8 +43,10 @@ def _load():
     lib.fm4_overlap_get_unique_id.argtypes = [ctypes.c_char_p]
     lib.fm4_overlap_get_unique_id.restype = ctypes.c_int
 
-    # (b, s, h, d, rank, nranks) ints, uid bytes, mask_head int.
-    lib.fm4_overlap_init.argtypes = [ctypes.c_int] * 6 + [ctypes.c_char_p, ctypes.c_int]
+    # (b, s, h, d, rank, nranks) ints, uid bytes, mask_head int, kv_shared int.
+    lib.fm4_overlap_init.argtypes = (
+        [ctypes.c_int] * 6 + [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    )
     lib.fm4_overlap_init.restype = ctypes.c_int
 
     for name in (
@@ -164,24 +166,27 @@ def bootstrap_unique_id(rank, group=None):
     return _UID
 
 
-def init_overlap(k, v, rank, nranks, uid_bytes, mask_head=1):
+def init_overlap(k, v, rank, nranks, uid_bytes, mask_head=1, kv_shared=False):
     """Create or reconfigure the C++ singleton from k/v shape + topology (only
-    k.shape is read; the local-KV copy into the SRBuffer happens in update_kv)."""
+    k.shape is read; the local-KV copy into the SRBuffer happens in update_kv).
+    kv_shared: K and V alias one storage, so only K is transported."""
     global _KV_SHAPE
     lib = _load()
     b, s_local, h, d = (int(x) for x in k.shape)
     _KV_SHAPE = (b, h, d)
-    rc = lib.fm4_overlap_init(b, s_local, h, d, int(rank), int(nranks), uid_bytes, int(mask_head))
+    rc = lib.fm4_overlap_init(b, s_local, h, d, int(rank), int(nranks), uid_bytes,
+                              int(mask_head), int(kv_shared))
     if rc != 1:
         raise RuntimeError("fm4_overlap_init failed")
 
 
-def ensure_initialized(k, v, group, mask_head=1):
+def ensure_initialized(k, v, group, mask_head=1, kv_shared=False):
     """Bootstrap the unique id once, then forward shape/topology to the C++ singleton
     every step. init_singleton_instance reconfigures (and reallocs the SRBuffer) only
     when they actually change, so unconditional forwarding is cheap and correct."""
     uid = bootstrap_unique_id(group.rank, group=group)
-    init_overlap(k, v, group.rank, group.world_size, uid, mask_head=mask_head)
+    init_overlap(k, v, group.rank, group.world_size, uid, mask_head=mask_head,
+                 kv_shared=kv_shared)
 
 
 def use_bhsd_layout():

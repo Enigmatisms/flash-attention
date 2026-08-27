@@ -69,9 +69,8 @@ public:
     inline KVType* v_recv(int seg_idx) const { return _dv_data + (CLAMP_IDX(seg_idx) * 2 + 1) * _buf_offset; }
     inline SemaphoreType* semaphores(int seg_idx) const { return _semaphores + CLAMP_IDX(seg_idx) * _semaphore_size; }
 
-    // initialize multi-buffer for post-notify latency hiding setup
-    // or using fixed capacity without post-notify
-    void initialize_buffer(int self_rank, bool per_stage_buffer = false);
+    // Zero every recv slot; the sparse RS puts leave holes the reduce would otherwise read.
+    void initialize_buffer(int self_rank);
 
     void wait_buffer(int seg_idx, cudaStream_t stream) {
         cudaStreamWaitEvent(stream, _empty_states[CLAMP_IDX(seg_idx)]);

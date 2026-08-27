@@ -92,13 +92,13 @@ void SepSRBuffer<KVType>::zero_recv_buf(int seg_idx, cudaStream_t comm_stream) {
 }
 
 template <typename KVType>
-void SepSRBuffer<KVType>::initialize_buffer(int self_rank, bool per_stage_buffer) {
-    if (per_stage_buffer) {
-        // all the GPU ops uses the default blocking stream, since this is only called during initialization (one-off)
-        size_t recv_buffer_sz = sizeof(KVType) * _buf_offset;
-        for (int stage = 0; stage < _capacity; stage++) {
-            cudaMemset(_dk_data + _buf_offset * (1 + 2 * (stage % _capacity)), 0, recv_buffer_sz);
-        }
+void SepSRBuffer<KVType>::initialize_buffer(int self_rank) {
+    // RS puts are sparse, so the reduce reads recv rows no producer wrote; every slot must
+    // start at zero, and zero_recv_buf only recycles a slot after its first use.
+    // all the GPU ops uses the default blocking stream, since this is only called during initialization (one-off)
+    size_t recv_buffer_sz = sizeof(KVType) * _buf_offset;
+    for (int stage = 0; stage < _capacity; stage++) {
+        cudaMemset(_dk_data + _buf_offset * (1 + 2 * stage), 0, recv_buffer_sz);
     }
     size_t semaphore_bytes = _semaphore_size * sizeof(SemaphoreType);
     // set recv buffer and semaphores to be 0 all at once

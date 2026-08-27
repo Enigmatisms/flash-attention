@@ -356,9 +356,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         const int64_t dst_addr = batch_id * batch_stride + seqlen_id * row_stride;
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
-            v_sr + dst_addr,
+            shmem::offset_or_null(v_sr, dst_addr),
             k_sr + src_addr,
-            v_sr + src_addr,
+            shmem::offset_or_null(v_sr, src_addr),
             row_per_block * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated
@@ -603,9 +603,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // In all cases local_k is the correct base; src_addr encodes the per-case offset.
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
-            v_sr + dst_addr,
+            shmem::offset_or_null(v_sr, dst_addr),
             local_k + src_addr,
-            local_v + src_addr,
+            shmem::offset_or_null(local_v, src_addr),
             row_per_block * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated.

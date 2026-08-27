@@ -54,12 +54,14 @@ size_t fm4_overlap_unique_id_size() noexcept {
 // Create or reconfigure the singleton. Only shape (b/s/h/d) + topology
 // (rank/nranks/uid) are needed; the ctor stores but never derefs k/v, so we pass
 // nullptr (the local-KV copy happens later in fm4_overlap_update_kv). Returns 1.
+// kv_shared: K and V alias one tensor, so only K is transported.
 int fm4_overlap_init(int b_kv, int s_kv, int h_kv, int d_kv,
                      int rank, int nranks,
-                     const uint8_t* unique_id, int mask_head) noexcept {
+                     const uint8_t* unique_id, int mask_head,
+                     int kv_shared) noexcept {
     flashmask::comm::init_singleton_instance(
         static_cast<const bf16*>(nullptr), static_cast<const bf16*>(nullptr),
-        b_kv, s_kv, h_kv, d_kv, rank, nranks, unique_id, mask_head);
+        b_kv, s_kv, h_kv, d_kv, rank, nranks, unique_id, mask_head, kv_shared != 0);
     return 1;
 }
 

@@ -170,9 +170,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
 
         shmem::two_buffers_putmem_block(
             k_recv + addr,
-            v_recv + addr,
+            shmem::offset_or_null(v_recv, addr),
             k_send + addr,
-            v_send + addr,
+            shmem::offset_or_null(v_send, addr),
             row_per_block * S_stride * sizeof(T), target_rank
         );
         // buffer putmem_block will call syncthreads(), so next_work_id will not be updated

@@ -97,6 +97,10 @@ public:
 
     OverlapConfig current_config() const { return _config; }
 
+    // Shared K/V: K and V are the same tensor, so only K is transported and every V
+    // pointer handed to the comm kernels is null. Must be set before each AG/RS launch.
+    void set_kv_shared(bool shared) { _kv_shared = shared; }
+
     /**
      * run the overlap kernel asynchronously
      * @param S the seqlen of local K (for example, 32K full length, CP=4, local S=8K)
@@ -130,7 +134,8 @@ public:
     void sync_comm_stream() { cudaStreamSynchronize(comm_stream); }
 
     void* k_data() const { return kv_buffer->k_data(); }
-    void* v_data() const { return kv_buffer->v_data(); }
+    // Shared K/V leaves the V region ungathered, so consumers must read K instead.
+    void* v_data() const { return _kv_shared ? kv_buffer->k_data() : kv_buffer->v_data(); }
     void* segment_k_data(int segment_idx) const {
         const size_t offset = _flags.use_hierarchical
             ? static_cast<size_t>(segment_idx) * B * num_chunks * _local_batch_stride
@@ -141,7 +146,7 @@ public:
         const size_t offset = _flags.use_hierarchical
             ? static_cast<size_t>(segment_idx) * B * num_chunks * _local_batch_stride
             : 0;
-        return kv_buffer->v_data() + offset;
+        return (_kv_shared ? kv_buffer->k_data() : kv_buffer->v_data()) + offset;
     }
 
     // we need to reroute the bwd dx_accum output buffer to dk_send and dv_send
@@ -331,6 +336,7 @@ private:
     int _my_pe_node;        // This rank's index within the NCCL LSA team
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
     OverlapFeatureFlags _flags;  // runtime feature switches (effective values after fallbacks)
+    bool _kv_shared = false;     // K and V alias one tensor: transport K only
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
     int _sema_count;        // allocated int64 semaphore slots
 
@@ -392,7 +398,8 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
     int rank,
     int nranks,
     const uint8_t* unique_id_ptr,
-    int mask_head = 1
+    int mask_head = 1,
+    bool kv_shared = false
 );
 
 // get instance (mutable ref), make sure the instance is initialized, used in both fwd and bwd

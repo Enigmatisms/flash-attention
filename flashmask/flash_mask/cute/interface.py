@@ -514,8 +514,19 @@ def _flash_attn_fwd(
         # :453); FM-3 overlap forbids causal for the same reason (overlap_flashmask.py
         # :335). Guarding here keeps the col mapping in _sparse_chunk_mask_cols exact.
         assert not causal, "overlap mode does not support causal yet"
+        # One storage for K and V makes the gathered V region a bit-for-bit copy of the
+        # gathered K region, so the comm layer transports K only and hands out the K region
+        # for V. _same_storage stays last: it raises rather than guess.
+        overlap_kv_shared = (
+            is_bigd_fwd
+            and k.dtype == v.dtype
+            and list(k.shape) == list(v.shape)
+            and tuple(k.strides) == tuple(v.strides)
+            and _same_storage(k, v)
+        )
         overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=startend_row_indices.shape[1]
+            k, v, group, mask_head=startend_row_indices.shape[1],
+            kv_shared=overlap_kv_shared,
         )
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle()
@@ -1373,7 +1384,7 @@ def _flash_attn_bwd(
         assert not causal, "overlap bwd does not support causal yet"
         startend_row_indices = flashmask_info.startend_row_indices
         overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=startend_row_indices.shape[1]
+            k, v, group, mask_head=startend_row_indices.shape[1], kv_shared=kv_shared
         )
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle()
@@ -2301,21 +2312,21 @@ def _flash_attn_bwd(
     if enable_overlap:
         def _run_overlap_dkv_postprocess(dk_send_addr, dv_send_addr):
             if is_bigd_bwd:
-                # dV stays all-zero under kv_shared (dK carries dK + dV, and RS is
-                # linear so the sum may be formed before the reduce). It still has to
-                # be written: the send buffer is reused across segments and stages.
                 _bigd_postprocess(
                     dk_accum, dk_tensor, bigd_scale, head_dim_rounded, slice_d,
                     n_block_size, seqlen_k_rounded,
                     cu_seqlens_k_tensor, seqused_k_tensor, "ovl_bigd_dk",
                     dk_send_addr, raw_storage_d_k,
                 )
-                _bigd_postprocess(
-                    dv_accum, dv_tensor, cutlass.Float32(1.0), head_dim_v_rounded,
-                    slice_dv, n_block_size, seqlen_k_rounded,
-                    cu_seqlens_k_tensor, seqused_k_tensor, "ovl_bigd_dv",
-                    dv_send_addr, raw_storage_d_v,
-                )
+                # kv_shared merges dV into dK, and the comm layer then leaves the dV
+                # send buffer unread, so filling it with zeros is pure overhead.
+                if not kv_shared:
+                    _bigd_postprocess(
+                        dv_accum, dv_tensor, cutlass.Float32(1.0), head_dim_v_rounded,
+                        slice_dv, n_block_size, seqlen_k_rounded,
+                        cu_seqlens_k_tensor, seqused_k_tensor, "ovl_bigd_dv",
+                        dv_send_addr, raw_storage_d_v,
+                    )
             elif is_split_d_bwd:
                 half_hdim = head_dim // 2
                 half_hdim_v = head_dim_v // 2
