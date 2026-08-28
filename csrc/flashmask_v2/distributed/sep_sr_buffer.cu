@@ -20,11 +20,12 @@ SepSRBuffer<KVType>::SepSRBuffer(
     int semaphore_size,
     int chunks_per_seg,
     int buffer_capacity,
-    int team
+    int team,
+    int kv_components
 ) :
     _context(context), _dk_data(nullptr), _dv_data(nullptr), _semaphores(nullptr),
     _allocated(false), _capacity(buffer_capacity), _team(team),
-    _buf_offset(2 * chunks_per_seg * single_k_numel),
+    _buf_offset(kv_components * chunks_per_seg * single_k_numel),
     _semaphore_size(semaphore_size),
     _single_k_numel(single_k_numel),
     _chunks_per_seg(chunks_per_seg)
@@ -36,8 +37,8 @@ SepSRBuffer<KVType>::SepSRBuffer(
         throw std::invalid_argument("SepSRBuffer: buffer_capacity must be > 0, got: " + std::to_string(buffer_capacity));
     }
 
-    // 2 = (K & V -->) 2 * (send recv -->) 2
-    size_t total_elements = 4 * chunks_per_seg * single_k_numel + 
+    // 2 = send + recv, kv_components = dK (+ dV unless K and V are shared)
+    size_t total_elements = 2 * _buf_offset +
             semaphore_size * sizeof(SemaphoreType) / sizeof(KVType);
 
     total_elements *= buffer_capacity;
@@ -45,7 +46,9 @@ SepSRBuffer<KVType>::SepSRBuffer(
 
     const size_t total_bytes = total_elements * sizeof(KVType);
     _dk_data = static_cast<KVType*>(gin::alloc(_context, total_bytes));
-    _dv_data = _dk_data + chunks_per_seg * single_k_numel;
+    // Shared K/V has no dV slab; null so that a stray dV access faults instead of
+    // silently landing in the dK slab.
+    _dv_data = kv_components == 2 ? _dk_data + chunks_per_seg * single_k_numel : nullptr;
     for (int i = 0; i < buffer_capacity; i++) {
         cudaEventCreateWithFlags(&_empty_states[i], cudaEventDisableTiming);
     }

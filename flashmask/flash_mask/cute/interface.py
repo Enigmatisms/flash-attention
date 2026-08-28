@@ -1282,11 +1282,8 @@ def _flash_attn_bwd(
     # accumulate them into a single TMEM slot and flush them once. Detected instead of
     # asked for: the signature stays (q, k, v).
     #
-    # dv then comes back all-zero and dk carries dK + dV. That falls out of the existing
-    # plumbing: the kernel simply never writes dv_accum, and every dv_accum row the
-    # postprocess reads was zeroed before the launch (whole-buffer zeros, or just the
-    # kv_postprocess range when that path is taken), so its postprocess writes zeros
-    # while dk_accum receives both terms.
+    # dv then comes back all-zero and dk carries dK + dV: the kernel never writes
+    # dv_accum, so dv is allocated zeroed and its postprocess is skipped.
     #
     # Only the shapes the merge is implemented for. 576/512 has no chunk width that
     # divides both axes, so the kernel pads the dv axis to 576 and lets the dO TMA
@@ -1570,16 +1567,11 @@ def _flash_attn_bwd(
         dq = paddle.empty_like(q)
     else:
         dq = paddle.zeros_like(q)
-    # Native RS writes the final local dK/dV directly into these tensors.
-    if enable_overlap:
-        dk = paddle.empty_like(k)
-        dv = paddle.empty_like(v)
-    elif fixed_seqlen and kv_postprocess_full:
-        dk = paddle.empty_like(k)
-        dv = paddle.empty_like(v)
-    else:
-        dk = paddle.zeros_like(k)
-        dv = paddle.zeros_like(v)
+    # Native RS also writes the final local dK/dV directly into these tensors.
+    kv_write_full = enable_overlap or (fixed_seqlen and kv_postprocess_full)
+    dk = paddle.empty_like(k) if kv_write_full else paddle.zeros_like(k)
+    # kv_shared: dk carries dK + dV and nothing writes dv, so it is the zero gradient.
+    dv = paddle.empty_like(v) if kv_write_full and not kv_shared else paddle.zeros_like(v)
 
     # ---- Compute shapes for fp32 accum workspaces ----
     if cu_seqlens_q is None:
@@ -1653,7 +1645,8 @@ def _flash_attn_bwd(
         zero_specs.append(("dq_accum", dq_accum_shape, _numel(dq_accum_shape)))
     if need_kv_accum and not zero_kv_accum_range:
         zero_specs.append(("dk_accum", dk_accum_shape, _numel(dk_accum_shape)))
-        zero_specs.append(("dv_accum", dv_accum_shape, _numel(dv_accum_shape)))
+        if not kv_shared:
+            zero_specs.append(("dv_accum", dv_accum_shape, _numel(dv_accum_shape)))
 
     _accum_buffers = {}
     if len(zero_specs) >= 2:
@@ -1698,7 +1691,9 @@ def _flash_attn_bwd(
             )
         else:
             dk_accum = _accum_buffers["dk_accum"]
-            dv_accum = _accum_buffers["dv_accum"]
+            # Nothing writes dv_accum under kv_shared, so it aliases dk_accum rather
+            # than costing a second fp32 buffer.
+            dv_accum = dk_accum if kv_shared else _accum_buffers["dv_accum"]
 
     dtype = paddle2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -2438,8 +2433,8 @@ def _flash_attn_bwd(
             if segment_idx + 1 < overlap_ag_args.num_segments:
                 if need_kv_accum:
                     dk_accum.zero_()
-                    # kv_shared folds dV into dK, so dv_accum is never written and
-                    # keeps the zeros it was allocated with.
+                    # kv_shared aliases dv_accum onto dk_accum, so zeroing it again
+                    # would only undo the line above.
                     if not kv_shared:
                         dv_accum.zero_()
                 overlap_runtime.start_backward_segment(
@@ -2487,6 +2482,10 @@ def _flash_attn_bwd(
             (dv_accum, dv, cutlass.Float32(1.0), head_dim_v_rounded, slice_dv,
              n_block_size, seqlen_k_rounded, "bigd_dv"),
         ):
+            # kv_shared merged dV into dK: dv is already the zero gradient and dv_accum
+            # aliases dk_accum, so this postprocess would write dK into dv.
+            if kv_shared and tag == "bigd_dv":
+                continue
             _bigd_postprocess(
                 accum, out, scale, hd, hd_slice, block, seq_rounded,
                 cu_seqlens_q_tensor if tag == "bigd_dq" else cu_seqlens_k_tensor,

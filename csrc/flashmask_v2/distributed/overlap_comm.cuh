@@ -79,7 +79,8 @@ public:
         int nranks,
         const uint8_t* unique_id_ptr = nullptr,
         int mask_head = 0,
-        bool overlap_rs = false
+        bool overlap_rs = false,
+        bool kv_shared = false
     );
 
     ~OverlapCommunicator();
@@ -91,15 +92,11 @@ public:
     */
     bool reconfigure_if_needed(
         int new_b, int new_s_local, int new_h, int new_d,
-        int rank, int nranks, int new_mask_head, bool new_overlap_rs,
+        int rank, int nranks, int new_mask_head, bool new_overlap_rs, bool kv_shared,
         const uint8_t* unique_id_ptr = nullptr
     );
 
     OverlapConfig current_config() const { return _config; }
-
-    // Shared K/V: K and V are the same tensor, so only K is transported and every V
-    // pointer handed to the comm kernels is null. Must be set before each AG/RS launch.
-    void set_kv_shared(bool shared) { _kv_shared = shared; }
 
     /**
      * run the overlap kernel asynchronously
@@ -153,7 +150,7 @@ public:
     // so that the output of post-proc kernel can be directly sent
     // DO NOT call the following methods, if overlap_rs = false
     void* dk_send(int seg_idx) const { return dkv_buffer->k_send(seg_idx); }
-    void* dv_send(int seg_idx) const { return dkv_buffer->v_send(seg_idx); }
+    void* dv_send(int seg_idx) const { return _kv_shared ? nullptr : dkv_buffer->v_send(seg_idx); }
 
     // computation stream wait the comm_stream kernel to be scheduled with SMs
     void wait_reset_stream_coordinator(cudaStream_t stream);
@@ -337,6 +334,10 @@ private:
     int _num_nodes;         // Number of nodes (= _total_n_pes / _gpus_per_node)
     OverlapFeatureFlags _flags;  // runtime feature switches (effective values after fallbacks)
     bool _kv_shared = false;     // K and V alias one tensor: transport K only
+    // Whether the buffers hold V/dV regions. Sticky: shared K/V allocates without them,
+    // and the first non-shared pass grows them back once.
+    bool _kv_alloc_v = true;
+    int kv_components() const { return _kv_alloc_v ? 2 : 1; }
     int _sema_inter_size;   // num_nodes for hierarchical, 0 otherwise (offset into semaphore array)
     int _sema_count;        // allocated int64 semaphore slots
 
@@ -350,7 +351,12 @@ private:
     // so the only bf16 rounding is the last segment's store into dk_ptr / dv_ptr.
     // Allocated lazily (grow-only) in prepare_dkv_buffer, and only when num_segments > 1.
     float* dkv_f32_accum;
-    size_t _dkv_f32_numel;                  // per-tensor numel of dkv_f32_accum (0 when unallocated)
+    size_t _dkv_f32_numel;                  // allocated float count of dkv_f32_accum (0 when unallocated)
+
+    // dV half of the scratch; null when K/V are shared, which drops the dV half entirely.
+    float* dkv_f32_dv() const {
+        return _kv_shared ? nullptr : dkv_f32_accum + _dkv_f32_numel / 2;
+    }
 
     int _num_copy_chunks;                   // block_work_ids array size tracking
     int _bitmap_region_size;                // bitmap region size (work_done + frontier)

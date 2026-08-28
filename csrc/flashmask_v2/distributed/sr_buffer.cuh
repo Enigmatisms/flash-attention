@@ -27,7 +27,8 @@ private:
     SRBuffer& operator=(SRBuffer&&) = delete;
 
 public:
-    explicit SRBuffer(gin::Context& context, size_t numel, int semaphore_size = 0)
+    explicit SRBuffer(gin::Context& context, size_t numel, int semaphore_size = 0,
+                      int kv_components = 2)
         : _context(context) {
         if (numel == 0) {
             throw std::invalid_argument("SRBuffer: numel must be positive");
@@ -36,11 +37,13 @@ public:
             throw std::invalid_argument("SRBuffer: numel should be a multiple of 32");
         }
 
-        const size_t total_bytes = 2 * numel * sizeof(KVType) +
+        const size_t total_bytes = kv_components * numel * sizeof(KVType) +
                                    semaphore_size * sizeof(SemaphoreType);
         _k_sr = static_cast<KVType*>(gin::alloc(_context, total_bytes));
-        _v_sr = _k_sr + numel;
-        _semaphores = reinterpret_cast<SemaphoreType*>(_v_sr + numel);
+        // Shared K/V has no V region; null so that a stray V access faults instead of
+        // silently landing in the semaphores.
+        _v_sr = kv_components == 2 ? _k_sr + numel : nullptr;
+        _semaphores = reinterpret_cast<SemaphoreType*>(_k_sr + kv_components * numel);
         _allocated = true;
         _numel = numel;
     }
@@ -71,7 +74,7 @@ public:
     SemaphoreType* semaphores() const noexcept { return _semaphores; }
 
     bool is_valid() const noexcept {
-        return _allocated && _k_sr != nullptr && _v_sr != nullptr && _semaphores != nullptr;
+        return _allocated && _k_sr != nullptr && _semaphores != nullptr;
     }
 
     size_t capacity() const noexcept { return _numel; }

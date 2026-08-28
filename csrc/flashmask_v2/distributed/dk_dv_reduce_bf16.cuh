@@ -40,7 +40,7 @@ __device__ __forceinline__ bf16x4 to_bf16x4(float4 in) {
  * non-overlap reduce. For a single segment (is_first && is_last) the scratch is
  * never touched and needs no allocation.
 */
-template <int S_chunk = 8192, int num_chunks = 4, bool is_first = true, bool is_last = true>
+template <int num_chunks = 4, bool is_first = true, bool is_last = true>
 __global__ __launch_bounds__(128, 8)
 void ReducedKdVKernel(
     const bf16* __restrict__ dk_recv,
@@ -93,12 +93,12 @@ void ReducedKdVKernel(
         const int64_t task_offset = int64_t(task_idx) * elem_per_block + 4 * threadIdx.x;
 
         reduce_op(dk_recv, dk_f32, dk_out, task_offset);
-        reduce_op(dv_recv, dv_f32, dv_out, task_offset);
+        if (dv_recv != nullptr) reduce_op(dv_recv, dv_f32, dv_out, task_offset);
     }
 }
 
 #define ReduceKernelLaunch(_num_chunk, _is_first, _is_last)                              \
-    ReducedKdVKernel<S_chunk_exp, _num_chunk, _is_first, _is_last><<<grid, 128, 0, stream>>>( \
+    ReducedKdVKernel<_num_chunk, _is_first, _is_last><<<grid, 128, 0, stream>>>(         \
         dk_recv, dv_recv, dk_f32, dv_f32, dk_out, dv_out, num_tasks_per_chunk)
 
 #define ChunkDipatchKernelLaunch(num_chunk, is_first, is_last)                           \
@@ -115,6 +115,8 @@ void ReducedKdVKernel(
 
 /**
  * This function calls the dK, dV reduce kernel.
+ * @param dv_recv nullptr skips the dV half entirely (kv_shared merges dV into dK,
+ *  leaving dv_f32 / dv_out untouched).
  * @param is_first The first segment overwrites the fp32 scratch instead of
  *  accumulating into it, so the scratch never needs to be zeroed.
  * @param is_last The last segment rounds the fp32 sum into the bf16 output
@@ -139,31 +141,13 @@ void launch_dk_dv_reduce(
     // the reduce speed shouldn't be a bottleneck, so it's OK to allocate more SMs
     dim3 grid(std::max(2048 / B, 128), B);
 
-#define ReduceDispatchBody(_S_chunk_val)                                            \
-    do {                                                                             \
-        static constexpr int S_chunk_exp = _S_chunk_val;                            \
-        if (is_first) {                                                              \
-            if (is_last) { ChunkDipatchKernelLaunch(num_chunks, true, true); }       \
-            else { ChunkDipatchKernelLaunch(num_chunks, true, false); }              \
-        } else {                                                                     \
-            if (is_last) { ChunkDipatchKernelLaunch(num_chunks, false, true); }      \
-            else { ChunkDipatchKernelLaunch(num_chunks, false, false); }             \
-        }                                                                            \
-    } while(0)
-
-    switch (S_chunk) {
-        case 4096:   { ReduceDispatchBody(4096);   break; }
-        case 8192:   { ReduceDispatchBody(8192);   break; }
-        case 16384:  { ReduceDispatchBody(16384);  break; }
-        case 32768:  { ReduceDispatchBody(32768);  break; }
-        case 65536:  { ReduceDispatchBody(65536);  break; }
-        case 131072: { ReduceDispatchBody(131072); break; }
-    default:
-        throw std::invalid_argument(
-            "[FlashMask Overlap] S_chunk must be one of {4096, 8192, 16384, 32768, 65536, 131072}, got: "
-            + std::to_string(S_chunk));
+    if (is_first) {
+        if (is_last) { ChunkDipatchKernelLaunch(num_chunks, true, true); }
+        else { ChunkDipatchKernelLaunch(num_chunks, true, false); }
+    } else {
+        if (is_last) { ChunkDipatchKernelLaunch(num_chunks, false, true); }
+        else { ChunkDipatchKernelLaunch(num_chunks, false, false); }
     }
-#undef ReduceDispatchBody
 }
 
 #undef ChunkDipatchKernelLaunch

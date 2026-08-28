@@ -61,6 +61,17 @@ struct OverlapFeatureFlags {
         return f;
     }
 
+    // The BHSD transpose puts D in a TMA box dimension, which caps at 256 elements.
+    // Clearing the flag here also makes this warn at most once.
+    void apply_head_dim_fallback(int d, int rank) {
+        if (!use_bhsd_layout || d <= 256) return;
+        if (rank == 0) {
+            printf("[FlashMask Overlap] FLASHMASK_USE_BHSD_LAYOUT=true is unsupported for "
+                   "head_dim=%d (>256 exceeds the TMA box limit), disabling it.\n", d);
+        }
+        use_bhsd_layout = false;
+    }
+
     // Log the effective (post-fallback) switch state. Prints on rank 0 only.
     void print(int rank) const {
         if (rank != 0) return;

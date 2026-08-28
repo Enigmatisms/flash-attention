@@ -103,7 +103,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
     int nranks,
     const uint8_t* unique_id_ptr,
     int mask_head,
-    bool overlap_rs
+    bool overlap_rs,
+    bool kv_shared
     // Maybe we should manage the following by ourselves? Do not pass as parameters
 ): gin_context_(nullptr),
    dkv_buffer(nullptr),
@@ -114,6 +115,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
    H_mask(mask_head),
    D(d_kv),
    num_chunks(get_num_chunk_per_segment(s_kv, nranks, h_kv)),
+   _kv_shared(kv_shared),
+   _kv_alloc_v(!kv_shared),
    _sema_count(0),
    dkv_f32_accum(nullptr),
    _dkv_f32_numel(0),
@@ -153,6 +156,9 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         _flags.use_hierarchical = false;
     }
 
+    // Fallback 2: the BHSD transpose cannot encode a TMA box wider than 256 elements.
+    _flags.apply_head_dim_fallback(d_kv, rank);
+
     // Log the effective (post-fallback) switch state.
     _flags.print(rank);
 
@@ -179,7 +185,7 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
 
     printf("Overlap Comm creating SR buffer...\n");
     kv_buffer = std::make_unique<SRBuffer<KVType>>(
-        *gin_context_, _total_numel, _sema_count);
+        *gin_context_, _total_numel, _sema_count, kv_components());
     if constexpr (USE_SEMAPHORES) {
         cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * _sema_count);
     }
@@ -224,7 +230,8 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
             _total_n_pes,
             num_chunks,
             rs_capacity,
-            cp_team
+            cp_team,
+            kv_components()
         );
         dkv_buffer->initialize_buffer(_my_pe);
 
@@ -865,8 +872,10 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         } else {                                                                                        \
             const int S_stride = H * D;                                                                 \
             const size_t batch_stride = static_cast<size_t>(num_chunks) * S_chunk * S_stride;           \
-            KVType* const dk_dst = dkv_buffer->k_recv(0), *const dv_dst = dkv_buffer->v_recv(0);        \
-            const KVType* const dk_src = dkv_buffer->k_send(0), *const dv_src = dkv_buffer->v_send(0);  \
+            KVType* const dk_dst = dkv_buffer->k_recv(0);                                               \
+            const KVType* const dk_src = dkv_buffer->k_send(0);                                         \
+            KVType* const dv_dst = _kv_shared ? nullptr : dkv_buffer->v_recv(0);                        \
+            const KVType* const dv_src = _kv_shared ? nullptr : dkv_buffer->v_send(0);                  \
             for (int bid = 0; bid < B; bid ++) {                                                        \
                 const size_t batch_offset = bid * batch_stride;                                         \
                 cudaMemcpyAsync(dk_dst + batch_offset, dk_src + batch_offset,                           \
@@ -892,8 +901,8 @@ void OverlapCommunicator<KVType>::run_overlap_rs_kernel(
         );                                                                                              \
         launch_dk_dv_reduce(                                                                            \
             dkv_buffer->k_recv(segment_idx),                                                            \
-            dkv_buffer->v_recv(segment_idx),                                                            \
-            dkv_f32_accum, dkv_f32_accum + _dkv_f32_numel,                                              \
+            _kv_shared ? nullptr : dkv_buffer->v_recv(segment_idx),                                     \
+            dkv_f32_accum, dkv_f32_dv(),                                                                \
             dk_accum, dv_accum,                                                                         \
             B, S_chunk, H, D, num_chunks,                                                               \
             segment_idx == 0, segment_idx == num_segments() - 1,                                        \
@@ -968,10 +977,11 @@ void OverlapCommunicator<KVType>::prepare_dkv_buffer(cudaStream_t stream) {
     if (!dkv_buffer) return;
 
     // fp32 reduce scratch (grow-only). Segment 0 overwrites it, so it needs no zeroing.
-    const size_t needed = _local_batch_stride * B;
+    // Shared K/V has no dV half to accumulate, so only the dK half is allocated.
+    const size_t needed = B * _local_batch_stride * (_kv_shared ? 1 : 2);
     if (num_segments() > 1 && needed > _dkv_f32_numel) {
         if (dkv_f32_accum) CUDA_DEBUG_CHECK(cudaFree(dkv_f32_accum));
-        CUDA_DEBUG_CHECK(cudaMalloc(&dkv_f32_accum, 2 * needed * sizeof(float)));
+        CUDA_DEBUG_CHECK(cudaMalloc(&dkv_f32_accum, needed * sizeof(float)));
         _dkv_f32_numel = needed;
     }
 
@@ -1037,7 +1047,7 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, int cp_team) {
         size_t alloc_numel = alloc_with_headroom(new_single_k_numel);
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
             *gin_context_,
-            alloc_numel, _total_n_pes, num_chunks, _flags.per_stage_buffer ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
+            alloc_numel, _total_n_pes, num_chunks, _flags.per_stage_buffer ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team, kv_components()
         );
         dkv_buffer->initialize_buffer(_my_pe);
         _dkv_single_k_numel_capacity = alloc_numel;
@@ -1071,7 +1081,7 @@ void OverlapCommunicator<KVType>::setup_dkv_buffer(bool need_rs, int cp_team) {
             dkv_buffer->release_for_realloc();
             dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
                 *gin_context_,
-                alloc_numel, _total_n_pes, num_chunks, _flags.per_stage_buffer ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team
+                alloc_numel, _total_n_pes, num_chunks, _flags.per_stage_buffer ? _total_n_pes / num_chunks : RS_BUFFER_CAPACITY, cp_team, kv_components()
             );
             dkv_buffer->initialize_buffer(_my_pe);
             _dkv_single_k_numel_capacity = alloc_numel;
@@ -1163,12 +1173,24 @@ void OverlapCommunicator<KVType>::prime_rs_semaphores() {
 template <typename KVType>
 bool OverlapCommunicator<KVType>::reconfigure_if_needed(
     int new_b, int new_s_local, int new_h, int new_d,
-    int rank, int nranks, int new_mask_head, 
-    bool new_overlap_rs, const uint8_t* unique_id_ptr
+    int rank, int nranks, int new_mask_head,
+    bool new_overlap_rs, bool kv_shared, const uint8_t* unique_id_ptr
 ) {
+    _flags.apply_head_dim_fallback(new_d, rank);
     OverlapConfig new_config = {new_b, new_s_local, new_h, new_mask_head, new_d, nranks, new_overlap_rs, _flags.use_bhsd_layout};
 
-    if (new_config == _config) return false;  // No change needed
+    // Shared K/V allocates no V/dV region, so the first non-shared pass has to grow the
+    // buffers back. Sticky, hence at most one such reallocation per communicator.
+    const bool grow_v = !kv_shared && !_kv_alloc_v;
+    _kv_shared = kv_shared;
+
+    if (new_config == _config && !grow_v) return false;  // No change needed
+
+    if (grow_v) {
+        _kv_alloc_v = true;
+        _sr_buffer_capacity = 0;              // force the SRBuffer realloc below
+        _dkv_single_k_numel_capacity = 0;     // force the SepSRBuffer recreate below
+    }
 
     if (nranks != _total_n_pes) {
         throw std::logic_error(
@@ -1221,7 +1243,7 @@ bool OverlapCommunicator<KVType>::reconfigure_if_needed(
 
         kv_buffer->release_for_realloc();
         kv_buffer = std::make_unique<SRBuffer<KVType>>(
-            *gin_context_, new_capacity, new_sema_count);
+            *gin_context_, new_capacity, new_sema_count, kv_components());
         if constexpr (USE_SEMAPHORES) {
             cudaMemset(kv_buffer->semaphores(), 0, sizeof(int64_t) * new_sema_count);
         }
@@ -1298,7 +1320,7 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
         // First-time creation
         overlap_comm = std::make_unique<OverlapCommunicator<cutlass::bfloat16_t>>(
             k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks,
-            unique_id_ptr, mask_head, new_overlap_rs
+            unique_id_ptr, mask_head, new_overlap_rs, kv_shared
         );
     } else {
         if (overlap_comm->nranks() != nranks) {
@@ -1311,18 +1333,16 @@ OverlapCommunicator<cutlass::bfloat16_t>& init_singleton_instance(
             overlap_comm.reset();
             overlap_comm = std::make_unique<OverlapCommunicator<cutlass::bfloat16_t>>(
                 k_data, v_data, b_kv, s_kv, h_kv, d_kv, rank, nranks,
-                unique_id_ptr, mask_head, new_overlap_rs
+                unique_id_ptr, mask_head, new_overlap_rs, kv_shared
             );
         } else {
             // Shape changes reuse the existing communicator and rebuild only regions.
             overlap_comm->reconfigure_if_needed(
-                b_kv, s_kv, h_kv, d_kv, rank, nranks, mask_head, new_overlap_rs, unique_id_ptr
+                b_kv, s_kv, h_kv, d_kv, rank, nranks, mask_head, new_overlap_rs,
+                kv_shared, unique_id_ptr
             );
         }
     }
-    // Not part of OverlapConfig: it changes no buffer size, and a difference must not
-    // trigger reconfigure_if_needed's device sync + barrier. Every pass sets its own value.
-    overlap_comm->set_kv_shared(kv_shared);
     return *overlap_comm;
 }
 

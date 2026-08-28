@@ -46,7 +46,8 @@ public:
         int semaphore_size,
         int chunks_per_seg,
         int buffer_capacity = 1,
-        int team = 0
+        int team = 0,
+        int kv_components = 2
     );
 
     void team_bar() const {
@@ -63,6 +64,7 @@ public:
     ~SepSRBuffer() noexcept;
 
     // [K_send, V_send] --> buf_offset size, therefore 2 * buf_offset is the double buffer offset
+    // (shared K/V drops the V halves, so buf_offset is then just the dK slab)
     inline KVType* k_send(int seg_idx) const { return _dk_data + CLAMP_IDX(seg_idx) * 2 * _buf_offset; }
     inline KVType* v_send(int seg_idx) const { return _dv_data + CLAMP_IDX(seg_idx) * 2 * _buf_offset; }
     inline KVType* k_recv(int seg_idx) const { return _dk_data + (CLAMP_IDX(seg_idx) * 2 + 1) * _buf_offset; }
@@ -84,7 +86,7 @@ public:
     void zero_recv_buf(int seg_idx, cudaStream_t comm_stream);
 
     inline bool is_valid() const noexcept {
-        return _allocated && _dk_data && _dv_data && _semaphores && _team != -1;
+        return _allocated && _dk_data && _semaphores && _team != -1;
     }
 
     size_t capacity() const noexcept {
