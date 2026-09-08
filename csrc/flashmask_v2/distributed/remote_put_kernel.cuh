@@ -69,15 +69,17 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     __shared__ int cached_empty[num_chunk];
     __shared__ int next_work_id;
 
-    if (threadIdx.x < total_works) {
-        const int batch_id = threadIdx.x / work_per_seg;
-        const int seqlen_id = threadIdx.x % work_per_seg;
-        constexpr int start_offset = chunk_offset * work_per_chunk;
+    // Block-stride loop: total_works grows with num_batch * S_chunk * num_chunk and can exceed
+    // blockDim.x, same as the get kernel's staging loop.
+    constexpr int start_offset = chunk_offset * work_per_chunk;
+    for (int i = threadIdx.x; i < total_works; i += blockDim.x) {
+        const int batch_id = i / work_per_seg;
+        const int seqlen_id = i % work_per_seg;
         auto* src_ptr = copy_chunk_mask + (segment_idx + batch_id * num_segments) * num_chunk * work_per_chunk + seqlen_id;
-        smem_chunk_mask[start_offset + threadIdx.x] = *(src_ptr + start_offset);
-        if (threadIdx.x < num_chunk) {
-            cached_empty[threadIdx.x] = 0;
-        }
+        smem_chunk_mask[start_offset + i] = *(src_ptr + start_offset);
+    }
+    if (threadIdx.x < num_chunk) {
+        cached_empty[threadIdx.x] = 0;
     }
     __syncthreads();
 

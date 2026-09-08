@@ -45,6 +45,7 @@ import sys
 import subprocess
 import shutil
 import glob
+import importlib.util
 
 from setuptools import setup as setuptools_setup, find_packages
 
@@ -510,6 +511,38 @@ def _detect_cutlass_inc():
     return None
 
 
+def _detect_nccl_home():
+    """NCCL install dir: NCCL_HOME/NCCL_ROOT, else this interpreter's wheel.
+
+    Preferring the interpreter's own wheel is what keeps build and runtime from
+    drifting: overlap_runtime.py pins the same file.
+    """
+    env = os.environ.get('NCCL_HOME') or os.environ.get('NCCL_ROOT')
+    if env:
+        return env
+    spec = importlib.util.find_spec('nvidia.nccl')
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return next(iter(spec.submodule_search_locations))
+
+
+def _detect_cuda_arch():
+    """sm arch for -gencode: FM4_OVERLAP_CUDA_ARCH, else the local GPU (10.3 -> 103a)."""
+    env = os.environ.get('FM4_OVERLAP_CUDA_ARCH')
+    if env:
+        return env
+    try:
+        out = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=compute_cap', '--format=csv,noheader'],
+            text=True, stderr=subprocess.DEVNULL)
+        major, minor = out.strip().splitlines()[0].strip().split('.')
+        arch = f'{int(major)}{int(minor)}'
+        # The accelerated 'a' suffix only exists from sm_90 on.
+        return arch + 'a' if int(major) >= 9 else arch
+    except Exception:
+        return '90a'
+
+
 def _build_cmake_submodule(name, csrc_dir, pkg_dir, lib_prefix, cmake_defs):
     """Build a submodule via a standalone sub-CMake (configure + build).
 
@@ -677,19 +710,20 @@ if BUILD_UTILS:
 #       _submodule_package_data[_pkg] = ['*.so']
 
 # --- overlap bridge: NCCL GIN + sm_90a/sm_100, built via standalone sub-CMake ---
-# Opt-in only (BUILD_OVL). NCCL_HOME (or NCCL_ROOT) selects the exact NCCL
-# headers/library used for both compilation and runtime. Missing NCCL or cutlass
-# warns and skips the optional bridge without affecting FA4.
+# Opt-in only (BUILD_OVL). NCCL install and target arch are auto-detected;
+# NCCL_HOME/NCCL_ROOT and FM4_OVERLAP_CUDA_ARCH override. Missing NCCL or
+# cutlass warns and skips the optional bridge without affecting FA4.
 if BUILD_OVL:
     _ovl_csrc = os.path.join(FLASH_MASK_DIR, 'overlap', 'csrc')
     _ovl_pkg_dir = os.path.join(FLASH_MASK_DIR, 'overlap')
-    _nccl_home = os.environ.get('NCCL_HOME', os.environ.get('NCCL_ROOT', ''))
-    _ovl_arch = os.environ.get('FM4_OVERLAP_CUDA_ARCH', '90a')
+    _nccl_home = _detect_nccl_home()
+    _ovl_arch = _detect_cuda_arch()
     _cutlass_inc = _detect_cutlass_inc()
 
     if not _nccl_home or not os.path.isdir(_nccl_home):
-        print(f"[flashmask] overlap: NCCL_HOME not found ({_nccl_home}); "
-              "skipping overlap bridge. Set NCCL_HOME to a valid install.")
+        print(f"[flashmask] overlap: no NCCL install found ({_nccl_home}); "
+              "skipping overlap bridge. Install nvidia-nccl-cu13 into this "
+              "interpreter, or set NCCL_HOME.")
     elif _cutlass_inc is None:
         print("[flashmask] overlap: cutlass/bfloat16.h not found "
               "(set FM4_OVERLAP_CUTLASS_INC or init the FA4 submodule); "

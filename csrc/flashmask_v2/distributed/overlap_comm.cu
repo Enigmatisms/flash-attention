@@ -132,13 +132,10 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         throw std::invalid_argument(
             "unique_id_ptr is null: NCCL initialization requires a valid unique ID.");
     }
-    fprintf(stderr, "[FM-OVL rank %d] OverlapComm ctor BEGIN (member-init done, pre create_context)\n", rank);
-    fflush(stderr);
 
     _flags = OverlapFeatureFlags::from_env();
     gin_context_ = gin::create_context(
         unique_id_ptr, rank, nranks, _flags.use_hierarchical);
-    printf("Overlap Comm GIN context created.\n");
     _my_pe = gin::rank(*gin_context_);
     _total_n_pes = gin::nranks(*gin_context_);
     WARN_PRINT("[FlashMask Overlap] NCCL GIN initialized. Rank: %d / %d\n", rank, nranks);
@@ -183,7 +180,6 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         : 0;
     _sema_inter_size = _flags.use_hierarchical ? _num_nodes : 0;
 
-    printf("Overlap Comm creating SR buffer...\n");
     kv_buffer = std::make_unique<SRBuffer<KVType>>(
         *gin_context_, _total_numel, _sema_count, kv_components());
     if constexpr (USE_SEMAPHORES) {
@@ -214,7 +210,6 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaMemsetAsync(stream_coordinator, 0, sizeof(int), comm_stream);
     }
     if (overlap_rs) {
-        printf("Overlap Comm RS preparations started...\n");
         // auxilary stream for RS-overlap (for used in reduce)
         cudaStreamCreateWithPriority(&aux_p_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
         cudaStreamCreateWithPriority(&aux_c_stream, cudaStreamNonBlocking, std::min(greatest_priority + 1, least_priority));
@@ -223,7 +218,6 @@ OverlapCommunicator<KVType>::OverlapCommunicator(
         cudaEventCreateWithFlags(&local_moved, cudaEventDisableTiming);
         const int num_stages = _total_n_pes / num_chunks;
         const int rs_capacity = _flags.per_stage_buffer ? num_stages : RS_BUFFER_CAPACITY;
-        printf("Overlap Comm dKV SR buffer creating...\n");
         dkv_buffer = std::make_unique<SepSRBuffer<KVType>>(
             *gin_context_,
             _local_batch_stride * b_kv,      // single chunk K numel (B * S_local * H * D)
@@ -424,11 +418,6 @@ void OverlapCommunicator<KVType>::update_kv_buffer(
                 reinterpret_cast<const __nv_bfloat16*>(new_v_data),
                 reinterpret_cast<__nv_bfloat16*>(kv_buffer->v_data()),
                 B, S_local, H, D, S_dst, s_offset, comm_stream);
-        }
-        cudaError_t transpose_err = cudaGetLastError();
-        if (transpose_err != cudaSuccess) {
-            fprintf(stderr, "[BHSD DEBUG] CUDA error AFTER transpose_copy_to_sr: %s\n",
-                    cudaGetErrorString(transpose_err));
         }
     } else {
         // BSHD path: per-batch flat memcpy into SR buffer

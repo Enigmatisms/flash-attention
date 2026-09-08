@@ -3,6 +3,7 @@ Importing never loads the .so; ``_load()`` raises only on first use if missing.
 """
 
 import ctypes
+import importlib.util
 import os
 from typing import NamedTuple
 
@@ -15,6 +16,34 @@ def _find_so(here):
         if f.startswith("libfm4_overlap") and f.endswith(".so"):
             return os.path.join(here, f)
     return None
+
+
+def _nccl_lib_path():
+    """libnccl.so.2 of the running interpreter's wheel. None if not wheel-installed."""
+    override = os.environ.get("FLASHMASK_NCCL_LIB")
+    if override:
+        return override
+    spec = importlib.util.find_spec("nvidia.nccl")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    root = next(iter(spec.submodule_search_locations))
+    for libdir in ("lib", "lib64"):
+        candidate = os.path.join(root, libdir, "libnccl.so.2")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _pin_nccl():
+    """Pin the soname so the bridge reuses this libnccl instead of searching.
+
+    The bridge inlines the GIN device API and must bind the exact libnccl it was
+    built against; its DT_RUNPATH ranks below LD_LIBRARY_PATH, which often lists
+    a stray system libnccl. RTLD_LOCAL suffices: reuse is keyed on the soname.
+    """
+    path = _nccl_lib_path()
+    if path:
+        ctypes.CDLL(path, mode=ctypes.RTLD_LOCAL)
 
 
 def _load():
@@ -32,6 +61,7 @@ def _load():
             "NCCL with GIN support is available."
         )
 
+    _pin_nccl()
     lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_LOCAL)
 
     lib.fm4_overlap_unique_id_size.argtypes = []
@@ -254,9 +284,11 @@ def sync_comm_stream():
 def _sparse_chunk_mask_cols(startend_row_indices):
     """Slice (lt_start, ut_end) columns into contiguous (B, H_mask, S_total) int32."""
     num_vecs = startend_row_indices.shape[-1]
-    assert num_vecs in (2, 4), f"overlap mask must be 2/4-vec (non-causal), got {num_vecs}"
+    # 4-vec is rejected: lt_end / ut_start are not plumbed through the bridge, so the skip
+    # bitmap would over-report fully-masked chunks and silently drop their contribution.
+    assert num_vecs == 2, f"overlap mask must be 2-vec (non-causal), got {num_vecs}"
     lt_start = startend_row_indices[..., 0].contiguous()
-    ut_end = startend_row_indices[..., num_vecs - 1].contiguous()
+    ut_end = startend_row_indices[..., 1].contiguous()
     return lt_start, ut_end
 
 

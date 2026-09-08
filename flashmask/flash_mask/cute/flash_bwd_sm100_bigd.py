@@ -1940,6 +1940,14 @@ class FlashAttentionBackwardSm100BigD:
             fm_heads = cute.size(mFM.shape[1])
             fm_b = batch_idx if cute.size(mFM.shape[0]) > 1 else Int32(0)
             fm_h = head_idx // (cute.size(mQ.shape[2]) // fm_heads)
+            # mFM keeps its full seqlen_k rows while overlap makes seqlen_k a segment
+            # length, so every absolute key row read is offset by the segment. The
+            # bounds themselves are QUERY rows and are never segmented.
+            fm_row_offset = (
+                overlap_segment_idx * seqlen_k
+                if cutlass.const_expr(overlap_segment_idx is not None)
+                else Int32(0)
+            )
         if cutlass.const_expr(self.fm_bound_num in (1, 2) and not self.deterministic):
             # `deterministic` excludes itself from this narrowing on purpose. The dQ
             # semaphore uses `lock_value = n_block`, which is only a valid arrival count
@@ -1958,14 +1966,6 @@ class FlashAttentionBackwardSm100BigD:
             # deterministic; it means turning this drain's segment walk into a
             # walk-all-plus-predicate loop, so it is left as a follow-up.
             #
-            # mFM keeps its full seqlen_k rows while overlap makes seqlen_k a segment
-            # length, so every absolute key row read below is offset by the segment.
-            # The bounds themselves are QUERY rows and are never segmented.
-            fm_row_offset = (
-                overlap_segment_idx * seqlen_k
-                if cutlass.const_expr(overlap_segment_idx is not None)
-                else Int32(0)
-            )
             # fm_bound_num == 4 (non-causal, both tails bounded) deliberately gets NO
             # skip: it would need four reduced scalars (max/min of both tails' starts and
             # ends) and the resulting iteration space is two bands rather than one, which
