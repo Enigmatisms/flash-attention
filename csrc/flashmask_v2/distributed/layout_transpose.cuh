@@ -1,6 +1,6 @@
 #pragma once
 /**
- * High-performance BSHD → BHSD transpose-copy kernel for bf16 with D=128.
+ * High-performance BSHD → BHSD transpose-copy kernel for bf16.
  *
  * Two variants:
  *   1. transpose_bshd_to_bhsd: equal-size, src (B,S,H,D) → dst (B,H,S,D)
@@ -10,7 +10,9 @@
  * within the larger S_total destination. FWD uses s_offset = S_total - S_local,
  * BWD uses s_offset = 0.
  *
- * Supports SM80 (vectorized uint4) and SM90 (TMA). Build with -DENABLE_TMA for SM90.
+ * D is a runtime argument. It only feeds the TMA descriptors, the dynamic smem
+ * size and the expect_tx byte count, so no code path specializes on it. TMA needs
+ * D*2 bytes to be a multiple of 16 and D <= 256, which every head dim satisfies.
  */
 
 #include <cuda_bf16.h>
@@ -21,8 +23,6 @@
 
 namespace flashmask {
 namespace layout {
-
-static constexpr int D = 128;
 
 // Runtime-resolve cuTensorMapEncodeTiled via cudaGetDriverEntryPoint (same as cutlass).
 // This avoids linking against libcuda.so which is a driver-provided library.
@@ -63,12 +63,11 @@ transpose_copy_kernel_tma(
     const int S_local,
     const int H,
     const int S_dst,
+    const int tile_bytes,                              // TILE_S * D * sizeof(bf16)
     const int s_offset
 ) {
-    constexpr int TILE_BYTES = TILE_S * D * sizeof(__nv_bfloat16);
-
     extern __shared__ char smem_raw[];
-    uint64_t* mbar_ptr = reinterpret_cast<uint64_t*>(smem_raw + TILE_BYTES);
+    uint64_t* mbar_ptr = reinterpret_cast<uint64_t*>(smem_raw + tile_bytes);
 
     const int bh = blockIdx.y;
     const int s_tile_idx = blockIdx.x;
@@ -90,7 +89,7 @@ transpose_copy_kernel_tma(
     // Coords: {d=0, h, s_start, b}
     if (threadIdx.x == 0) {
         asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
-            :: "r"(mbar_addr), "r"(TILE_BYTES));
+            :: "r"(mbar_addr), "r"(tile_bytes));
         asm volatile(
             "cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
             " [%0], [%1, {%2, %3, %4, %5}], [%6];"
@@ -125,16 +124,16 @@ transpose_copy_kernel_tma(
 }
 
 inline void create_src_tma_descriptor(
-    CUtensorMap* tma_map, const __nv_bfloat16* src, int B, int S_local, int H
+    CUtensorMap* tma_map, const __nv_bfloat16* src, int B, int S_local, int H, int D
 ) {
-    // Source (B, S_local, H, D=128), TMA dims (innermost→outermost): D, H, S, B
+    // Source (B, S_local, H, D), TMA dims (innermost→outermost): D, H, S, B
     uint64_t globalDim[4] = {
         (uint64_t)D, (uint64_t)H, (uint64_t)S_local, (uint64_t)B
     };
     uint64_t globalStrides[3] = {
         (uint64_t)(D * sizeof(__nv_bfloat16)),
-        (uint64_t)(H * D * sizeof(__nv_bfloat16)),
-        (uint64_t)(S_local * H * D * sizeof(__nv_bfloat16))
+        (uint64_t)((size_t)H * D * sizeof(__nv_bfloat16)),
+        (uint64_t)((size_t)S_local * H * D * sizeof(__nv_bfloat16))
     };
     constexpr int TILE_S = 64;
     uint32_t boxDim[4] = {(uint32_t)D, 1, (uint32_t)TILE_S, 1};
@@ -152,16 +151,16 @@ inline void create_src_tma_descriptor(
 }
 
 inline void create_dst_tma_descriptor(
-    CUtensorMap* tma_map, __nv_bfloat16* dst, int B, int H, int S_dst
+    CUtensorMap* tma_map, __nv_bfloat16* dst, int B, int H, int S_dst, int D
 ) {
-    // Destination (B, H, S_dst, D=128), TMA dims (innermost→outermost): D, S_dst, H, B
+    // Destination (B, H, S_dst, D), TMA dims (innermost→outermost): D, S_dst, H, B
     uint64_t globalDim[4] = {
         (uint64_t)D, (uint64_t)S_dst, (uint64_t)H, (uint64_t)B
     };
     uint64_t globalStrides[3] = {
-        (uint64_t)(D * sizeof(__nv_bfloat16)),              // stride for S (row-to-row within (b,h) slice)
-        (uint64_t)(S_dst * D * sizeof(__nv_bfloat16)),      // stride for H
-        (uint64_t)(H * S_dst * D * sizeof(__nv_bfloat16))   // stride for B
+        (uint64_t)(D * sizeof(__nv_bfloat16)),                      // stride for S (row-to-row within (b,h) slice)
+        (uint64_t)((size_t)S_dst * D * sizeof(__nv_bfloat16)),      // stride for H
+        (uint64_t)((size_t)H * S_dst * D * sizeof(__nv_bfloat16))   // stride for B
     };
     constexpr int TILE_S = 64;
     uint32_t boxDim[4] = {(uint32_t)D, (uint32_t)TILE_S, 1, 1};
@@ -180,26 +179,26 @@ inline void create_dst_tma_descriptor(
 
 inline void launch_copy_tma(
     const __nv_bfloat16* src, __nv_bfloat16* dst,
-    int B, int S_local, int H, int S_dst, int s_offset,
+    int B, int S_local, int H, int D, int S_dst, int s_offset,
     cudaStream_t stream = 0
 ) {
     constexpr int TILE_S = 64;
-    constexpr int TILE_BYTES = TILE_S * D * sizeof(__nv_bfloat16);
-    constexpr int SMEM_SIZE = TILE_BYTES + sizeof(uint64_t);
+    const int tile_bytes = TILE_S * D * sizeof(__nv_bfloat16);
+    const int smem_size = tile_bytes + sizeof(uint64_t);
 
     CUtensorMap src_tma_map, dst_tma_map;
-    create_src_tma_descriptor(&src_tma_map, src, B, S_local, H);
-    create_dst_tma_descriptor(&dst_tma_map, dst, B, H, S_dst);
+    create_src_tma_descriptor(&src_tma_map, src, B, S_local, H, D);
+    create_dst_tma_descriptor(&dst_tma_map, dst, B, H, S_dst, D);
 
     dim3 grid(S_local / TILE_S, B * H);
     dim3 block(128);
 
     cudaFuncSetAttribute(
         transpose_copy_kernel_tma<TILE_S>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
-    transpose_copy_kernel_tma<TILE_S><<<grid, block, SMEM_SIZE, stream>>>(
-        src_tma_map, dst_tma_map, S_local, H, S_dst, s_offset);
+    transpose_copy_kernel_tma<TILE_S><<<grid, block, smem_size, stream>>>(
+        src_tma_map, dst_tma_map, S_local, H, S_dst, tile_bytes, s_offset);
 }
 
 // ============================================================================
@@ -207,23 +206,23 @@ inline void launch_copy_tma(
 // ============================================================================
 
 /// Transpose-copy local KV (BSHD) into SR buffer (BHSD) at given S offset.
-///   src: (B, S_local, H, D=128), contiguous BSHD
-///   dst: (B, H, S_dst, D=128), BHSD (SR buffer)
+///   src: (B, S_local, H, D), contiguous BSHD
+///   dst: (B, H, S_dst, D), BHSD (SR buffer)
 ///   s_offset: FWD = S_dst - S_local, BWD = 0
 inline void transpose_copy_to_sr(
     const __nv_bfloat16* src, __nv_bfloat16* dst,
-    int B, int S_local, int H, int S_dst, int s_offset,
+    int B, int S_local, int H, int D, int S_dst, int s_offset,
     cudaStream_t stream = 0
 ) {
-    launch_copy_tma(src, dst, B, S_local, H, S_dst, s_offset, stream);
+    launch_copy_tma(src, dst, B, S_local, H, D, S_dst, s_offset, stream);
 }
 
 /// Equal-size transpose (convenience wrapper): src (B,S,H,D) → dst (B,H,S,D)
 inline void transpose_bshd_to_bhsd(
     const __nv_bfloat16* src, __nv_bfloat16* dst,
-    int B, int S, int H, cudaStream_t stream = 0
+    int B, int S, int H, int D, cudaStream_t stream = 0
 ) {
-    transpose_copy_to_sr(src, dst, B, S, H, S, 0, stream);
+    transpose_copy_to_sr(src, dst, B, S, H, D, S, 0, stream);
 }
 
 }  // namespace layout

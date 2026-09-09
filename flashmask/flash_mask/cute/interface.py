@@ -514,8 +514,19 @@ def _flash_attn_fwd(
         # :453); FM-3 overlap forbids causal for the same reason (overlap_flashmask.py
         # :335). Guarding here keeps the col mapping in _sparse_chunk_mask_cols exact.
         assert not causal, "overlap mode does not support causal yet"
+        # One storage for K and V makes the gathered V region a bit-for-bit copy of the
+        # gathered K region, so the comm layer transports K only and hands out the K region
+        # for V. _same_storage stays last: it raises rather than guess.
+        overlap_kv_shared = (
+            is_bigd_fwd
+            and k.dtype == v.dtype
+            and list(k.shape) == list(v.shape)
+            and tuple(k.strides) == tuple(v.strides)
+            and _same_storage(k, v)
+        )
         overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=startend_row_indices.shape[1]
+            k, v, group, mask_head=startend_row_indices.shape[1],
+            kv_shared=overlap_kv_shared,
         )
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle()
@@ -573,6 +584,9 @@ def _flash_attn_fwd(
         # from overlap_view_args) carries the gathered shape into the kernel.
         assert num_head_kv == overlap_view_args.shape[2]
         assert head_dim == overlap_view_args.shape[3]
+        # The V view is built from K's overlap_d, so an unequal head_dim_v would read
+        # the wrong bytes rather than fail.
+        assert head_dim_v == head_dim, "overlap requires head_dim_v == head_dim"
     elif cu_seqlens_k is None:
         if page_table is None:
             assert k.shape == [batch_size, seqlen_k, num_head_kv, head_dim], (
@@ -1268,11 +1282,8 @@ def _flash_attn_bwd(
     # accumulate them into a single TMEM slot and flush them once. Detected instead of
     # asked for: the signature stays (q, k, v).
     #
-    # dv then comes back all-zero and dk carries dK + dV. That falls out of the existing
-    # plumbing: the kernel simply never writes dv_accum, and every dv_accum row the
-    # postprocess reads was zeroed before the launch (whole-buffer zeros, or just the
-    # kv_postprocess range when that path is taken), so its postprocess writes zeros
-    # while dk_accum receives both terms.
+    # dv then comes back all-zero and dk carries dK + dV: the kernel never writes
+    # dv_accum, so dv is allocated zeroed and its postprocess is skipped.
     #
     # Only the shapes the merge is implemented for. 576/512 has no chunk width that
     # divides both axes, so the kernel pads the dv axis to 576 and lets the dO TMA
@@ -1293,9 +1304,6 @@ def _flash_attn_bwd(
 
     bigd_cfg = None
     if is_bigd_bwd:
-        assert group is None or group.world_size <= 1, (
-            "overlap is not supported by big-headdim bwd"
-        )
         # The kernel solves its own tile config; the accumulator shapes and the
         # postprocess grid below are built from m_block_size / n_block_size, so they
         # have to agree with it.
@@ -1366,10 +1374,14 @@ def _flash_attn_bwd(
             "overlap bwd owns the KV segment postprocess range"
         )
         assert k.dtype == paddle.bfloat16, "overlap SRBuffer is bf16"
+        assert head_dim_v == head_dim, (
+            "the SRBuffer is a single K/V pair of equal-width slabs, so the V view is "
+            "built from K's head_dim"
+        )
         assert not causal, "overlap bwd does not support causal yet"
         startend_row_indices = flashmask_info.startend_row_indices
         overlap_runtime.ensure_initialized(
-            k, v, group, mask_head=startend_row_indices.shape[1]
+            k, v, group, mask_head=startend_row_indices.shape[1], kv_shared=kv_shared
         )
         overlap_bhsd_layout = overlap_runtime.use_bhsd_layout()
         overlap_stream = overlap_runtime.current_stream_handle()
@@ -1555,16 +1567,11 @@ def _flash_attn_bwd(
         dq = paddle.empty_like(q)
     else:
         dq = paddle.zeros_like(q)
-    # Native RS writes the final local dK/dV directly into these tensors.
-    if enable_overlap:
-        dk = paddle.empty_like(k)
-        dv = paddle.empty_like(v)
-    elif fixed_seqlen and kv_postprocess_full:
-        dk = paddle.empty_like(k)
-        dv = paddle.empty_like(v)
-    else:
-        dk = paddle.zeros_like(k)
-        dv = paddle.zeros_like(v)
+    # Native RS also writes the final local dK/dV directly into these tensors.
+    kv_write_full = enable_overlap or (fixed_seqlen and kv_postprocess_full)
+    dk = paddle.empty_like(k) if kv_write_full else paddle.zeros_like(k)
+    # kv_shared: dk carries dK + dV and nothing writes dv, so it is the zero gradient.
+    dv = paddle.empty_like(v) if kv_write_full and not kv_shared else paddle.zeros_like(v)
 
     # ---- Compute shapes for fp32 accum workspaces ----
     if cu_seqlens_q is None:
@@ -1638,7 +1645,8 @@ def _flash_attn_bwd(
         zero_specs.append(("dq_accum", dq_accum_shape, _numel(dq_accum_shape)))
     if need_kv_accum and not zero_kv_accum_range:
         zero_specs.append(("dk_accum", dk_accum_shape, _numel(dk_accum_shape)))
-        zero_specs.append(("dv_accum", dv_accum_shape, _numel(dv_accum_shape)))
+        if not kv_shared:
+            zero_specs.append(("dv_accum", dv_accum_shape, _numel(dv_accum_shape)))
 
     _accum_buffers = {}
     if len(zero_specs) >= 2:
@@ -1683,7 +1691,9 @@ def _flash_attn_bwd(
             )
         else:
             dk_accum = _accum_buffers["dk_accum"]
-            dv_accum = _accum_buffers["dv_accum"]
+            # Nothing writes dv_accum under kv_shared, so it aliases dk_accum rather
+            # than costing a second fp32 buffer.
+            dv_accum = dk_accum if kv_shared else _accum_buffers["dv_accum"]
 
     dtype = paddle2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -2247,8 +2257,72 @@ def _flash_attn_bwd(
         def _raw_addr(addr, element_offset=0):
             return cutlass.Int64(int(addr) + 2 * element_offset)
 
+    if is_bigd_bwd:
+        # The big-headdim accumulators are blocked as
+        #   [head_dim slice][row block][4-col group][row][4 cols]
+        # so each slice is byte-identical to a head_dim=slice accumulator. The shared
+        # postprocess cannot swallow head_dim 576 in one go (it stages a whole
+        # tile x head_dim fp32 tile in SMEM and registers), so it runs once per slice,
+        # writing a last-dim slice of the output -- the same trick the split-d path
+        # uses, and legal because the postprocess writes dQ/dK/dV with plain gmem
+        # copies rather than TMA.
+        assert head_dim == head_dim_rounded and head_dim_v == head_dim_v_rounded, (
+            "the big-headdim postprocess writes whole head_dim slices, so head_dim "
+            f"must already be a multiple of 64 (got {head_dim} / {head_dim_v})"
+        )
+        slice_d = bigd_cfg["accum_slice_d"]
+        slice_dv = bigd_cfg["accum_slice_dv"]
+        # With kv_shared the kernel folded softmax_scale into dS, so dK and dQ arrive
+        # already scaled (dV never carried the scale -- that asymmetry is exactly why it
+        # had to move into dS for a merged dKV accumulator).
+        bigd_scale = cutlass.Float32(1.0) if kv_shared else softmax_scale
+
+        def _bigd_postprocess(
+            accum, out, scale, hd, hd_slice, block, seq_rounded,
+            cu_seqlens_t, seqused_t, tag, raw_addr=None, raw_storage_d=None,
+        ):
+            # raw_addr routes the slice into the overlap send buffer instead of `out`,
+            # which then only carries the layout for the trace.
+            accum_slice_elems = seq_rounded * hd_slice
+            for j in range(hd // hd_slice):
+                accum_slice = _to_cute(
+                    accum[..., j * accum_slice_elems : (j + 1) * accum_slice_elems]
+                )
+                if raw_addr is None:
+                    _postprocess_run(
+                        accum_slice,
+                        _to_cute(out[..., j * hd_slice : (j + 1) * hd_slice]),
+                        scale, hd_slice, block, 1, False, False, 1,
+                        cu_seqlens_t, seqused_t, tag,
+                    )
+                else:
+                    _postprocess_run(
+                        accum_slice, out,
+                        scale, hd_slice, block, 1, False, False, 1,
+                        cu_seqlens_t, seqused_t, tag,
+                        _raw_addr(raw_addr, j * hd_slice), raw_b, raw_s, raw_h,
+                        cutlass.Int32(hd_slice), raw_storage_d,
+                    )
+
+    if enable_overlap:
         def _run_overlap_dkv_postprocess(dk_send_addr, dv_send_addr):
-            if is_split_d_bwd:
+            if is_bigd_bwd:
+                _bigd_postprocess(
+                    dk_accum, dk_tensor, bigd_scale, head_dim_rounded, slice_d,
+                    n_block_size, seqlen_k_rounded,
+                    cu_seqlens_k_tensor, seqused_k_tensor, "ovl_bigd_dk",
+                    dk_send_addr, raw_storage_d_k,
+                )
+                # kv_shared merges dV into dK, and the comm layer then leaves the dV
+                # send buffer unread, so filling it with zeros is pure overhead.
+                if not kv_shared:
+                    _bigd_postprocess(
+                        dv_accum, dv_tensor, cutlass.Float32(1.0), head_dim_v_rounded,
+                        slice_dv, n_block_size, seqlen_k_rounded,
+                        cu_seqlens_k_tensor, seqused_k_tensor, "ovl_bigd_dv",
+                        dv_send_addr, raw_storage_d_v,
+                    )
+            elif is_split_d_bwd:
                 half_hdim = head_dim // 2
                 half_hdim_v = head_dim_v // 2
                 dk_accum_low, dk_accum_high = (
@@ -2359,7 +2433,10 @@ def _flash_attn_bwd(
             if segment_idx + 1 < overlap_ag_args.num_segments:
                 if need_kv_accum:
                     dk_accum.zero_()
-                    dv_accum.zero_()
+                    # kv_shared aliases dv_accum onto dk_accum, so zeroing it again
+                    # would only undo the line above.
+                    if not kv_shared:
+                        dv_accum.zero_()
                 overlap_runtime.start_backward_segment(
                     segment_idx + 1, overlap_stream
                 )
@@ -2371,7 +2448,14 @@ def _flash_attn_bwd(
         overlap_runtime.wait_backward_rs(overlap_stream)
 
     if enable_overlap:
-        if is_split_d_bwd:
+        if is_bigd_bwd:
+            # dK / dV already left through the per-segment raw-address postprocess.
+            _bigd_postprocess(
+                dq_accum, dq, bigd_scale, head_dim_rounded, slice_d,
+                m_block_size, seqlen_q_rounded,
+                cu_seqlens_q_tensor, seqused_q_tensor, "bigd_dq",
+            )
+        elif is_split_d_bwd:
             half_hdim = head_dim // 2
             dq_accum_low, dq_accum_high = dq_accum[..., : dq_accum.shape[-1] // 2], dq_accum[..., dq_accum.shape[-1] // 2 :]
             for accum_part, out_part in (
@@ -2390,24 +2474,6 @@ def _flash_attn_bwd(
                 use_2cta_instrs, 1, cu_seqlens_q_tensor, seqused_q_tensor, "ovl_dq",
             )
     elif is_bigd_bwd:
-        # The big-headdim accumulators are blocked as
-        #   [head_dim slice][row block][4-col group][row][4 cols]
-        # so each slice is byte-identical to a head_dim=slice accumulator. The shared
-        # postprocess cannot swallow head_dim 576 in one go (it stages a whole
-        # tile x head_dim fp32 tile in SMEM and registers), so it runs once per slice,
-        # writing a last-dim slice of the output -- the same trick the split-d path
-        # uses, and legal because the postprocess writes dQ/dK/dV with plain gmem
-        # copies rather than TMA.
-        slice_d = bigd_cfg["accum_slice_d"]
-        slice_dv = bigd_cfg["accum_slice_dv"]
-        # With kv_shared the kernel folded softmax_scale into dS, so dK and dQ arrive
-        # already scaled (dV never carried the scale -- that asymmetry is exactly why it
-        # had to move into dS for a merged dKV accumulator).
-        bigd_scale = cutlass.Float32(1.0) if kv_shared else softmax_scale
-        assert head_dim == head_dim_rounded and head_dim_v == head_dim_v_rounded, (
-            "the big-headdim postprocess writes whole head_dim slices, so head_dim "
-            f"must already be a multiple of 64 (got {head_dim} / {head_dim_v})"
-        )
         for accum, out, scale, hd, hd_slice, block, seq_rounded, tag in (
             (dq_accum, dq, bigd_scale, head_dim_rounded, slice_d,
              m_block_size, seqlen_q_rounded, "bigd_dq"),
@@ -2416,24 +2482,16 @@ def _flash_attn_bwd(
             (dv_accum, dv, cutlass.Float32(1.0), head_dim_v_rounded, slice_dv,
              n_block_size, seqlen_k_rounded, "bigd_dv"),
         ):
-            accum_slice_elems = seq_rounded * hd_slice
-            for j in range(hd // hd_slice):
-                _postprocess_run(
-                    _to_cute(
-                        accum[..., j * accum_slice_elems : (j + 1) * accum_slice_elems]
-                    ),
-                    _to_cute(out[..., j * hd_slice : (j + 1) * hd_slice]),
-                    scale,
-                    hd_slice,
-                    block,
-                    1,
-                    False,
-                    False,
-                    1,
-                    cu_seqlens_q_tensor if tag == "bigd_dq" else cu_seqlens_k_tensor,
-                    seqused_q_tensor if tag == "bigd_dq" else seqused_k_tensor,
-                    tag,
-                )
+            # kv_shared merged dV into dK: dv is already the zero gradient and dv_accum
+            # aliases dk_accum, so this postprocess would write dK into dv.
+            if kv_shared and tag == "bigd_dv":
+                continue
+            _bigd_postprocess(
+                accum, out, scale, hd, hd_slice, block, seq_rounded,
+                cu_seqlens_q_tensor if tag == "bigd_dq" else cu_seqlens_k_tensor,
+                seqused_q_tensor if tag == "bigd_dq" else seqused_k_tensor,
+                tag,
+            )
     elif is_split_d_bwd:
         half_hdim = head_dim // 2
         half_hdim_v = head_dim_v // 2

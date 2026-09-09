@@ -1,18 +1,38 @@
 cmake_minimum_required(VERSION 3.9)
 find_package(CUDAToolkit REQUIRED)
 
-# Make sure add_subdirectory is called later than include(distributed/cmake/nvshmem), so that nvshmem external proj is visible
-if(NOT TARGET nvshmem)
-    message(FATAL_ERROR "NVSHMEM target not found! Please ensure NVSHMEM is properly configured.")
+set(NCCL_INSTALL_DIR "" CACHE PATH "NCCL install dir (include/ + lib/)")
+if(NOT NCCL_INSTALL_DIR)
+    message(FATAL_ERROR "NCCL_INSTALL_DIR is required for FlashMask distributed")
+endif()
+find_path(NCCL_INCLUDE_DIR
+    NAMES nccl.h nccl_device.h
+    PATHS "${NCCL_INSTALL_DIR}/include"
+    NO_DEFAULT_PATH
+)
+# [NCCL-WHEEL] the pip wheel (nvidia-nccl-cu13) ships only the versioned
+# libnccl.so.2 with no libnccl.so dev symlink, so match that name too.
+find_library(NCCL_LIBRARY
+    NAMES nccl libnccl.so.2
+    PATHS "${NCCL_INSTALL_DIR}/lib" "${NCCL_INSTALL_DIR}/lib64"
+    NO_DEFAULT_PATH
+)
+if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+    message(FATAL_ERROR "NCCL headers and libnccl.so[.2] are required under ${NCCL_INSTALL_DIR}")
 endif()
 
 set(DISTRIBUTED_SOURCES
     overlap_comm.cu
     sep_sr_buffer.cu
+    nccl_gin_backend.cu
 )
 
 add_library(flashmaskv2_distributed STATIC
     ${DISTRIBUTED_SOURCES}
+)
+
+target_compile_definitions(flashmaskv2_distributed PRIVATE
+    FLASHMASK_GIN_DEVICE_API=1
 )
 
 target_compile_options(flashmaskv2_distributed PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
@@ -20,28 +40,21 @@ target_compile_options(flashmaskv2_distributed PRIVATE $<$<COMPILE_LANGUAGE:CUDA
     -Xcompiler="-O3"
     -std=c++17
     --use_fast_math
-    -gencode arch=compute_90a,code=sm_90a
     -lineinfo
     -DNDEBUG
     --expt-relaxed-constexpr
     >)
 
 target_include_directories(flashmaskv2_distributed PRIVATE
-    ${NVSHMEM_INCLUDE_DIR}
+    ${NCCL_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../cutlass/include          # include cutlass
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 target_link_libraries(flashmaskv2_distributed PRIVATE
     CUDA::cudart
-    nvshmem
-    ${NVSHMEM_BOOTSTRAP_UID_LIB}        # using MPI_Init, mpi bootstrap
+    ${NCCL_LIBRARY}
 )
-
-if(TARGET extern_nvshmem)
-    # There is no extern_nvshmem in non-standalone building
-    add_dependencies(flashmaskv2_distributed extern_nvshmem)
-endif()
 
 set_target_properties(flashmaskv2_distributed PROPERTIES
     POSITION_INDEPENDENT_CODE ON
@@ -53,5 +66,5 @@ set_target_properties(flashmaskv2_distributed PROPERTIES
     # the following lines tries to prevent PTX JIT
     # getting rid of the need for loading libnvidia-ptxjitcompiler.so
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    CUDA_ARCHITECTURES "90a"
+    CUDA_ARCHITECTURES "90a-real"
 )

@@ -4,11 +4,10 @@
 # NOT by the parent FA-v2 build graph. It compiles three TUs into one shared lib:
 #   - fm4_overlap_bridge.cu   (new: extern "C" surface)
 #   - overlap_comm.cu         (reused from FM-3, unchanged)
-#   - sep_sr_buffer.cu        (reused from FM-3, unchanged)
-# and statically links the prebuilt NVSHMEM combined archive (libnvshmem.a) plus
-# the UID bootstrap host .so. The recipe (rdc / device-link / symbol isolation /
-# rpath) is copied verbatim from csrc/flashmask_v2/distributed/CMakeLists.txt and
-# the symbol-isolation block at csrc/CMakeLists.txt:688-704.
+#   - sep_sr_buffer.cu        (reused from FM-3)
+#   - nccl_gin_backend.cu     (NCCL communicator/window lifecycle)
+# The target links the selected NCCL shared library and keeps the device-link
+# step because the device state is shared by the kernel translation units.
 #
 # 3.18 is the floor: CUDA_ARCHITECTURES accepting arch strings like "90a"/"100a"
 # landed in 3.18. The dev box has 3.31.
@@ -24,12 +23,27 @@ find_package(CUDAToolkit REQUIRED)
 # A100 dev box and the H100/B200 build boxes.
 # ---------------------------------------------------------------------------
 set(FM4_OVERLAP_CUDA_ARCH "90a" CACHE STRING "target sm arch, e.g. 90a or 100a")
-set(NVSHMEM_INSTALL_DIR "" CACHE PATH "nvshmem install dir (include/ + lib/)")
+set(NCCL_INSTALL_DIR "" CACHE PATH "NCCL install dir (include/ + lib/)")
 set(FM4_OVERLAP_CUTLASS_INC "" CACHE PATH "cutlass include dir (must contain cutlass/bfloat16.h)")
 
-if(NOT NVSHMEM_INSTALL_DIR)
-    message(FATAL_ERROR "NVSHMEM_INSTALL_DIR is required (e.g. Paddle's third_party/install/nvshmem). "
-                        "Set it via -DNVSHMEM_INSTALL_DIR=... or the NVSHMEM_HOME env in setup.py.")
+if(NOT NCCL_INSTALL_DIR)
+    message(FATAL_ERROR "NCCL_INSTALL_DIR is required. Set it to the NCCL installation root.")
+endif()
+
+find_path(NCCL_INCLUDE_DIR
+    NAMES nccl.h nccl_device.h
+    PATHS "${NCCL_INSTALL_DIR}/include"
+    NO_DEFAULT_PATH
+)
+# [NCCL-WHEEL] the pip wheel (nvidia-nccl-cu13) ships only the versioned
+# libnccl.so.2 with no libnccl.so dev symlink, so match that name too.
+find_library(NCCL_LIBRARY
+    NAMES nccl libnccl.so.2
+    PATHS "${NCCL_INSTALL_DIR}/lib" "${NCCL_INSTALL_DIR}/lib64"
+    NO_DEFAULT_PATH
+)
+if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+    message(FATAL_ERROR "NCCL headers (nccl.h, nccl_device.h) and libnccl.so[.2] are required under ${NCCL_INSTALL_DIR}")
 endif()
 if(NOT FM4_OVERLAP_CUTLASS_INC)
     message(FATAL_ERROR "FM4_OVERLAP_CUTLASS_INC is required (dir containing cutlass/bfloat16.h).")
@@ -52,7 +66,9 @@ get_filename_component(DIST_DIR
 foreach(_req
         "${DIST_DIR}/overlap_comm.cu"
         "${DIST_DIR}/sep_sr_buffer.cu"
-        "${DIST_DIR}/overlap_comm.cuh")
+        "${DIST_DIR}/nccl_gin_backend.cu"
+        "${DIST_DIR}/overlap_comm.cuh"
+        "${DIST_DIR}/nccl_gin_backend.cuh")
     if(NOT EXISTS "${_req}")
         message(FATAL_ERROR "Required FM-3 source not found: ${_req}\n"
                             "Check the relative path from overlap/csrc, or that the "
@@ -67,30 +83,7 @@ if(NOT EXISTS "${FM4_OVERLAP_CUTLASS_INC}/cutlass/bfloat16.h")
                         "git submodule update --init --recursive")
 endif()
 
-if(NOT EXISTS "${NVSHMEM_INSTALL_DIR}/include/nvshmem.h")
-    message(FATAL_ERROR "nvshmem.h not found under NVSHMEM_INSTALL_DIR=${NVSHMEM_INSTALL_DIR}")
-endif()
-
 # ---------------------------------------------------------------------------
-# Self-built nvshmem IMPORTED target (copied from csrc/CMakeLists.txt:631-649).
-# We do NOT depend on the parent FA-v2 build graph, so we cannot rely on its
-# `nvshmem` target existing; we re-create it here. This also sidesteps the
-# `if(NOT TARGET nvshmem) FATAL_ERROR` guard in distributed/CMakeLists.txt.
-# ---------------------------------------------------------------------------
-set(NVSHMEM_INCLUDE_DIR "${NVSHMEM_INSTALL_DIR}/include")
-set(NVSHMEM_LIB "${NVSHMEM_INSTALL_DIR}/lib/libnvshmem.a")
-set(NVSHMEM_BOOTSTRAP_UID_LIB "${NVSHMEM_INSTALL_DIR}/lib/nvshmem_bootstrap_uid.so.3")
-
-if(NOT EXISTS "${NVSHMEM_LIB}")
-    message(FATAL_ERROR "libnvshmem.a not found at ${NVSHMEM_LIB}")
-endif()
-if(NOT EXISTS "${NVSHMEM_BOOTSTRAP_UID_LIB}")
-    message(FATAL_ERROR "nvshmem_bootstrap_uid.so.3 not found at ${NVSHMEM_BOOTSTRAP_UID_LIB}")
-endif()
-
-add_library(nvshmem STATIC IMPORTED GLOBAL)
-set_property(TARGET nvshmem PROPERTY IMPORTED_LOCATION ${NVSHMEM_LIB})
-
 # ---------------------------------------------------------------------------
 # The bridge shared library.
 # ---------------------------------------------------------------------------
@@ -98,6 +91,11 @@ add_library(fm4_overlap SHARED
     ${CMAKE_CURRENT_SOURCE_DIR}/fm4_overlap_bridge.cu
     ${DIST_DIR}/overlap_comm.cu
     ${DIST_DIR}/sep_sr_buffer.cu
+    ${DIST_DIR}/nccl_gin_backend.cu
+)
+
+target_compile_definitions(fm4_overlap PRIVATE
+    FLASHMASK_GIN_DEVICE_API=1
 )
 
 target_compile_options(fm4_overlap PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
@@ -109,11 +107,10 @@ target_compile_options(fm4_overlap PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
     -lineinfo
     -DNDEBUG
     --expt-relaxed-constexpr
-    -DNVSHMEM_DISTRIBUTED_OVERLAP
 >)
 
 target_include_directories(fm4_overlap PRIVATE
-    ${NVSHMEM_INCLUDE_DIR}
+    ${NCCL_INCLUDE_DIR}
     ${FM4_OVERLAP_CUTLASS_INC}
     ${DIST_DIR}                       # overlap_comm.cuh, sr_buffer.cuh, ...
     ${CMAKE_CURRENT_SOURCE_DIR}       # fm4_overlap_bridge.cu's own dir
@@ -121,13 +118,11 @@ target_include_directories(fm4_overlap PRIVATE
 
 target_link_libraries(fm4_overlap PRIVATE
     CUDA::cudart
-    nvshmem
-    ${NVSHMEM_BOOTSTRAP_UID_LIB}
+    ${NCCL_LIBRARY}
 )
 
-# Symbol isolation (copied from csrc/CMakeLists.txt:688-704). Export only the
-# fm4_overlap_* C-ABI; localize everything else so the statically-linked NVSHMEM
-# / cutlass internals do not interpose with libpaddle.so or DeepEP's NVSHMEM.
+# Export only the fm4_overlap_* C ABI and keep the bridge's implementation
+# symbols local to avoid interposing with libpaddle.so or DeepEP.
 target_link_options(fm4_overlap PRIVATE
     -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/fm4_overlap.map
     -Wl,-Bsymbolic
@@ -140,14 +135,11 @@ set_target_properties(fm4_overlap PROPERTIES
     CUDA_STANDARD_REQUIRED ON
     CXX_STANDARD 17
     CUDA_STANDARD 17
-    CUDA_SEPARABLE_COMPILATION ON     # = -rdc=true (NVSHMEM device symbols need it)
+    CUDA_SEPARABLE_COMPILATION ON     # = -rdc=true (shared GIN device state)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON    # = device-link, avoids runtime PTX JIT
     CUDA_ARCHITECTURES "${FM4_OVERLAP_CUDA_ARCH}"
-    # $ORIGIN: the bridge .so sits next to nothing it needs except itself; the
-    # NVSHMEM lib dir is needed at runtime for the bootstrap/transport host .so's
-    # that libnvshmem.a dlopen's. Both are on the rpath.
-    BUILD_RPATH "$ORIGIN;${NVSHMEM_INSTALL_DIR}/lib"
-    INSTALL_RPATH "$ORIGIN;${NVSHMEM_INSTALL_DIR}/lib"
+    BUILD_RPATH "$ORIGIN;${NCCL_INSTALL_DIR}/lib;${NCCL_INSTALL_DIR}/lib64"
+    INSTALL_RPATH "$ORIGIN;${NCCL_INSTALL_DIR}/lib;${NCCL_INSTALL_DIR}/lib64"
     BUILD_WITH_INSTALL_RPATH ON
 )
 

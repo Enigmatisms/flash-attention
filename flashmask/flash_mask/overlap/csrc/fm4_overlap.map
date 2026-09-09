@@ -1,5 +1,5 @@
-# Export only the bridge C-ABI; localize all statically-linked NVSHMEM / cutlass
-# internals. Same form as csrc/flashmask_v2/flashmaskv2.map. ctypes only needs
+# Export only the bridge C ABI; localize all implementation internals.
+# Same form as csrc/flashmask_v2/flashmaskv2.map. ctypes only needs
 # the fm4_overlap_* prefix.
 {
     global:

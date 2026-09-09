@@ -1,8 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
-#include <nvshmem.h>
-#include <nvshmemx.h>
 #include "debug_logger.cuh"
+#include "nccl_gin_backend.cuh"
 #include "hierarchical_rank_map.cuh"
 
 namespace flashmask {
@@ -16,11 +15,11 @@ __global__ void SetValueKernel(
     const int value
 ) {
     *(semaphore + threadIdx.x) = static_cast<SemaphoreT>(value);
-#ifdef NVSHMEM_DEBUG
+#ifdef FLASHMASK_DEBUG
     if (gridDim.x == 1) {
         DEBUG_PRINT("Consumer sets self empty value: %d\n", value);
     }
-#endif  // NVSHMEM_DEBUG
+#endif  // FLASHMASK_DEBUG
 }
 
 __global__ void ProducerNotifyFull(
@@ -34,12 +33,12 @@ __global__ void ProducerNotifyFull(
     if (self_rank == target_rank) return;
     semaphores[target_rank] = 0;        // clear the local status (set by the remote target)
     const int64_t clear_mask = -(1LL << self_rank);
-#ifdef NVSHMEM_DEBUG
-    auto fetched = nvshmem_long_atomic_add(semaphores + target_rank, clear_mask, target_rank);
-    DEBUG_PRINT("Producer %d notifies remote %d full, fetched: %ld\n", self_rank, target_rank, fetched);
+#ifdef FLASHMASK_DEBUG
+    gin::remote_add(semaphores + target_rank, clear_mask, target_rank);
+    DEBUG_PRINT("Producer %d notifies remote %d full\n", self_rank, target_rank);
 #else
-    nvshmem_long_atomic_add(semaphores + target_rank, clear_mask, target_rank);
-#endif  // NVSHMEM_DEBUG
+    gin::remote_add(semaphores + target_rank, clear_mask, target_rank);
+#endif  // FLASHMASK_DEBUG
 }
 
 __global__ void FusedConsumerNotifyEmpty(
@@ -62,7 +61,7 @@ __global__ void FusedConsumerNotifyEmpty(
     int target_rank = remote_producer_end_rank - threadIdx.x;
     target_rank = target_rank >= 0 ? target_rank : target_rank + nranks;
     if (target_rank == self_rank) return;
-    nvshmem_int64_p(semaphores + self_rank, 1, target_rank);
+    gin::remote_store(semaphores + self_rank, int64_t(1), target_rank);
     DEBUG_PRINT("Consumer %d notifies remote %d empty, end_rank: %d\n", self_rank, target_rank, remote_producer_end_rank);
 }
 
@@ -149,7 +148,7 @@ static __global__ void SpinWaitAndReplaceKernel(int64_t* ptr, int64_t target) {
 
 /**
  * @brief CPU wait until the semaphores[my_pe] reached 0
- * @param semaphores int semaphores allocated by nvshmem: size is total_n_pes
+ * @param semaphores int64 semaphores in the registered NCCL window: size is total_n_pes
  * @param my_pe the id of semaphore to wait for
  * @param stream waiting stream. This API is therefore async on stream (if non-blocking)
 */
@@ -166,9 +165,9 @@ void consumer_wait_full(
             semaphores + my_pe, wait_value
         );
     } else {
-        nvshmemx_int64_wait_until_on_stream(
+        gin::wait_until_on_stream(
             semaphores + my_pe,
-            NVSHMEM_CMP_EQ,
+            gin::Compare::Equal,
             0,
             comm_stream
         );
@@ -181,7 +180,7 @@ __device__ void producer_wait_empty(
     const int target_pe
 ) {
     WARN_PRINT("Producer block %d waits remote %d empty ...\n", blockIdx.x, target_pe);
-    nvshmem_int64_wait_until(const_cast<int64_t*>(semaphores) + target_pe, NVSHMEM_CMP_NE, 0);   // wait until not 0
+    gin::wait_until(const_cast<int64_t*>(semaphores) + target_pe, gin::Compare::NotEqual, 0);   // wait until not 0
     WARN_PRINT("Producer block %d waits remote %d empty succeeded.\n", blockIdx.x, target_pe);
 }
 
@@ -219,7 +218,7 @@ __global__ void HierFusedConsumerNotifyEmpty(
     const int logical_pos = logical_pos_base + threadIdx.x;
     const int sender = hier::hier_sender_at_pos(logical_pos, self_rank, total_n_pes, gpus_per_node);
     if (sender == self_rank) return;  // local chunk, no notification needed
-    nvshmem_int64_p(semaphores + self_rank, 1, sender);
+    gin::remote_store(semaphores + self_rank, int64_t(1), sender);
     DEBUG_PRINT("HierConsumer %d notifies sender %d (logical_pos %d) empty\n", self_rank, sender, logical_pos);
 }
 

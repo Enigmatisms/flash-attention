@@ -23,7 +23,7 @@
 #include "epilogue_fwd.hpp"
 #include "flash_mask.hpp"
 
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
 #include "distributed/overlap_comm.cuh"
 #endif
 
@@ -93,7 +93,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int scaled_seqlen_k = params.seqlen_k;
     int overlap_sm_margin = 0;
     bool simulate_single_head_rdma = false;
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
     bool need_overlap_comm = false;
     if (params.nranks > 1) {
         if constexpr (Varlen) {
@@ -164,7 +164,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if constexpr (Arch >= 90) {
         prepare_flashmask(params, stream, params.num_sm, Scheduler::pipelining);
     }
-#endif  // NVSHMEM_DISTRIBUTED_OVERLAP
+#endif  // NCCL_DISTRIBUTED_OVERLAP
 
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
@@ -179,7 +179,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     flash::flashmask::prepare_block_maxmin<kBlockN>(params, scaled_seqlen_k, stream, true);
 
-#ifdef NVSHMEM_DISTRIBUTED_OVERLAP
+#ifdef NCCL_DISTRIBUTED_OVERLAP
     // DEBUG: check for CUDA errors before to_underlying_arguments
     if (need_overlap_comm) {
         cudaError_t dbg_err = cudaGetLastError();

@@ -28,7 +28,7 @@ struct OverlapFeatureFlags {
     // FLASHMASK_USE_HIERARCHICAL: multi-node hierarchical AG/RS rank mapping.
     // Hierarchical communication defaults to false. Since using hierarchical communication
     // requires the code modification on Python end (context_parallel_utils.py)
-    bool use_hierarchical = false;
+    bool use_hierarchical = true;
     // FLASHMASK_USE_BHSD_LAYOUT: SR buffer uses (B,H,S,D) instead of (B,S,H,D).
     bool use_bhsd_layout = false;
     // FLASHMASK_PER_STAGE_BUFFER: one RS buffer slot per segment (vs. a single shared slot).
@@ -59,6 +59,17 @@ struct OverlapFeatureFlags {
         f.use_bhsd_layout  = parse_bool_env("FLASHMASK_USE_BHSD_LAYOUT",  f.use_bhsd_layout);
         f.per_stage_buffer = parse_bool_env("FLASHMASK_PER_STAGE_BUFFER", f.per_stage_buffer);
         return f;
+    }
+
+    // The BHSD transpose puts D in a TMA box dimension, which caps at 256 elements.
+    // Clearing the flag here also makes this warn at most once.
+    void apply_head_dim_fallback(int d, int rank) {
+        if (!use_bhsd_layout || d <= 256) return;
+        if (rank == 0) {
+            printf("[FlashMask Overlap] FLASHMASK_USE_BHSD_LAYOUT=true is unsupported for "
+                   "head_dim=%d (>256 exceeds the TMA box limit), disabling it.\n", d);
+        }
+        use_bhsd_layout = false;
     }
 
     // Log the effective (post-fallback) switch state. Prints on rank 0 only.

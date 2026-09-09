@@ -1,13 +1,13 @@
-"""FM-4 Overlap Python runtime: ctypes front-end over ``libfm4_overlap.so`` (the
-``extern "C"`` wrapper around the FM-3 ``flashmask::comm`` NVSHMEM singleton).
+"""FM-4 Overlap Python runtime: ctypes front-end over ``libfm4_overlap.so``.
 Importing never loads the .so; ``_load()`` raises only on first use if missing.
 """
 
 import ctypes
+import importlib.util
 import os
 from typing import NamedTuple
 
-_UID_NBYTES = 128  # sizeof(nvshmemx_uniqueid_t)
+_UID_NBYTES = None
 _LIB = None
 
 
@@ -18,9 +18,37 @@ def _find_so(here):
     return None
 
 
+def _nccl_lib_path():
+    """libnccl.so.2 of the running interpreter's wheel. None if not wheel-installed."""
+    override = os.environ.get("FLASHMASK_NCCL_LIB")
+    if override:
+        return override
+    spec = importlib.util.find_spec("nvidia.nccl")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    root = next(iter(spec.submodule_search_locations))
+    for libdir in ("lib", "lib64"):
+        candidate = os.path.join(root, libdir, "libnccl.so.2")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _pin_nccl():
+    """Pin the soname so the bridge reuses this libnccl instead of searching.
+
+    The bridge inlines the GIN device API and must bind the exact libnccl it was
+    built against; its DT_RUNPATH ranks below LD_LIBRARY_PATH, which often lists
+    a stray system libnccl. RTLD_LOCAL suffices: reuse is keyed on the soname.
+    """
+    path = _nccl_lib_path()
+    if path:
+        ctypes.CDLL(path, mode=ctypes.RTLD_LOCAL)
+
+
 def _load():
     """Load the bridge .so and bind argtypes/restype. Cached after first call."""
-    global _LIB
+    global _LIB, _UID_NBYTES
     if _LIB is not None:
         return _LIB
 
@@ -30,18 +58,25 @@ def _load():
         raise RuntimeError(
             "FM4 overlap extension (libfm4_overlap.so) not found next to "
             f"{__file__}. Built only when the 'ovl' component is selected and "
-            "NVSHMEM is available."
+            "NCCL with GIN support is available."
         )
 
-    # RTLD_GLOBAL so the bridge's NVSHMEM symbols are visible to the dlopen'd
-    # bootstrap/transport plugins at runtime.
-    lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+    _pin_nccl()
+    lib = ctypes.CDLL(so_path, mode=ctypes.RTLD_LOCAL)
+
+    lib.fm4_overlap_unique_id_size.argtypes = []
+    lib.fm4_overlap_unique_id_size.restype = ctypes.c_size_t
+    _UID_NBYTES = int(lib.fm4_overlap_unique_id_size())
+    if _UID_NBYTES <= 0:
+        raise RuntimeError("FM4 overlap bridge returned an invalid NCCL unique ID size")
 
     lib.fm4_overlap_get_unique_id.argtypes = [ctypes.c_char_p]
     lib.fm4_overlap_get_unique_id.restype = ctypes.c_int
 
-    # (b, s, h, d, rank, nranks) ints, uid bytes, mask_head int.
-    lib.fm4_overlap_init.argtypes = [ctypes.c_int] * 6 + [ctypes.c_char_p, ctypes.c_int]
+    # (b, s, h, d, rank, nranks) ints, uid bytes, mask_head int, kv_shared int.
+    lib.fm4_overlap_init.argtypes = (
+        [ctypes.c_int] * 6 + [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    )
     lib.fm4_overlap_init.restype = ctypes.c_int
 
     for name in (
@@ -121,13 +156,13 @@ def _load():
 # B/H/D are Python-side (from the K/V shape); stashed to rebuild the gathered view.
 _KV_SHAPE = None   # (B, H, D); S_total = s_local() * nranks()
 
-# NVSHMEM unique id is a process-level constant: bootstrap once (one broadcast),
-# then reuse on every reconfigure.
+# Cache one NCCL UID per Python process/group generation.
 _UID = None
+_UID_KEY = None
 
 
 def is_available():
-    """True if the bridge .so can be loaded (built + NVSHMEM present)."""
+    """True if the bridge .so can be loaded with NCCL GIN support."""
     try:
         _load()
         return True
@@ -136,46 +171,52 @@ def is_available():
 
 
 def bootstrap_unique_id(rank, group=None):
-    """group-local rank 0 generates the NVSHMEM unique id and broadcasts it; every
-    rank returns the same 128-byte id. Cached process-wide (the id never changes)."""
-    global _UID
-    if _UID is not None:
-        return _UID
+    """Generate and broadcast one NCCL UID for the current group generation."""
+    global _UID, _UID_KEY
     import numpy as np
     import paddle
     import paddle.distributed as dist
 
+    world_size = int(group.world_size) if group is not None else int(dist.get_world_size())
+    uid_key = (id(group), world_size) if group is not None else (None, world_size)
+    if _UID is not None and _UID_KEY == uid_key:
+        return _UID
+
     lib = _load()
     buf = (ctypes.c_uint8 * _UID_NBYTES)()
-    if rank == 0:
-        lib.fm4_overlap_get_unique_id(ctypes.cast(buf, ctypes.c_char_p))
+    if rank == 0 and lib.fm4_overlap_get_unique_id(ctypes.cast(buf, ctypes.c_char_p)) != 1:
+        raise RuntimeError("fm4_overlap_get_unique_id failed")
 
     src_global = group.ranks[0] if group is not None else 0
     arr = np.frombuffer(bytes(buf), dtype=np.uint8).copy()
     t = paddle.to_tensor(arr, dtype="uint8")
     dist.broadcast(t, src=src_global, group=group)
     _UID = bytes(t.numpy().tobytes())
+    _UID_KEY = uid_key
     return _UID
 
 
-def init_overlap(k, v, rank, nranks, uid_bytes, mask_head=1):
+def init_overlap(k, v, rank, nranks, uid_bytes, mask_head=1, kv_shared=False):
     """Create or reconfigure the C++ singleton from k/v shape + topology (only
-    k.shape is read; the local-KV copy into the SRBuffer happens in update_kv)."""
+    k.shape is read; the local-KV copy into the SRBuffer happens in update_kv).
+    kv_shared: K and V alias one storage, so only K is transported."""
     global _KV_SHAPE
     lib = _load()
     b, s_local, h, d = (int(x) for x in k.shape)
     _KV_SHAPE = (b, h, d)
-    rc = lib.fm4_overlap_init(b, s_local, h, d, int(rank), int(nranks), uid_bytes, int(mask_head))
+    rc = lib.fm4_overlap_init(b, s_local, h, d, int(rank), int(nranks), uid_bytes,
+                              int(mask_head), int(kv_shared))
     if rc != 1:
         raise RuntimeError("fm4_overlap_init failed")
 
 
-def ensure_initialized(k, v, group, mask_head=1):
+def ensure_initialized(k, v, group, mask_head=1, kv_shared=False):
     """Bootstrap the unique id once, then forward shape/topology to the C++ singleton
     every step. init_singleton_instance reconfigures (and reallocs the SRBuffer) only
     when they actually change, so unconditional forwarding is cheap and correct."""
     uid = bootstrap_unique_id(group.rank, group=group)
-    init_overlap(k, v, group.rank, group.world_size, uid, mask_head=mask_head)
+    init_overlap(k, v, group.rank, group.world_size, uid, mask_head=mask_head,
+                 kv_shared=kv_shared)
 
 
 def use_bhsd_layout():
@@ -243,9 +284,11 @@ def sync_comm_stream():
 def _sparse_chunk_mask_cols(startend_row_indices):
     """Slice (lt_start, ut_end) columns into contiguous (B, H_mask, S_total) int32."""
     num_vecs = startend_row_indices.shape[-1]
-    assert num_vecs in (2, 4), f"overlap mask must be 2/4-vec (non-causal), got {num_vecs}"
+    # 4-vec is rejected: lt_end / ut_start are not plumbed through the bridge, so the skip
+    # bitmap would over-report fully-masked chunks and silently drop their contribution.
+    assert num_vecs == 2, f"overlap mask must be 2-vec (non-causal), got {num_vecs}"
     lt_start = startend_row_indices[..., 0].contiguous()
-    ut_end = startend_row_indices[..., num_vecs - 1].contiguous()
+    ut_end = startend_row_indices[..., 1].contiguous()
     return lt_start, ut_end
 
 

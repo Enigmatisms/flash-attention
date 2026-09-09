@@ -1,7 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 #include "sr_buffer.cuh"
-#include "nvshmem_copy_utils.cuh"
+#include "gin_copy_utils.cuh"
 #include "ag_semaphore_ops.cuh"
 #include "hierarchical_rank_map.cuh"
 #include "debug_logger.cuh"
@@ -189,7 +189,10 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     constexpr int chunk_per_batch = (S - S_chunk) / row_per_block;
     constexpr int work_per_chunk = S_chunk / row_per_block;
     const int total_chunks = num_batch * chunk_per_batch;
-    const int batch_stride = S * S_stride;
+    // the gathered KV (num_batch * S * S_stride) exceeds INT_MAX for large shapes,
+    // so every offset built from it is 64-bit. Loop counters stay int.
+    const int64_t row_stride = S_stride;
+    const int64_t batch_stride = S * row_stride;
     __shared__ int cached_semaphores[64];
     __shared__ int next_work_id;
     // note that block_cnt_semaphore starts from 1. dyn-scheduling from the beginning.
@@ -234,18 +237,13 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 const int counter_offset = target_rank_val + total_n_pes * batch_id;
                 // Fence BEFORE publishing counter increment: ensures this CTA's SR buffer
                 // stores are at L2 before other CTAs can observe the count and trigger Phase 2 notification.
+                __threadfence();
                 int prev = atomicAdd(&rank_empty_counters[counter_offset], 1);
                 if (prev + 1 == work_per_chunk) {
                     // All works for this (batch, Phase 1 target) are done.
                     // Notify same-node ranks: relay data for this batch is ready.
-                    const int my_pe_node = my_pe % gpus_per_node;
-                    const int my_node_id = my_pe / gpus_per_node;
-                    __threadfence();
-                    for (int slot = 1; slot < gpus_per_node; slot++) {
-                        int base = (my_pe_node + slot) % gpus_per_node;
-                        int sn_rank = base + my_node_id * gpus_per_node;
-                        nvshmem_int64_atomic_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
-                    }
+                    sema::ag::notify_batch_ready_to_same_node(
+                        sema_intra, target_rank_val, batch_id, num_batch, my_pe, gpus_per_node);
                 }
             }
         }
@@ -268,7 +266,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         const int seq_work_id = (work_id_m1 % chunk_per_batch) + 1;     // this is in range [1, chunk_per_batch]
         int mask_index = 0;
         int seqlen_id = 0, remote_pe = 0;
-        int src_addr = 0;
+        int64_t src_addr = 0;
         bool is_phase1 = true;
         int target_rank = 0;  // For hierarchical: data owner rank (semaphore wait target)
 
@@ -295,7 +293,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             // Source address in remote_pe's SR buffer
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
                 info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, bwd);
-            src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * S_stride;
+            src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * row_stride;
         } else {
             // Original circular shift traversal
             if constexpr (bwd) {        // bwd is forward traversal
@@ -309,7 +307,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 remote_pe = remote_pe >= 0 ? remote_pe : remote_pe + total_n_pes;
             }
             target_rank = remote_pe;  // Non-hierarchical: target_rank = remote_pe
-            src_addr = batch_id * batch_stride + (seqlen_offset + (seqlen_id % S_chunk)) * S_stride;
+            src_addr = batch_id * batch_stride + (seqlen_offset + (seqlen_id % S_chunk)) * row_stride;
             mask_index = bwd
                 ? ((batch_id / num_heads_per_batch) * chunk_per_batch + (seq_work_id - 1))
                 : (chunk_per_batch * (batch_id / num_heads_per_batch + 1) - seq_work_id);
@@ -344,7 +342,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                     // Phase 2 (intra-node only): per-batch bit-check on sema_intra
                     // Waits until the specific batch_id bit is set by congruence_notify
                     if (threadIdx.x == 0) {
-                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank);
+                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch);
                     }
                 }
             } else {
@@ -355,12 +353,12 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             }
         }
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
-        const int dst_addr = batch_id * batch_stride + seqlen_id * S_stride;
+        const int64_t dst_addr = batch_id * batch_stride + seqlen_id * row_stride;
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
-            v_sr + dst_addr,
+            shmem::offset_or_null(v_sr, dst_addr),
             k_sr + src_addr,
-            v_sr + src_addr,
+            shmem::offset_or_null(v_sr, src_addr),
             row_per_block * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated
@@ -432,8 +430,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
     // into num_segments independent sub-tensors each of size B * num_chunks * S_chunk.
     // Stage separation is handled by the caller advancing k_sr/local_k per segment.
     // Non-hierarchical: same formula, overwrites the single segment region.
-    const int batch_stride = S * S_stride;
-    const int local_batch_stride = S_chunk * S_stride;
+    const int64_t row_stride = S_stride;
+    const int64_t batch_stride = S * row_stride;
+    const int64_t local_batch_stride = S_chunk * row_stride;
 
     extern __shared__ int smem_chunk_mask[];
     __shared__ int cached_semaphores[64];
@@ -495,16 +494,11 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 const int counter_idx = (chunk_id - chunk_offset) + num_chunks * batch_id;
                 // Fence BEFORE publishing counter increment: ensures this CTA's SR buffer
                 // stores are at L2 before other CTAs can observe the count and trigger Phase 2 notification.
+                __threadfence();
                 int prev = atomicAdd(&rank_empty_counters[counter_idx], 1);
                 if (prev + 1 == work_per_chunk) {
-                    const int my_pe_node = my_pe % gpus_per_node;
-                    const int my_node_id = my_pe / gpus_per_node;
-                    __threadfence();
-                    for (int slot = 1; slot < gpus_per_node; slot++) {
-                        int base = (my_pe_node + slot) % gpus_per_node;
-                        int sn_rank = base + my_node_id * gpus_per_node;
-                        nvshmem_int64_atomic_or(sema_intra + target_rank_val, static_cast<int64_t>(1ULL << batch_id), sn_rank);
-                    }
+                    sema::ag::notify_batch_ready_to_same_node(
+                        sema_intra, target_rank_val, batch_id, num_batch, my_pe, gpus_per_node);
                 }
             }
         }
@@ -527,7 +521,8 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         int chunk_id = seq_work_id / work_per_chunk;
 
         // Compute remote PE, src/dst addresses (done early so masked-skip can check Phase 1)
-        int seqlen_id = 0, remote_pe = 0, src_addr = 0;
+        int seqlen_id = 0, remote_pe = 0;
+        int64_t src_addr = 0;
         bool is_phase1 = false;
         int target_rank = 0;
 
@@ -552,14 +547,14 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
             //     where src_pe wrote Phase 1 data during segment 0 at seqlen j * S_chunk.
             const int src_chunk_seqlen = hier::hier_src_chunk_offset(
                 info, total_n_pes, S_chunk, total_n_pes, gpus_per_node, /*bwd=*/true);
-            src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * S_stride;
+            src_addr = batch_id * batch_stride + (src_chunk_seqlen + row_within_chunk * row_per_block) * row_stride;
         } else {
             // Non-hierarchical: circular shift order
             seqlen_id = seq_work_id * row_per_block;
             remote_pe = start_rank + seqlen_id / S_chunk;
             remote_pe = remote_pe < total_n_pes ? remote_pe : remote_pe - total_n_pes;
             target_rank = remote_pe;
-            src_addr = batch_id * local_batch_stride + (seqlen_id % S_chunk) * S_stride;
+            src_addr = batch_id * local_batch_stride + (seqlen_id % S_chunk) * row_stride;
         }
 
         bool should_skip = false;
@@ -588,7 +583,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
                 } else {
                     // Phase 2 (intra-node only): per-batch bit-check on sema_intra
                     if (threadIdx.x == 0) {
-                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank);
+                        sema::ag::wait_full_one_batch(sema_intra, batch_id, target_rank, num_batch);
                     }
                 }
             } else {
@@ -600,7 +595,7 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         }
 
         // copy upto 4 heads (S_stride = H * D), and row_per_block rows (seqlen axis) per CTA
-        const int dst_addr = batch_id * batch_stride + seqlen_id * S_stride;
+        const int64_t dst_addr = batch_id * batch_stride + seqlen_id * row_stride;
         // src is always local_k/local_v (the SR buffer base pointer on remote_pe, passed by caller):
         //   Hierarchical Phase 1: remote_pe == target_rank, reads its local KV at SR offset 0.
         //   Hierarchical Phase 2: remote_pe == src_pe (same-node), reads target's congruence slot.
@@ -608,9 +603,9 @@ __global__ void __launch_bounds__(num_warps * 32, 64 / num_warps) SparseLargeKVC
         // In all cases local_k is the correct base; src_addr encodes the per-case offset.
         shmem::two_buffers_getmem_block(
             k_sr + dst_addr,
-            v_sr + dst_addr,
+            shmem::offset_or_null(v_sr, dst_addr),
             local_k + src_addr,
-            local_v + src_addr,
+            shmem::offset_or_null(local_v, src_addr),
             row_per_block * S_stride * sizeof(T), remote_pe
         );
         // buffer getmem_block will call syncthreads(), so next_work_id will not be updated.
