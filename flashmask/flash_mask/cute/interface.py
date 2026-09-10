@@ -60,15 +60,39 @@ try:
 except ImportError:
     accum_zero_axis1_kv = None
 
+_OVERLAP_RUNTIME = None
 
 def _get_overlap_runtime():
+    """ Fix raw package import (import flash_mask.*)
+        and paddlefleet_ops import (import paddlefleet_ops.flash_mask.*)
+        with cached module to accelerate import
+    """
+    global _OVERLAP_RUNTIME
+    if _OVERLAP_RUNTIME is not None:
+        return _OVERLAP_RUNTIME
+
+    import importlib
+    import sys
+
+    registered = next(
+        (
+            name
+            for name, module in list(sys.modules.items())
+            if getattr(module, "__dict__", None) is globals()
+        ),
+        None,
+    )
+    if registered is None:
+        raise RuntimeError(f"{__file__} is not registered in sys.modules")
+    root = registered.rsplit(".", 2)[0]  # drop ".cute.interface"
     try:
-        from flash_mask.overlap import overlap_runtime
+        _OVERLAP_RUNTIME = importlib.import_module(f"{root}.overlap.overlap_runtime")
     except ImportError as exc:
         raise RuntimeError(
-            "FM-4 overlap support requires the 'ovl' build component"
+            f"failed to import {root}.overlap.overlap_runtime; the 'ovl' build "
+            f"component may not have been built: {exc}"
         ) from exc
-    return overlap_runtime
+    return _OVERLAP_RUNTIME
 
 
 def maybe_contiguous(x):
