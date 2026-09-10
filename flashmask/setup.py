@@ -526,6 +526,28 @@ def _detect_nccl_home():
     return next(iter(spec.submodule_search_locations))
 
 
+def _detect_nccl_version(nccl_home):
+    """Read NCCL_MAJOR/MINOR/PATCH from the selected NCCL installation."""
+    header = os.path.join(nccl_home, 'include', 'nccl.h')
+    try:
+        with open(header, encoding='utf-8') as f:
+            text = f.read()
+    except (OSError, UnicodeError):
+        return None
+
+    version = []
+    for name in ('MAJOR', 'MINOR', 'PATCH'):
+        match = re.search(
+            rf'^\s*#\s*define\s+NCCL_{name}\s+(\d+)\b',
+            text,
+            re.MULTILINE,
+        )
+        if match is None:
+            return None
+        version.append(int(match.group(1)))
+    return tuple(version)
+
+
 def _detect_cuda_arch():
     """sm arch for -gencode: FM4_OVERLAP_CUDA_ARCH, else the local GPU (10.3 -> 103a)."""
     env = os.environ.get('FM4_OVERLAP_CUDA_ARCH')
@@ -717,7 +739,11 @@ if BUILD_OVL:
     _ovl_csrc = os.path.join(FLASH_MASK_DIR, 'overlap', 'csrc')
     _ovl_pkg_dir = os.path.join(FLASH_MASK_DIR, 'overlap')
     _nccl_home = _detect_nccl_home()
-    _ovl_arch = _detect_cuda_arch()
+    _nccl_version = (
+        _detect_nccl_version(_nccl_home)
+        if _nccl_home and os.path.isdir(_nccl_home)
+        else None
+    )
     _cutlass_inc = _detect_cutlass_inc()
 
     if not _nccl_home or not os.path.isdir(_nccl_home):
@@ -728,7 +754,15 @@ if BUILD_OVL:
         print("[flashmask] overlap: cutlass/bfloat16.h not found "
               "(set FM4_OVERLAP_CUTLASS_INC or init the FA4 submodule); "
               "skipping overlap bridge.")
+    elif _nccl_version is None:
+        print(f"[flashmask] overlap: NCCL version not found in "
+              f"{os.path.join(_nccl_home, 'include', 'nccl.h')}; "
+              "skipping overlap bridge.")
+    elif _nccl_version < (2, 30, 5):
+        print(f"[flashmask] overlap: NCCL {'.'.join(map(str, _nccl_version))} "
+              "is too old; requires NCCL >= 2.30.5. Skipping overlap bridge.")
     else:
+        _ovl_arch = _detect_cuda_arch()
         print(f"[flashmask] overlap: NCCL_HOME={_nccl_home}  "
               f"arch={_ovl_arch}  cutlass_inc={_cutlass_inc}")
         _pkg = _build_cmake_submodule(
